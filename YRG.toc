@@ -1,0 +1,14 @@
+## Interface: 16001
+## Title: |cffffd100YRG|r - YulRun Gaming Master Addon
+## Notes: Modular UI Suite (Steamdeck Improvements, BetterBagsModule, Minimap EXP Tracker, QuestTrackerUpdater & ClassImprovementsModule)
+## Author: YulRun Gaming
+## Version: 2.4.2
+## IconTexture: Interface\AddOns\YRG\Textures\YRGLogo
+## OptionalDeps: Blizzard_UIPanels_Game, Blizzard_MainMenuBarBagButtons, Blizzard_ObjectiveTracker, Questie
+## SavedVariables: YRGDB
+
+Core.lua
+Modules\BetterBagsModule.lua
+Modules\MinimapExpTracker.lua
+Modules\QuestTrackerUpdater.lua
+Modules\ClassImprovementsModule.lua
