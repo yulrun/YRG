@@ -65,6 +65,7 @@ Each module can be toggled independently on the main `YRG` panel and has its own
 ### 4. ClassImprovementsModule (`Modules/ClassImprovementsModule.lua`)
 - **Druid Class Bars:** Displays a secondary Mana bar below Rage or Energy on the Player Frame when shifted into Bear or Cat Form.
 - **Nameplate Combo Points:** Displays 5 circular combo point pips for Rogues and Cat Form Druids on targeted enemy nameplates, either `Below Nameplate (Smart)` (automatically drops beneath active enemy cast bars) or `Right of Health Bar`, with configurable size, spacing, scale, X/Y offsets, cast-bar extra drop, and a 4/5 test preview toggle.
+- **OB Prep (One-Button Prep):** Cross-class single-button preparation via the `YRGOBP` macro (`/yrgobprep`, with `/yrgrogueprep` / `YRGRP` preserved for backwards compatibility). Checks and applies 1 action per press in priority order: **Poisons** (Rogues) → **Item Enhancements** (`Wizard / Mana Oils`, superseding `Sharpening / Weight Stones` when both are checked) → **Food Buff** → **Potions / Elixirs** → **Class Self-Buffs** (level-aware priority per class or custom **Override Default Class Buffs CSV**). Features separate early-overbuff sliders for Weapons/Poisons and Buffs/Consumables plus a **OB Prep: Consumables & Buffs** subpage for Shift-Click / drag-and-drop configuration.
 
 ---
 
@@ -76,6 +77,7 @@ Each module can be toggled independently on the main `YRG` panel and has its own
 | `/bagstrip` / `/betterbags` | Prints BetterBagsModule status |
 | `/yrgbagdebug` | Captures container/slot layout diagnostics to `YRGDB` |
 | `/yrgcast` | Prints target nameplate, combo point anchor, and cast bar diagnostics |
+| `/yrgobprep` (alias `/yrgrogueprep`) | Evaluates and prepares 1 OB Prep step (supports `status`, `macro`, and `debug`) |
 
 ---
 
