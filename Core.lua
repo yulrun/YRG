@@ -1,7 +1,7 @@
 local addonName, YRG = ...
 _G.YRG = YRG
 
-YRG.version = "2.4.2"
+YRG.version = "2.4.3"
 YRG.modules = {}
 YRG.moduleOrder = {}
 YRG.extraCategories = {}
@@ -52,10 +52,14 @@ local defaultDB = {
         hideChatEditBox = false,
         autoFadeChatTabs = false,
         gradientChatBackground = false,
+        chatGradientMainOnly = true,
         chatGradientWidthPct = 100,
         chatGradientHeightPct = 100,
         chatGradientOpacityPct = 45,
+        fadeChatTopText = false,
+        chatTextTopFadePct = 35,
         fadeChatOnInactivity = false,
+        chatInactivityIncludeFloating = true,
         chatInactivityMinutes = 5,
         quickLoot = false,
         quickLootDelay = 0.3,
@@ -206,6 +210,8 @@ local editBoxMeta = setmetatable({}, { __mode = "k" })
 local hookedChatFrames = setmetatable({}, { __mode = "k" })
 local chatFrameMeta = setmetatable({}, { __mode = "k" })
 local texMeta = setmetatable({}, { __mode = "k" })
+local textLineMeta = setmetatable({}, { __mode = "k" })
+local hookedFontStrings = setmetatable({}, { __mode = "k" })
 local tabMeta = setmetatable({}, { __mode = "k" })
 local dockManagerMeta = setmetatable({}, { __mode = "k" })
 local originalEditBoxAnchors = setmetatable({}, { __mode = "k" })
@@ -216,6 +222,7 @@ local originalChat1Size = nil
 local settingAlphaGuard = false
 local settingScrollGuard = false
 local settingBgAlphaGuard = false
+local settingTextAlphaGuard = false
 local settingTabAlphaGuard = false
 local settingWindowAlphaGuard = false
 local settingClampGuard = false
@@ -546,21 +553,175 @@ local function HookChatEditBox(eb, cf)
     end
 end
 
+local function IsMainOrDockedChatFrame(cf, index)
+    if not cf then return false end
+    local meta = chatFrameMeta[cf]
+    local idx = index or (meta and meta.index) or (cf.GetID and cf:GetID())
+    local mainCF = DEFAULT_CHAT_FRAME or ChatFrame1
+    return (cf == mainCF or idx == 1 or cf.isDocked == true)
+end
+
+local function ShouldApplyGradientToChatFrame(cf, index)
+    if not cf then return false end
+    local sdb = YRG:GetSteamdeckDB()
+    if not sdb or not sdb.gradientChatBackground then
+        return false
+    end
+    if sdb.chatGradientMainOnly ~= false and not IsMainOrDockedChatFrame(cf, index) then
+        return false
+    end
+    return true
+end
+
+local function ShouldApplyTopTextFade(cf, index)
+    if not cf then return false end
+    local sdb = YRG:GetSteamdeckDB()
+    if not sdb or not sdb.fadeChatTopText then
+        return false
+    end
+    local pct = tonumber(sdb.chatTextTopFadePct) or 0
+    if pct <= 0 then
+        return false
+    end
+    if sdb.chatGradientMainOnly ~= false and not IsMainOrDockedChatFrame(cf, index) then
+        return false
+    end
+    return true
+end
+
+local function ComputeLineTopFade(region, cf, fadePct)
+    if not region or not cf or fadePct <= 0 then return 1.0 end
+    local boundsFrame = cf.FontStringContainer or cf
+    local bTop = YRG.SafeNumber(boundsFrame.GetTop and boundsFrame:GetTop(), nil)
+        or YRG.SafeNumber(cf.GetTop and cf:GetTop(), nil)
+    local bBot = YRG.SafeNumber(boundsFrame.GetBottom and boundsFrame:GetBottom(), nil)
+        or YRG.SafeNumber(cf.GetBottom and cf:GetBottom(), nil)
+    if not bTop or not bBot or (bTop - bBot) <= 10 then
+        return 1.0
+    end
+    local lTop = YRG.SafeNumber(region.GetTop and region:GetTop(), nil)
+    local lBot = YRG.SafeNumber(region.GetBottom and region:GetBottom(), nil)
+    if not lTop or not lBot then
+        return 1.0
+    end
+    local lineCenterY = (lTop + lBot) * 0.5
+    local fadeZone = math.max((bTop - bBot) * (fadePct / 100.0), 1)
+    local fadeStartY = bTop - fadeZone
+    if lineCenterY <= fadeStartY then
+        return 1.0
+    end
+    local frac = (bTop - lineCenterY) / fadeZone
+    return math.max(0.0, math.min(1.0, frac))
+end
+
+local function HookFontStringAlpha(region, cf)
+    if hookedFontStrings[region] then return end
+    hookedFontStrings[region] = true
+    if type(region) == "table" and type(region.SetAlpha) == "function" then
+        pcall(hooksecurefunc, region, "SetAlpha", function(self, alpha)
+            if settingTextAlphaGuard then return end
+            local lm = textLineMeta[self]
+            if not lm then
+                lm = { cf = cf }
+                textLineMeta[self] = lm
+            elseif not lm.cf then
+                lm.cf = cf
+            end
+            local blizzAlpha = YRG.SafeNumber(alpha, 1)
+            lm.blizzAlpha = blizzAlpha
+            local targetCF = lm.cf or cf
+            local meta = targetCF and chatFrameMeta[targetCF]
+            if not ShouldApplyTopTextFade(targetCF, meta and meta.index) then
+                lm.lastAppliedAlpha = nil
+                return
+            end
+            local sdb = YRG:GetSteamdeckDB()
+            local fadePct = (sdb and tonumber(sdb.chatTextTopFadePct)) or 35
+            local topFade = ComputeLineTopFade(self, targetCF, fadePct)
+            if topFade < 0.999 then
+                local target = blizzAlpha * topFade
+                lm.lastAppliedAlpha = target
+                settingTextAlphaGuard = true
+                self:SetAlpha(target)
+                settingTextAlphaGuard = false
+            else
+                lm.lastAppliedAlpha = nil
+            end
+        end)
+    end
+end
+
+local function ApplyChatTopTextFade(cf, index)
+    if not cf or not cf.FontStringContainer or type(cf.FontStringContainer.GetRegions) ~= "function" then
+        return
+    end
+    local shouldFade = ShouldApplyTopTextFade(cf, index)
+    if not shouldFade and not chatFrameMeta[cf] then return end
+    local sdb = YRG:GetSteamdeckDB()
+    local fadePct = (sdb and tonumber(sdb.chatTextTopFadePct)) or 35
+    local shown = (type(cf.IsShown) == "function") and cf:IsShown()
+
+    for _, region in ipairs({ cf.FontStringContainer:GetRegions() }) do
+        if type(region) == "table"
+            and not (type(region.IsForbidden) == "function" and region:IsForbidden())
+            and type(region.GetObjectType) == "function"
+            and region:GetObjectType() == "FontString"
+            and type(region.SetAlpha) == "function" then
+            if shouldFade and shown then
+                HookFontStringAlpha(region, cf)
+                if type(region.IsShown) ~= "function" or region:IsShown() then
+                    local curA = YRG.SafeNumber(region.GetAlpha and region:GetAlpha(), 1)
+                    local lm = textLineMeta[region]
+                    if not lm then
+                        lm = { cf = cf, blizzAlpha = curA }
+                        textLineMeta[region] = lm
+                    else
+                        lm.cf = cf
+                        if lm.lastAppliedAlpha == nil or math.abs(curA - lm.lastAppliedAlpha) > 0.01 then
+                            lm.blizzAlpha = curA
+                        end
+                    end
+                    local topFade = ComputeLineTopFade(region, cf, fadePct)
+                    local target = (topFade < 0.999) and (lm.blizzAlpha * topFade) or lm.blizzAlpha
+                    lm.lastAppliedAlpha = (topFade < 0.999) and target or nil
+                    if math.abs(curA - target) > 0.005 then
+                        settingTextAlphaGuard = true
+                        region:SetAlpha(target)
+                        settingTextAlphaGuard = false
+                    end
+                end
+            else
+                local lm = textLineMeta[region]
+                if lm and lm.lastAppliedAlpha ~= nil then
+                    local restoreA = lm.blizzAlpha or 1
+                    lm.lastAppliedAlpha = nil
+                    lm.blizzAlpha = nil
+                    settingTextAlphaGuard = true
+                    region:SetAlpha(restoreA)
+                    settingTextAlphaGuard = false
+                end
+            end
+        end
+    end
+end
+
 -- Zero-Flicker Suppression of Default Chat Background & Border Textures (no Hide/FADEFRAMES taint)
-local function SuppressBgTexture(tex, suppress)
+local function SuppressBgTexture(tex, suppress, cf, index)
     if not tex then return end
     local meta = texMeta[tex]
     if not meta then
         meta = {}
         texMeta[tex] = meta
     end
+    if cf ~= nil then meta.cf = cf end
+    if index ~= nil then meta.index = index end
 
     if not meta.hooked and type(tex) == "table" and type(tex.SetAlpha) == "function" then
         meta.hooked = true
         pcall(hooksecurefunc, tex, "SetAlpha", function(self, alpha)
             if settingBgAlphaGuard then return end
-            local sdb = YRG:GetSteamdeckDB()
-            if sdb and sdb.gradientChatBackground and alpha and alpha > 0 then
+            local tm = texMeta[self]
+            if tm and ShouldApplyGradientToChatFrame(tm.cf, tm.index) and alpha and alpha > 0 then
                 settingBgAlphaGuard = true
                 self:SetAlpha(0)
                 settingBgAlphaGuard = false
@@ -598,18 +759,19 @@ local function SuppressDefaultChatBgRegions(cf, index, suppress)
     for _, suffix in ipairs(CHAT_BORDER_SUFFIXES) do
         local tex = _G["ChatFrame" .. index .. suffix]
         if tex then
-            SuppressBgTexture(tex, suppress)
+            SuppressBgTexture(tex, suppress, cf, index)
         end
     end
     if cf.Background then
-        SuppressBgTexture(cf.Background, suppress)
+        SuppressBgTexture(cf.Background, suppress, cf, index)
     end
 end
 
 -- Half-Radial Warm Dark-Brown Gradient Chat Background Replacer (parented to UIParent to avoid ChatFrame taint)
-local function UpdateChatFrameGradientBg(cf, index, enableGradient)
+local function UpdateChatFrameGradientBg(cf, index)
     if not cf then return end
     local sdb = YRG:GetSteamdeckDB()
+    local enableGradient = ShouldApplyGradientToChatFrame(cf, index)
 
     SuppressDefaultChatBgRegions(cf, index, enableGradient)
 
@@ -726,19 +888,37 @@ local function SetChatWindowsContentAlpha(alpha)
     local sdb = YRG:GetSteamdeckDB()
     local opacityPct = (sdb and tonumber(sdb.chatGradientOpacityPct)) or 45
     local baseAlpha = math.max(0, math.min(1, opacityPct / 100.0))
+    local includeFloating = not sdb or (sdb.chatInactivityIncludeFloating ~= false)
 
     local maxWindows = NUM_CHAT_WINDOWS or 10
     for i = 1, maxWindows do
         local cf = _G["ChatFrame" .. i]
         if cf then
-            if cf.FontStringContainer and type(cf.FontStringContainer.SetAlpha) == "function" then
-                cf.FontStringContainer:SetAlpha(alpha)
-            elseif type(cf.SetAlpha) == "function" then
-                cf:SetAlpha(alpha)
-            end
-            local meta = chatFrameMeta[cf]
-            if meta and meta.gradBg and sdb and sdb.gradientChatBackground then
-                meta.gradBg:SetVertexColor(1, 1, 1, baseAlpha * alpha)
+            local effAlpha = (includeFloating or IsMainOrDockedChatFrame(cf, i)) and alpha or 1.0
+            local useGradient = ShouldApplyGradientToChatFrame(cf, i)
+            if useGradient then
+                if type(cf.SetAlpha) == "function" and type(cf.GetAlpha) == "function" and math.abs((cf:GetAlpha() or 1) - 1.0) > 0.002 then
+                    cf:SetAlpha(1.0)
+                end
+                if cf.FontStringContainer and type(cf.FontStringContainer.SetAlpha) == "function" then
+                    cf.FontStringContainer:SetAlpha(effAlpha)
+                elseif type(cf.SetAlpha) == "function" then
+                    cf:SetAlpha(effAlpha)
+                end
+                local meta = chatFrameMeta[cf]
+                if meta and meta.gradBg then
+                    meta.gradBg:SetVertexColor(1, 1, 1, baseAlpha * effAlpha)
+                end
+            else
+                if cf.FontStringContainer and type(cf.FontStringContainer.SetAlpha) == "function" then
+                    cf.FontStringContainer:SetAlpha(1.0)
+                end
+                if type(cf.SetAlpha) == "function" then
+                    local curA = (type(cf.GetAlpha) == "function") and (cf:GetAlpha() or 1) or 1
+                    if math.abs(curA - effAlpha) > 0.002 then
+                        cf:SetAlpha(effAlpha)
+                    end
+                end
             end
         end
     end
@@ -912,16 +1092,48 @@ local function HookChatFrameForActivityAndSize(cf, index)
     if type(cf) == "table" then
         if type(cf.AddMessage) == "function" then
             pcall(hooksecurefunc, cf, "AddMessage", function(self)
-                lastChatActivityTime = (GetTime and GetTime()) or 0
-                if currentChatFadeAlpha < 1.0 then
-                    SetChatWindowsContentAlpha(1.0)
+                local sdb = YRG:GetSteamdeckDB()
+                if not sdb or sdb.chatInactivityIncludeFloating ~= false or IsMainOrDockedChatFrame(self, index) then
+                    lastChatActivityTime = (GetTime and GetTime()) or 0
+                    if currentChatFadeAlpha < 1.0 then
+                        SetChatWindowsContentAlpha(1.0)
+                    end
                 end
                 if ShouldSuppressChatScrollBar() then
                     if self.ScrollBar then ForceHideScrollElement(self.ScrollBar) end
                     if self.ScrollToBottomButton then ForceHideScrollElement(self.ScrollToBottomButton) end
                     if self.buttonFrame then ForceHideScrollElement(self.buttonFrame) end
                 end
+                if ShouldApplyTopTextFade(self, index) then
+                    ApplyChatTopTextFade(self, index)
+                    if C_Timer and type(C_Timer.After) == "function" then
+                        C_Timer.After(0, function()
+                            if self and self:IsShown() then
+                                ApplyChatTopTextFade(self, index)
+                            end
+                        end)
+                    end
+                end
             end)
+        end
+        for _, methodName in ipairs({
+            "RefreshDisplay",
+            "ScrollUp",
+            "ScrollDown",
+            "PageUp",
+            "PageDown",
+            "ScrollToTop",
+            "ScrollToBottom",
+            "SetScrollOffset",
+            "Update",
+        }) do
+            if type(cf[methodName]) == "function" then
+                pcall(hooksecurefunc, cf, methodName, function(self)
+                    if ShouldApplyTopTextFade(self, index) then
+                        ApplyChatTopTextFade(self, index)
+                    end
+                end)
+            end
         end
         if type(cf.UpdateScrollBar) == "function" then
             pcall(hooksecurefunc, cf, "UpdateScrollBar", function(self)
@@ -985,11 +1197,8 @@ local function HookChatFrameForActivityAndSize(cf, index)
     end
 
     cf:HookScript("OnShow", function(self)
-        local m = chatFrameMeta[self]
-        local sdb = YRG:GetSteamdeckDB()
-        if m and m.gradFrame then
-            m.gradFrame:SetShown(sdb and sdb.gradientChatBackground and true or false)
-        end
+        UpdateChatFrameGradientBg(self, index)
+        ApplyChatTopTextFade(self, index)
     end)
 
     cf:HookScript("OnHide", function(self)
@@ -999,11 +1208,20 @@ local function HookChatFrameForActivityAndSize(cf, index)
         end
     end)
 
+    if type(cf.HookScript) == "function" and (type(cf.HasScript) ~= "function" or cf:HasScript("OnMouseWheel")) then
+        pcall(cf.HookScript, cf, "OnMouseWheel", function(self)
+            if ShouldApplyTopTextFade(self, index) then
+                ApplyChatTopTextFade(self, index)
+            end
+        end)
+    end
+
     cf:HookScript("OnSizeChanged", function(self)
         local sdb = YRG:GetSteamdeckDB()
         if sdb and sdb.gradientChatBackground then
-            UpdateChatFrameGradientBg(self, index, true)
+            UpdateChatFrameGradientBg(self, index)
         end
+        ApplyChatTopTextFade(self, index)
         if ShouldSuppressChatScrollBar() then
             if self.ScrollBar then ForceHideScrollElement(self.ScrollBar) end
             if self.ScrollToBottomButton then ForceHideScrollElement(self.ScrollToBottomButton) end
@@ -1073,7 +1291,6 @@ end
 
 function YRG:ApplySteamdeckSettings()
     local sdb = self:GetSteamdeckDB()
-    local enableGradient = sdb.gradientChatBackground and true or false
 
     HookEditModeForChat()
 
@@ -1097,8 +1314,9 @@ function YRG:ApplySteamdeckSettings()
             -- Update ClampRectInsets so chat frame can snap flush to left & bottom edges
             EnforceChatFrameClampInsets(cf)
 
-            -- Custom half-radial Forever-tinted gradient background
-            UpdateChatFrameGradientBg(cf, i, enableGradient)
+            -- Custom half-radial Forever-tinted gradient background & optional top-edge text fade
+            UpdateChatFrameGradientBg(cf, i)
+            ApplyChatTopTextFade(cf, i)
         end
     end
 
@@ -1120,10 +1338,8 @@ function YRG:ApplySteamdeckSettings()
         UpdateChatTabsAlpha(true)
     end
 
-    -- Inactivity Fade Reset if disabled
-    if not sdb.fadeChatOnInactivity then
-        SetChatWindowsContentAlpha(1.0)
-    end
+    -- Sync Inactivity Fade state across main & floating chat windows
+    SetChatWindowsContentAlpha(sdb.fadeChatOnInactivity and currentChatFadeAlpha or 1.0)
 
     -- Snap ChatFrame1 closer to the left and/or bottom screen edges (and re-verify next frame after EditMode/Gamepad layout)
     EnforceChatFrame1EdgeSnap()
@@ -2154,10 +2370,9 @@ end
 -- Hook Blizzard's FloatingChatFrame fade functions so default backgrounds & scrollbars never flash
 local function EnforceChatFrameOverridesOnHook(chatFrame)
     if not chatFrame then return end
-    local sdb = YRG:GetSteamdeckDB()
-    if sdb and sdb.gradientChatBackground then
-        local meta = chatFrameMeta[chatFrame]
-        local idx = (meta and meta.index) or (chatFrame.GetID and chatFrame:GetID()) or 1
+    local meta = chatFrameMeta[chatFrame]
+    local idx = (meta and meta.index) or (chatFrame.GetID and chatFrame:GetID()) or 1
+    if ShouldApplyGradientToChatFrame(chatFrame, idx) then
         SuppressDefaultChatBgRegions(chatFrame, idx, true)
     end
     if ShouldSuppressChatScrollBar() then
@@ -2178,19 +2393,18 @@ end
 if type(FCF_SetWindowAlpha) == "function" then
     hooksecurefunc("FCF_SetWindowAlpha", function(chatFrame, alpha)
         if settingWindowAlphaGuard or not chatFrame then return end
-        local sdb = YRG:GetSteamdeckDB()
-        if sdb and sdb.gradientChatBackground then
+        local meta = chatFrameMeta[chatFrame]
+        local idx = (meta and meta.index) or (chatFrame.GetID and chatFrame:GetID()) or 1
+        if ShouldApplyGradientToChatFrame(chatFrame, idx) then
             settingWindowAlphaGuard = true
-            local meta = chatFrameMeta[chatFrame]
-            local idx = (meta and meta.index) or (chatFrame.GetID and chatFrame:GetID()) or 1
             SuppressDefaultChatBgRegions(chatFrame, idx, true)
             settingWindowAlphaGuard = false
         end
     end)
 end
 
--- Periodic watcher for Chat Tab hover-fade, ScrollBar auto-hide, and Chat Inactivity fade
--- Runs only when autoFadeChatTabs or fadeChatOnInactivity is enabled, and only acts on state changes.
+-- Periodic watcher for Chat Tab hover-fade, ScrollBar auto-hide, top-edge text fade, and Chat Inactivity fade
+-- Runs only when autoFadeChatTabs, fadeChatOnInactivity, or fadeChatTopText is enabled.
 local chatWatcher = CreateFrame("Frame")
 local watcherElapsed = 0
 chatWatcher:SetScript("OnUpdate", function(_, elapsed)
@@ -2200,7 +2414,19 @@ chatWatcher:SetScript("OnUpdate", function(_, elapsed)
     watcherElapsed = 0
 
     local sdb = YRG:GetSteamdeckDB()
-    if not sdb or (not sdb.autoFadeChatTabs and not sdb.fadeChatOnInactivity) then return end
+    if not sdb or (not sdb.autoFadeChatTabs and not sdb.fadeChatOnInactivity and not sdb.fadeChatTopText) then return end
+
+    if sdb.fadeChatTopText then
+        local maxWindows = NUM_CHAT_WINDOWS or 10
+        for i = 1, maxWindows do
+            local cf = _G["ChatFrame" .. i]
+            if cf and cf.IsShown and cf:IsShown() and ShouldApplyTopTextFade(cf, i) then
+                ApplyChatTopTextFade(cf, i)
+            end
+        end
+    end
+
+    if not sdb.autoFadeChatTabs and not sdb.fadeChatOnInactivity then return end
 
     local active = IsMouseOverAnyChatOrTab() or IsAnyChatEditBoxActive()
 
@@ -2238,6 +2464,9 @@ end)
 if type(ChatEdit_ActivateChat) == "function" then
     hooksecurefunc("ChatEdit_ActivateChat", function(editBox)
         lastChatActivityTime = (GetTime and GetTime()) or 0
+        if currentChatFadeAlpha < 1.0 then
+            SetChatWindowsContentAlpha(1.0)
+        end
         if editBox then
             UpdateEditBoxLayoutAndVisibility(editBox, editBox.chatFrame or ChatFrame1)
             ApplyEditBoxVisualState(editBox, true)
@@ -2256,6 +2485,12 @@ end
 
 if type(FCF_DockUpdate) == "function" then
     hooksecurefunc("FCF_DockUpdate", function()
+        ScheduleChatRefresh()
+    end)
+end
+
+if type(FCF_UnDockFrame) == "function" then
+    hooksecurefunc("FCF_UnDockFrame", function()
         ScheduleChatRefresh()
     end)
 end
@@ -2644,6 +2879,7 @@ local function BuildSettingsPanels()
     })
 
     local gradientVars = {
+        "YRG_Main_chatGradientMainOnly",
         "YRG_Main_chatGradientWidthPct",
         "YRG_Main_chatGradientHeightPct",
         "YRG_Main_chatGradientOpacityPct",
@@ -2664,6 +2900,27 @@ local function BuildSettingsPanels()
     local function IsGradientEnabled()
         return YRG:GetSteamdeckDB().gradientChatBackground and true or false
     end
+
+    local function IsTopTextFadeEnabled()
+        return YRG:GetSteamdeckDB().fadeChatTopText and true or false
+    end
+
+    local function IsGradientOrTopFadeEnabled()
+        return IsGradientEnabled() or IsTopTextFadeEnabled()
+    end
+
+    mainCtx:AddCheckbox({
+        key = "chatGradientMainOnly",
+        name = "Apply Gradient / Top Text Fade to Main Chat Only",
+        tooltip = "Only applies the gradient background overlay and top-edge text fade to the main docked chat window (and its docked tabs), leaving separate free-floating chat windows untouched.",
+        defaultValue = true,
+        canModify = IsGradientOrTopFadeEnabled,
+        get = function() return YRG:GetSteamdeckDB().chatGradientMainOnly ~= false end,
+        set = function(val)
+            YRG:GetSteamdeckDB().chatGradientMainOnly = val and true or false
+            YRG:ApplySteamdeckSettings()
+        end,
+    })
 
     mainCtx:AddSlider({
         key = "chatGradientWidthPct",
@@ -2708,15 +2965,59 @@ local function BuildSettingsPanels()
     })
 
     mainCtx:AddCheckbox({
+        key = "fadeChatTopText",
+        name = "Fade Chat Text Near Top Edge",
+        tooltip = "Softly fades chat lines as they scroll into the top portion of the chat window to blend cleanly with the gradient background.",
+        defaultValue = false,
+        notifies = { "YRG_Main_chatTextTopFadePct", "YRG_Main_chatGradientMainOnly" },
+        get = function() return YRG:GetSteamdeckDB().fadeChatTopText and true or false end,
+        set = function(val)
+            YRG:GetSteamdeckDB().fadeChatTopText = val and true or false
+            YRG:ApplySteamdeckSettings()
+        end,
+    })
+
+    mainCtx:AddSlider({
+        key = "chatTextTopFadePct",
+        name = "Top Text Fade Amount (%)",
+        tooltip = "Percentage of the chat window height from the top edge over which chat text fades out.",
+        min = 10, max = 75, step = 5, defaultValue = 35,
+        format = function(v) return string.format("%d%%", v) end,
+        canModify = IsTopTextFadeEnabled,
+        get = function() return YRG:GetSteamdeckDB().chatTextTopFadePct or 35 end,
+        set = function(val)
+            YRG:GetSteamdeckDB().chatTextTopFadePct = val
+            YRG:ApplySteamdeckSettings()
+        end,
+    })
+
+    mainCtx:AddCheckbox({
         key = "fadeChatOnInactivity",
         name = "Fade Chat Window When No New Messages",
         tooltip = "Automatically fades out the chat window when no new chat messages have been received for the configured number of minutes.",
         defaultValue = false,
-        notifies = { "YRG_Main_chatInactivityMinutes" },
+        notifies = { "YRG_Main_chatInactivityIncludeFloating", "YRG_Main_chatInactivityMinutes" },
         get = function() return YRG:GetSteamdeckDB().fadeChatOnInactivity end,
         set = function(val)
             YRG:GetSteamdeckDB().fadeChatOnInactivity = val
             YRG:ResetChatInactivityTimer()
+            YRG:ApplySteamdeckSettings()
+        end,
+    })
+
+    local function IsInactivityFadeEnabled()
+        return YRG:GetSteamdeckDB().fadeChatOnInactivity and true or false
+    end
+
+    mainCtx:AddCheckbox({
+        key = "chatInactivityIncludeFloating",
+        name = "Include Other Chat Windows in Inactivity Fade",
+        tooltip = "Also fades separate free-floating chat tabs/windows when chat is inactive (even when excluded from the Forever background gradient).",
+        defaultValue = true,
+        canModify = IsInactivityFadeEnabled,
+        get = function() return YRG:GetSteamdeckDB().chatInactivityIncludeFloating ~= false end,
+        set = function(val)
+            YRG:GetSteamdeckDB().chatInactivityIncludeFloating = val and true or false
             YRG:ApplySteamdeckSettings()
         end,
     })
@@ -2727,7 +3028,7 @@ local function BuildSettingsPanels()
         tooltip = "Minutes without new chat messages before fading the chat window.",
         min = 1, max = 30, step = 1, defaultValue = 5,
         format = function(v) return string.format("%d min", v) end,
-        canModify = function() return YRG:GetSteamdeckDB().fadeChatOnInactivity and true or false end,
+        canModify = IsInactivityFadeEnabled,
         get = function() return YRG:GetSteamdeckDB().chatInactivityMinutes or 5 end,
         set = function(val)
             YRG:GetSteamdeckDB().chatInactivityMinutes = val

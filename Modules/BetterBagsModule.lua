@@ -50,7 +50,7 @@ local BetterBags = {
         controllerBagStrip = true,
         rowGap = 8,
         showDivider = true,
-        bagPinAlignment = "LEFT", -- "LEFT", "CENTER", "RIGHT"
+        bagPinAlignment = "RIGHT", -- "LEFT", "CENTER", "RIGHT"
         includeReagentBagInCombined = true,
         reagentBagTintPurple = true,
         autoSortOnOpen = false,
@@ -62,9 +62,11 @@ local BetterBags = {
 }
 
 local controllerStripHooked = false
+local gamepadBagBarHooked = false
 local reagentSearchHooked = false
 local autoSortHooked = false
 local pending, applying = false, false
+local deferredPassPending = false
 local dividerFrame = nil
 local divider = nil
 local reagentDividerFrame = nil
@@ -94,9 +96,77 @@ local function IsFrameProtectedOrForbidden(f)
     return false
 end
 
+local function GetReagentBagID()
+    if REAGENTBAG_CONTAINER ~= nil then
+        return REAGENTBAG_CONTAINER
+    end
+    if Enum and Enum.BagIndex and Enum.BagIndex.ReagentBag ~= nil then
+        return Enum.BagIndex.ReagentBag
+    end
+    return 5
+end
+
+local nativeBagBaseY = setmetatable({}, { __mode = "k" })
+local ApplyUnifiedBagLayout
+
 local function HideDividerOverlay()
     if dividerFrame then
         dividerFrame:Hide()
+    end
+end
+
+local function CollectControllerBagButtons(bar, includeHiddenReagent)
+    if not bar or type(bar.GetBagButton) ~= "function" then return nil end
+    local bags, seenBagIDs = {}, {}
+
+    local function TryAdd(id, requireShown)
+        if id == nil or seenBagIDs[id] then return true end
+        seenBagIDs[id] = true
+        local button = bar:GetBagButton(id)
+        if not button then return true end
+        if requireShown and type(button.IsShown) == "function" and not button:IsShown() then
+            return true
+        end
+        if IsFrameProtectedOrForbidden(button) then return false end
+        bags[#bags + 1] = button
+        return true
+    end
+
+    local startBag = BACKPACK_CONTAINER or 0
+    local endBag = ENDING_BAG_INDEX or 4
+    for id = startBag, endBag do
+        if not TryAdd(id, false) then return nil end
+    end
+
+    local reagentID = GetReagentBagID()
+    if reagentID ~= nil then
+        if not TryAdd(reagentID, not includeHiddenReagent) then return nil end
+    end
+
+    if KEYRING_CONTAINER then
+        local showKR = (GetCVarBool and GetCVarBool("showKeyring"))
+        local krBtn = bar:GetBagButton(KEYRING_CONTAINER)
+        if krBtn and (showKR or (type(krBtn.IsShown) == "function" and krBtn:IsShown())) then
+            if not TryAdd(KEYRING_CONTAINER, false) then return nil end
+        end
+    end
+
+    return bags
+end
+
+local function ResetControllerBagButtonScales()
+    if InCombatLockdown() then return end
+    local bar = GamepadBagBar
+    if not bar or IsFrameProtectedOrForbidden(bar) then return end
+    local bags = CollectControllerBagButtons(bar, true)
+    if not bags then return end
+    for _, button in ipairs(bags) do
+        if not IsFrameProtectedOrForbidden(button) and type(button.SetScale) == "function" then
+            local curScale = YRG.SafeNumber(button.GetScale and button:GetScale(), 1)
+            if math.abs(curScale - 1) >= 0.005 then
+                button:SetScale(1)
+            end
+        end
     end
 end
 
@@ -114,6 +184,7 @@ local function ApplyControllerBagStripLayout()
     local db = YRG:GetModuleDB("BetterBagsModule")
     if not db or not db.enabled or db.controllerBagStrip == false then
         HideDividerOverlay()
+        ResetControllerBagButtonScales()
         return
     end
 
@@ -124,6 +195,7 @@ local function ApplyControllerBagStripLayout()
     end
     if not IsControllerUIActive() then
         HideDividerOverlay()
+        ResetControllerBagButtonScales()
         return
     end
     if IsFrameProtectedOrForbidden(frame) or IsFrameProtectedOrForbidden(bar) then
@@ -132,37 +204,37 @@ local function ApplyControllerBagStripLayout()
     end
 
     local columns = frame:GetColumns()
-    if not frame.itemButtonPool or type(frame.itemButtonPool.GetTemplate) ~= "function" then return end
+    if not frame.itemButtonPool or type(frame.itemButtonPool.GetTemplate) ~= "function" then
+        HideDividerOverlay()
+        return
+    end
     local template = C_XMLUtil and C_XMLUtil.GetTemplateInfo and C_XMLUtil.GetTemplateInfo(frame.itemButtonPool:GetTemplate())
-    if not template or not template.width or not template.height then return end
+    if not template or not template.width or not template.height then
+        HideDividerOverlay()
+        return
+    end
 
     local anchor = frame.MoneyFrame
-    if not anchor or IsFrameProtectedOrForbidden(anchor) or columns < 1 then return end
-
-    local bags, items = {}, {}
-    local startBag = BACKPACK_CONTAINER or 0
-    local endBag = ENDING_BAG_INDEX or 4
-    for id = startBag, endBag do
-        local button = bar:GetBagButton(id)
-        if button then
-            if IsFrameProtectedOrForbidden(button) then return end
-            bags[#bags + 1] = button
-        end
+    if not anchor or IsFrameProtectedOrForbidden(anchor) or columns < 1 then
+        HideDividerOverlay()
+        return
     end
-    if KEYRING_CONTAINER then
-        local button = bar:GetBagButton(KEYRING_CONTAINER)
-        if button and ((GetCVarBool and GetCVarBool("showKeyring")) or (type(button.IsShown) == "function" and button:IsShown())) then
-            if IsFrameProtectedOrForbidden(button) then return end
-            bags[#bags + 1] = button
-        end
-    end
-    if #bags == 0 then return end
 
+    local bags = CollectControllerBagButtons(bar, false)
+    if not bags or #bags == 0 then
+        HideDividerOverlay()
+        return
+    end
+
+    local items = {}
     local itemW, itemH = template.width, template.height
     local maxX, minY
     local xs, ys = {}, {}
     for _, button in frame:EnumerateValidItems() do
-        if IsFrameProtectedOrForbidden(button) then return end
+        if IsFrameProtectedOrForbidden(button) then
+            HideDividerOverlay()
+            return
+        end
         if type(button.IsShown) ~= "function" or button:IsShown() then
             local bag = bar:GetBagButton(button:GetBagID())
             if not bag or bag.isCollapsed ~= true then
@@ -170,6 +242,7 @@ local function ApplyControllerBagStripLayout()
                 if point ~= "BOTTOMRIGHT" or relativeTo ~= anchor
                     or relativePoint ~= "TOPRIGHT"
                     or type(x) ~= "number" or type(y) ~= "number" then
+                    HideDividerOverlay()
                     return
                 end
                 if not maxX or x > maxX then maxX = x end
@@ -181,8 +254,12 @@ local function ApplyControllerBagStripLayout()
         end
     end
 
+    -- Preserve Blizzard's native bottom offset across mode switches and repeat layout passes
+    if minY and minY < 20 then
+        nativeBagBaseY[frame] = minY
+    end
     local baseX = (maxX and maxX <= 2) and maxX or 0
-    local baseY = minY or 4
+    local baseY = nativeBagBaseY[frame] or 4
     local stepX = itemW + 5
     local stepY = itemH + 5
 
@@ -226,7 +303,7 @@ local function ApplyControllerBagStripLayout()
     end)
 
     local gap = db.rowGap or 8
-    local pinAlign = db.bagPinAlignment or "LEFT"
+    local pinAlign = db.bagPinAlignment or "RIGHT"
     local itemRows = math.ceil(#items / columns)
     local bagRows = math.ceil(#bags / columns)
     local height = frame:CalculateHeight()
@@ -240,6 +317,18 @@ local function ApplyControllerBagStripLayout()
         if math.abs(entry.x - tx) >= 0.4 or math.abs(entry.y - ty) >= 0.4 then
             entry.button:ClearAllPoints()
             entry.button:SetPoint("BOTTOMRIGHT", anchor, "TOPRIGHT", tx, ty)
+        end
+    end
+
+    local frameStrata = (frame.GetFrameStrata and frame:GetFrameStrata()) or "MEDIUM"
+    local frameLevel = math.max((frame.GetFrameLevel and frame:GetFrameLevel()) or 1, 1)
+    if type(bar.SetFrameStrata) == "function" and bar.GetFrameStrata and bar:GetFrameStrata() ~= frameStrata then
+        bar:SetFrameStrata(frameStrata)
+    end
+    if type(bar.SetFrameLevel) == "function" and bar.GetFrameLevel then
+        local curBarLevel = YRG.SafeNumber(bar:GetFrameLevel(), 0)
+        if curBarLevel <= frameLevel + 1 then
+            bar:SetFrameLevel(frameLevel + 2)
         end
     end
 
@@ -263,6 +352,20 @@ local function ApplyControllerBagStripLayout()
             colFromRight = columns - 1 - targetColFromLeft
         else -- "LEFT"
             colFromRight = columns - 1 - colInRow
+        end
+
+        -- Match each bag button's screen-space scale to the container (essential when 1280x800 auto-scales
+        -- ContainerFrameCombinedBags smaller than GamepadBagBar so bag rects do not overlap neighbors or items).
+        local rawBtnW = YRG.SafeNumber(button.GetWidth and button:GetWidth(), itemW)
+        local fitScale = (rawBtnW > 0 and rawBtnW > (stepX - 2)) and ((stepX - 2) / rawBtnW) or 1
+        local btnParent = button.GetParent and button:GetParent()
+        local btnParentScale = math.max(YRG.SafeNumber(btnParent and btnParent.GetEffectiveScale and btnParent:GetEffectiveScale(), 1), 0.01)
+        local targetSelfScale = (ancScale * fitScale) / btnParentScale
+        if type(button.SetScale) == "function" then
+            local curSelfScale = YRG.SafeNumber(button.GetScale and button:GetScale(), 1)
+            if math.abs(curSelfScale - targetSelfScale) >= 0.005 then
+                button:SetScale(targetSelfScale)
+            end
         end
 
         -- Center bag button horizontally & vertically inside its column cell in anchor space,
@@ -298,9 +401,10 @@ local function ApplyControllerBagStripLayout()
         divider:SetColorTexture(0.65, 0.55, 0.35, 0.45)
         frame:HookScript("OnHide", HideDividerOverlay)
     end
-    dividerFrame:SetScale((frame.GetScale and frame:GetScale()) or 1)
-    dividerFrame:SetFrameStrata(frame:GetFrameStrata() or "MEDIUM")
-    dividerFrame:SetFrameLevel((frame:GetFrameLevel() or 1) + 2)
+    local uiScale = math.max(YRG.SafeNumber(UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale(), 1), 0.01)
+    dividerFrame:SetScale(ancScale / uiScale)
+    dividerFrame:SetFrameStrata(frameStrata)
+    dividerFrame:SetFrameLevel(frameLevel + 2)
     dividerFrame:ClearAllPoints()
     dividerFrame:SetPoint("BOTTOMRIGHT", anchor, "TOPRIGHT", baseX,
         baseY + itemRows * stepY + (gap - (stepY - itemH)) / 2)
@@ -317,16 +421,6 @@ end
 -- =========================================================================
 -- NON-CONTROLLER MODE: Merge Reagent Bag into Combined Bags (Optional Purple Tint)
 -- =========================================================================
-local function GetReagentBagID()
-    if REAGENTBAG_CONTAINER ~= nil then
-        return REAGENTBAG_CONTAINER
-    end
-    if Enum and Enum.BagIndex and Enum.BagIndex.ReagentBag ~= nil then
-        return Enum.BagIndex.ReagentBag
-    end
-    return 5
-end
-
 local function GetBagNumSlotsSafe(bagID)
     if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
         return YRG.SafeNumber(C_Container.GetContainerNumSlots(bagID), 0)
@@ -335,9 +429,6 @@ local function GetBagNumSlotsSafe(bagID)
     end
     return 0
 end
-
-local nativeBagBaseY = setmetatable({}, { __mode = "k" })
-local ApplyUnifiedBagLayout
 
 local function HideReagentOverlays()
     if reagentDividerFrame then
@@ -834,6 +925,7 @@ ApplyUnifiedBagLayout = function()
         ApplyControllerBagStripLayout()
     else
         HideDividerOverlay()
+        ResetControllerBagButtonScales()
         ApplyNonControllerReagentMerge()
     end
 end
@@ -1083,6 +1175,7 @@ local function RefreshBlizzardBagLayout()
     local db = YRG:GetModuleDB("BetterBagsModule")
     if not db or not db.enabled then
         HideDividerOverlay()
+        ResetControllerBagButtonScales()
         RestoreCombinedBagsFromMerge(ContainerFrameCombinedBags)
         return
     end
@@ -1119,6 +1212,24 @@ local function InstallAutomationHooks()
     end
 end
 
+local function ScheduleUnifiedBagLayout()
+    if deferredPassPending then return end
+    if C_Timer and type(C_Timer.After) == "function" then
+        deferredPassPending = true
+        C_Timer.After(0, function()
+            deferredPassPending = false
+            if ContainerFrameCombinedBags and ContainerFrameCombinedBags:IsShown() then
+                ApplyUnifiedBagLayout()
+            end
+        end)
+    end
+end
+
+local function ApplyAndScheduleUnifiedBagLayout()
+    ApplyUnifiedBagLayout()
+    ScheduleUnifiedBagLayout()
+end
+
 InstallControllerStripHooks = function()
     if not reagentSearchHooked and BagItemSearchBox and type(BagItemSearchBox.HookScript) == "function" then
         reagentSearchHooked = true
@@ -1134,22 +1245,38 @@ InstallControllerStripHooks = function()
     local db = YRG:GetModuleDB("BetterBagsModule")
     if not db or not db.enabled then return end
     if db.controllerBagStrip == false and db.includeReagentBagInCombined == false then return end
-    if controllerStripHooked or type(UpdateContainerFrameAnchors) ~= "function"
-        or not ContainerFrameCombinedBags then return end
 
-    hooksecurefunc("UpdateContainerFrameAnchors", ApplyUnifiedBagLayout)
-    if type(ContainerFrameCombinedBags.UpdateItems) == "function" then
-        hooksecurefunc(ContainerFrameCombinedBags, "UpdateItems", ApplyUnifiedBagLayout)
+    if not controllerStripHooked and type(UpdateContainerFrameAnchors) == "function"
+        and ContainerFrameCombinedBags then
+        hooksecurefunc("UpdateContainerFrameAnchors", ApplyAndScheduleUnifiedBagLayout)
+        for _, methodName in ipairs({ "UpdateItems", "UpdateItemLayout", "SetupGamepad", "FocusGamepad" }) do
+            if type(ContainerFrameCombinedBags[methodName]) == "function" then
+                local hookFn = (methodName == "SetupGamepad" or methodName == "FocusGamepad")
+                    and ApplyAndScheduleUnifiedBagLayout or ApplyUnifiedBagLayout
+                hooksecurefunc(ContainerFrameCombinedBags, methodName, hookFn)
+            end
+        end
+        ContainerFrameCombinedBags:HookScript("OnShow", ApplyAndScheduleUnifiedBagLayout)
+        ContainerFrameCombinedBags:HookScript("OnHide", function()
+            HideDividerOverlay()
+            HideReagentOverlays()
+        end)
+        controllerStripHooked = true
     end
-    if type(ContainerFrameCombinedBags.UpdateItemLayout) == "function" then
-        hooksecurefunc(ContainerFrameCombinedBags, "UpdateItemLayout", ApplyUnifiedBagLayout)
+
+    -- Hook GamepadBagBar separately so delayed Proton/Blizzard bag bar layouts or
+    -- demand-loaded GamepadBagBar updates never leave bag buttons unpinned/unscaled.
+    if GamepadBagBar and not gamepadBagBarHooked then
+        if type(GamepadBagBar.HookScript) == "function" then
+            GamepadBagBar:HookScript("OnShow", ApplyAndScheduleUnifiedBagLayout)
+        end
+        for _, methodName in ipairs({ "Layout", "Update", "SetupGamepad", "UpdateBagButtons" }) do
+            if type(GamepadBagBar[methodName]) == "function" then
+                hooksecurefunc(GamepadBagBar, methodName, ApplyAndScheduleUnifiedBagLayout)
+            end
+        end
+        gamepadBagBarHooked = true
     end
-    ContainerFrameCombinedBags:HookScript("OnShow", ApplyUnifiedBagLayout)
-    ContainerFrameCombinedBags:HookScript("OnHide", function()
-        HideDividerOverlay()
-        HideReagentOverlays()
-    end)
-    controllerStripHooked = true
 end
 
 function BetterBags:GetStatusMessage()
@@ -1164,7 +1291,7 @@ function BetterBags:GetStatusMessage()
     elseif InCombatLockdown() then
         return "Layout changes will apply after combat."
     else
-        return "Active: Controller Bag Strip pinned (" .. (db.bagPinAlignment or "LEFT") .. ") + Bag Automation Active."
+        return "Active: Controller Bag Strip pinned (" .. (db.bagPinAlignment or "RIGHT") .. ") + Bag Automation Active."
     end
 end
 
@@ -1228,9 +1355,9 @@ function BetterBags:OnInitialize(db)
             or event == "BAG_NEW_ITEMS_UPDATED" or event == "INVENTORY_SEARCH_UPDATE" then
             UpdateAllReagentSlotButtons()
         elseif event == "BAG_CONTAINER_UPDATE" then
-            ApplyUnifiedBagLayout()
+            ApplyAndScheduleUnifiedBagLayout()
         elseif event == "PLAYER_LOGIN" or event == "GAME_PAD_ACTIVE_CHANGED" or (event == "PLAYER_REGEN_ENABLED" and pending) then
-            ApplyUnifiedBagLayout()
+            ApplyAndScheduleUnifiedBagLayout()
         end
         self:UpdateStatusText()
     end)
@@ -1247,6 +1374,7 @@ end
 
 function BetterBags:OnDisable(db)
     HideDividerOverlay()
+    ResetControllerBagButtonScales()
     RestoreCombinedBagsFromMerge(ContainerFrameCombinedBags)
     self:UpdateStatusText()
 end
@@ -1326,7 +1454,7 @@ function BetterBags:BuildConfigUI(ctx, db)
         key = "bagPinAlignment",
         name = "Controller Bag Bar Pin Alignment",
         tooltip = "Horizontal alignment of the separate bag control strip above your bag grid in Controller Mode. Tip: Right alignment keeps bag buttons above filled top-right item columns when top-left slots are empty.",
-        defaultValue = "LEFT",
+        defaultValue = "RIGHT",
         canModify = IsControllerStripEnabled,
         options = {
             { value = "LEFT", label = "Left" },
@@ -1335,7 +1463,7 @@ function BetterBags:BuildConfigUI(ctx, db)
         },
         get = function()
             local mdb = GetDB()
-            return (mdb and mdb.bagPinAlignment) or "LEFT"
+            return (mdb and mdb.bagPinAlignment) or "RIGHT"
         end,
         set = function(val)
             local mdb = GetDB()
@@ -1808,12 +1936,27 @@ SlashCmdList.YRGBAGDEBUG = function()
     local calcH = (f.CalculateHeight and f:CalculateHeight()) or -1
     local curH = (f.GetHeight and f:GetHeight()) or -1
     local fScale = (f.GetEffectiveScale and f:GetEffectiveScale()) or 1
+    local fSelfScale = (f.GetScale and f:GetScale()) or 1
+    local fStrata = (f.GetFrameStrata and f:GetFrameStrata()) or "?"
+    local fLvl = (f.GetFrameLevel and f:GetFrameLevel()) or -1
     local bShown = b and b.IsShown and b:IsShown() or false
     local bMouse = b and b.IsMouseEnabled and b:IsMouseEnabled() or false
     local bScale = b and b.GetEffectiveScale and b:GetEffectiveScale() or -1
-    Emit(string.format("F:sh=%s strip=%s gp=%s cols=%d rows=%d calcH=%.0f curH=%.0f fSc=%.2f Bar:sh=%s m=%s sc=%.2f",
+    local bStrata = (b and b.GetFrameStrata and b:GetFrameStrata()) or "?"
+    local bLvl = (b and b.GetFrameLevel and b:GetFrameLevel()) or -1
+    local uiScale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or -1
+    local physW, physH = 0, 0
+    if type(GetPhysicalScreenSize) == "function" then
+        physW, physH = GetPhysicalScreenSize()
+    end
+    local combCVar = GetCVar and GetCVar("combinedBags")
+    Emit(string.format("F:sh=%s strip=%s gp=%s pin=%s gap=%s cols=%d rows=%d calcH=%.0f curH=%.0f fSc=%.2f(s=%.2f) fZ=%s:%d Bar:sh=%s m=%s sc=%.2f bZ=%s:%d",
         tostring(f:IsShown()), tostring(db and db.controllerBagStrip), tostring(IsControllerUIActive()),
-        cols, rows, calcH, curH, fScale, tostring(bShown), tostring(bMouse), bScale))
+        tostring(db and db.bagPinAlignment), tostring(db and db.rowGap),
+        cols, rows, calcH, curH, fScale, fSelfScale, tostring(fStrata), fLvl,
+        tostring(bShown), tostring(bMouse), bScale, tostring(bStrata), bLvl))
+    Emit(string.format("Env: phys=%dx%d uiSc=%.2f combinedBags=%s",
+        tonumber(physW) or 0, tonumber(physH) or 0, uiScale, tostring(combCVar)))
 
     local fKeys, bKeys, fSeen, bSeen = {}, {}, {}, {}
     local pats = { "pad", "nav", "cursor", "focus", "grid", "inline", "bag", "reagent", "item", "slot", "pool", "calc", "row", "col", "height", "layout" }
@@ -1924,24 +2067,31 @@ SlashCmdList.YRGBAGDEBUG = function()
     Emit("OpenCFs=[" .. table.concat(openCFs, "; ") .. "]")
 
     if b and type(b.GetBagButton) == "function" then
-        for id = (KEYRING_CONTAINER or -2), (ENDING_BAG_INDEX or 4) do
+        local maxBagID = math.max((ENDING_BAG_INDEX or 4), rBagID or 5)
+        for id = (KEYRING_CONTAINER or -2), maxBagID do
             local btn = b:GetBagButton(id)
             if btn then
                 local cx, cy = btn:GetCenter()
                 local bw, bh = btn:GetSize()
-                Emit(string.format("Bag[%d] sh=%s col=%s m=%s sc=%.2f sz=%.0fx%.0f pt=%s ctr=(%.1f,%.1f)",
+                local bl, br, bb, bt = btn:GetLeft(), btn:GetRight(), btn:GetBottom(), btn:GetTop()
+                Emit(string.format("Bag[%d] sh=%s col=%s m=%s s=%.2f eff=%.2f sz=%.0fx%.0f pt=%s ctr=(%.1f,%.1f) rect=%.0f..%.0f,%.0f..%.0f",
                     id, tostring(btn:IsShown()), tostring(btn.isCollapsed), tostring(btn.IsMouseEnabled and btn:IsMouseEnabled()),
+                    (btn.GetScale and btn:GetScale()) or 1,
                     (btn.GetEffectiveScale and btn:GetEffectiveScale()) or -1,
                     tonumber(bw) or -1, tonumber(bh) or -1,
-                    FmtPt(btn), tonumber(cx) or -1, tonumber(cy) or -1))
+                    FmtPt(btn), tonumber(cx) or -1, tonumber(cy) or -1,
+                    tonumber(bl) or -1, tonumber(br) or -1, tonumber(bb) or -1, tonumber(bt) or -1))
             end
         end
     end
 
     local cAuto = GetCVar and GetCVar("GamePadCursorAutoEnable")
     local cCtr = GetCVar and GetCVar("GamePadCursorCentering")
-    Emit(string.format("CVars: AutoEnable=%s Centering=%s SoftCursor=%s",
-        tostring(cAuto), tostring(cCtr), tostring(SoftCursor and SoftCursor.IsShown and SoftCursor:IsShown())))
+    local cTgt = GetCVar and GetCVar("GamePadCursorForTargeting")
+    local cStk = GetCVar and GetCVar("GamePadCursorAutoDisableSticks")
+    Emit(string.format("CVars: AutoEnable=%s Centering=%s Targeting=%s Sticks=%s SoftCursor=%s",
+        tostring(cAuto), tostring(cCtr), tostring(cTgt), tostring(cStk),
+        tostring(SoftCursor and SoftCursor.IsShown and SoftCursor:IsShown())))
 
     if db then
         db._lastDebug = lines

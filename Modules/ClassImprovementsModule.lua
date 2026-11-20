@@ -1252,9 +1252,7 @@ local CLASS_BUFF_PRIORITIES = {
         { match = { "aspect of the hawk", "aspect of the monkey", "aspect of the cheetah", "aspect of the pack", "aspect of the beast", "aspect of the wild", "aspect of the viper" }, cast = { "Aspect of the Hawk", "Aspect of the Monkey" }, keepActive = true },
         { match = { "trueshot aura" }, cast = { "Trueshot Aura" } },
     },
-    WARRIOR = {
-        { match = { "battle shout", "commanding shout" }, cast = { "Battle Shout", "Commanding Shout" }, keepActive = true },
-    },
+    WARRIOR = {}, -- Battle/Commanding Shout require Rage built in combat
     ROGUE = {},
 }
 
@@ -3235,7 +3233,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
     ctx:AddSlider({
         key = "obPrepBuffOverbuffMinutes",
         name = "Buffs / Consumables Rebuff Early Timer",
-        tooltip = "Refresh Food, Potions/Elixirs, and Class Self-Buffs early when this many minutes or fewer remain (capped at half a spell's max duration for short buffs like Battle Shout; 0 = only when missing).",
+        tooltip = "Refresh Food, Potions/Elixirs, and Class Self-Buffs early when this many minutes or fewer remain (capped at half a spell's max duration for short buffs like Thorns or Lightning Shield; 0 = only when missing).",
         min = 0,
         max = 30,
         step = 1,

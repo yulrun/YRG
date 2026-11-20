@@ -52,43 +52,12 @@ local COLOR_SCHEME_OPTIONS = {
     { value = "red",    label = "Red" },
 }
 
-local ROW1_LEFT_OPTIONS = {
-    { value = "coords", label = "Coordinates (Default)" },
-    { value = "gold",   label = "Current Gold" },
-    { value = "none",   label = "None (Hidden)" },
-}
-
-local function GetRow1LeftMode(db)
-    if not db then return "coords" end
-    if db.row1LeftMode == "coords" or db.row1LeftMode == "gold" or db.row1LeftMode == "none" then
-        return db.row1LeftMode
-    end
-    if db.showCoordinates == false then
-        return "none"
-    end
-    return "coords"
-end
-
-local function FormatPlacardMoneyText(copper, iconSz)
-    local total = math.max(0, math.floor(YRG.SafeNumber(copper, 0)))
-    local gold = math.floor(total / 10000)
-    local silver = math.floor((total % 10000) / 100)
-    local bronze = total % 100
-    local sz = math.max(9, math.floor((iconSz or 12) * 0.9 + 0.5))
-    local gIcon = string.format("|TInterface\\MoneyFrame\\UI-GoldIcon:%d:%d:1:0|t", sz, sz)
-    local sIcon = string.format("|TInterface\\MoneyFrame\\UI-SilverIcon:%d:%d:1:0|t", sz, sz)
-    local cIcon = string.format("|TInterface\\MoneyFrame\\UI-CopperIcon:%d:%d:1:0|t", sz, sz)
-    if gold > 0 then
-        return string.format("%d%s %d%s %d%s", gold, gIcon, silver, sIcon, bronze, cIcon)
-    elseif silver > 0 then
-        return string.format("%d%s %d%s", silver, sIcon, bronze, cIcon)
-    end
-    return string.format("%d%s", bronze, cIcon)
-end
+local MUI = YRG.MinimapUI or {}
+YRG.MinimapUI = MUI
 
 local ExpTracker = {
     name = "Minimap EXP Tracker",
-    description = "Radial EXP & Rested ring with a bottom-fixed EXP badge and a dynamic session info placard.",
+    description = "Radial EXP & Rested ring with a bottom-fixed EXP badge and minimap header enhancements.",
     defaultEnabled = true,
     defaults = {
         enabled = true,
@@ -105,42 +74,11 @@ local ExpTracker = {
         centerMinimapHeader = true,
         matchPlacardWidth = false,
 
-        -- Placard 1: Bottom-Fixed EXP Percentage Placard (always visible)
+        -- Bottom-Fixed EXP Percentage Placard
         showDecimals = false,
         expTextSize = 14,
-
-        -- Placard 2: Dynamic Session & Map Info Placard
-        showInfoPlacard = true,
-        followMapOrientation = true,
-        infoPlacardOffsetY = 0,
-        infoPlacardWidth = 200,
-        rowDividerOpacityPct = 60,
-        rowExtraPadding = 4,
-        row1LeftMode = "coords",
-        showBagSlots = true,
-        showArrowsRemaining = true,
-        showSoulShards = true,
-        showFarmingRow = true,
-        bagWarnThreshold = 3,
-        ammoWarnThreshold = 200,
-        bagRaidWarnings = false,
-        cellPadding = 10,
-        row1TextSize = 12,
-        row2TextSize = 12,
     }
 }
-
-local sessionKillsData = {}
-local sessionStartTime = 0
-
-local ICON_SKULL  = "Interface\\Icons\\INV_Misc_Bone_HumanSkull_01"
-local ICON_WATCH  = "Interface\\Icons\\INV_Misc_PocketWatch_01"
-local ICON_MAP    = "Interface\\Icons\\INV_Misc_Map_01"
-local ICON_BAG    = "Interface\\Icons\\INV_Misc_Bag_08"
-local ICON_ARROW  = 132382 -- INV_Ammo_Arrow_01
-local ICON_BULLET = 132384 -- INV_Ammo_Bullet_01
-local ICON_SHARD  = 134075 -- INV_Misc_Gem_Amethyst_02
-local SOUL_SHARD_ITEM_ID = 6265
 
 local QUAD_INFO = {
     [1] = { point = "BOTTOMLEFT",  u1 = 0.0, u2 = 0.5, v1 = 0.5, v2 = 1.0 },
@@ -669,6 +607,7 @@ local function ApplyHeaderNineSliceStyle(frame)
         ns.C:SetAlpha(alpha)
     end
 end
+MUI.ApplyHeaderNineSliceStyle = ApplyHeaderNineSliceStyle
 
 -- Darkens the native Minimap Header background cleanly at locked 1.0 placard opacity
 local function ApplyMinimapHeaderDarkness(db)
@@ -811,44 +750,18 @@ local function CreateRadialRingLayer(parent, subLevel)
     return ring
 end
 
-local function HandleBuiltInCoordinates(takeOver)
-    local builtInCoords = {
-        _G["MinimapCoordinates"] or false,
-        _G["MinimapCoordinatesText"] or false,
-        (Minimap and Minimap.CoordinateFrame) or false,
-        (Minimap and Minimap.Coordinates) or false,
-    }
-
-    for _, frame in ipairs(builtInCoords) do
-        if frame then
-            local canToggleVis = (not InCombatLockdown()) and not (type(frame.IsProtected) == "function" and frame:IsProtected())
-            if takeOver then
-                if not frame._yrgOriginalAlpha then
-                    frame._yrgOriginalAlpha = frame:GetAlpha() or 1
-                end
-                frame:SetAlpha(0)
-                if canToggleVis then
-                    frame:Hide()
-                end
-            else
-                if frame._yrgOriginalAlpha then
-                    frame:SetAlpha(frame._yrgOriginalAlpha)
-                else
-                    frame:SetAlpha(1)
-                end
-                if canToggleVis then
-                    frame:Show()
-                end
-            end
-        end
-    end
-end
-
 local function SafeRegionCenterY(region)
     if not region or type(region.GetCenter) ~= "function" then return nil end
     local ok, _, y = pcall(region.GetCenter, region)
     if not ok then return nil end
     return YRG.SafeOptionalNumber(y)
+end
+
+local function SafeRegionTop(region)
+    if not region or type(region.GetTop) ~= "function" then return nil end
+    local ok, t = pcall(region.GetTop, region)
+    if not ok then return nil end
+    return YRG.SafeOptionalNumber(t)
 end
 
 local function SafeRegionBottom(region)
@@ -872,6 +785,12 @@ local function SafeRegionCenterX(region)
     if not ok then return nil end
     return YRG.SafeOptionalNumber(x)
 end
+
+MUI.SafeRegionCenterY = SafeRegionCenterY
+MUI.SafeRegionTop = SafeRegionTop
+MUI.SafeRegionBottom = SafeRegionBottom
+MUI.SafeRegionScale = SafeRegionScale
+MUI.SafeRegionCenterX = SafeRegionCenterX
 
 local headerCenteringGuard = false
 
@@ -1089,7 +1008,7 @@ local function HasHorizontalTwoPointStretch(region)
 end
 
 local function GetTargetPlacardScreenWidth(db)
-    for _, placard in ipairs({ ExpTracker.infoFrame or false, ExpTracker.expFrame or false }) do
+    for _, placard in ipairs({ MUI.infoFrame or false, ExpTracker.expFrame or false }) do
         if placard and placard.IsShown and placard:IsShown() then
             local w = SafeRegionWidth(placard)
             local s = SafeRegionScale(placard, 1)
@@ -1098,8 +1017,9 @@ local function GetTargetPlacardScreenWidth(db)
             end
         end
     end
+    local infoDB = YRG:GetModuleDB("DynamicInfoPlacard")
     local mapScale = SafeRegionScale(Minimap, 1)
-    local fallbackW = YRG.SafeNumber(db and db.infoPlacardWidth, 200)
+    local fallbackW = YRG.SafeNumber(infoDB and infoDB.infoPlacardWidth, YRG.SafeNumber(db and db.infoPlacardWidth, 200))
     if mapScale > 0 and fallbackW > 0 then
         return fallbackW * mapScale, mapScale
     end
@@ -1125,6 +1045,36 @@ local function ApplyWidthDelta(region, deltaW, minW)
     end
 end
 
+local function IsInfoPlacardTitleAnchored()
+    local infoDB = YRG:GetModuleDB("DynamicInfoPlacard")
+    if not infoDB or not infoDB.enabled then
+        return false
+    end
+    return (infoDB.placardAnchorPoint or "ZONE_TITLE") == "ZONE_TITLE"
+end
+
+local function GetZoneTitleAnchorFrame()
+    local mc = MinimapCluster
+    local candidates = {
+        (mc and mc.BorderTop) or false,
+        _G["MinimapBorderTop"] or false,
+        (mc and mc.ZoneTextButton) or false,
+        _G["MinimapZoneTextButton"] or false,
+        (mc and mc.HeaderFrame) or false,
+    }
+    for _, f in ipairs(candidates) do
+        if f and (not f.IsShown or f:IsShown()) then
+            local top = SafeRegionTop(f)
+            local bot = SafeRegionBottom(f)
+            if top and bot and top > bot then
+                return f
+            end
+        end
+    end
+    return nil
+end
+MUI.GetZoneTitleAnchorFrame = GetZoneTitleAnchorFrame
+
 local function ApplyMinimapHeaderWidth(db)
     if headerWidthGuard then return end
     if InCombatLockdown() then
@@ -1137,7 +1087,7 @@ local function ApplyMinimapHeaderWidth(db)
     local borderTop = mc and mc.BorderTop
     if not zoneBtn then return end
 
-    local shouldStretch = db and db.enabled and db.matchPlacardWidth and true or false
+    local shouldStretch = IsInfoPlacardTitleAnchored() or (db and db.enabled and db.matchPlacardWidth and true) or false
     if not shouldStretch then
         local candidates = {
             zoneBtn,
@@ -1243,7 +1193,7 @@ local function ApplyMinimapHeaderCenter(db)
     local roots = GetMinimapHeaderAnchors()
     if not roots then return end
 
-    local shouldCenter = db and db.enabled and (db.centerMinimapHeader ~= false)
+    local shouldCenter = IsInfoPlacardTitleAnchored() or (db and db.enabled and (db.centerMinimapHeader ~= false)) or false
     if not shouldCenter then
         local hadApplied = false
         for _, entry in ipairs(roots) do
@@ -1317,456 +1267,7 @@ local function ApplyMinimapHeaderCenter(db)
     headerCenteringGuard = false
 end
 
-local function IsMinimapHeaderOnBottom()
-    if MinimapCluster then
-        if type(MinimapCluster.IsHeaderUnderneath) == "function" then
-            local ok, val = pcall(MinimapCluster.IsHeaderUnderneath, MinimapCluster)
-            if ok and val then
-                return true
-            end
-        end
-        if MinimapCluster.headerUnderneath == true then
-            return true
-        end
-        if Enum and Enum.EditModeMinimapSetting and Enum.EditModeMinimapSetting.HeaderUnderneath
-            and type(MinimapCluster.GetSettingValueBool) == "function" then
-            local ok, val = pcall(MinimapCluster.GetSettingValueBool, MinimapCluster, Enum.EditModeMinimapSetting.HeaderUnderneath)
-            if ok and val then
-                return true
-            end
-        end
-    end
-
-    local mapY = SafeRegionCenterY(Minimap)
-    if mapY then
-        local mapScreenY = mapY * SafeRegionScale(Minimap, 1)
-        local headerCandidates = {
-            (MinimapCluster and MinimapCluster.HeaderFrame) or false,
-            (MinimapCluster and MinimapCluster.ZoneTextButton) or false,
-            _G["MinimapZoneTextButton"] or false,
-            (MinimapCluster and MinimapCluster.BorderTop) or false,
-            _G["MinimapBorderTop"] or false,
-            _G["TimeManagerClockButton"] or false,
-        }
-        for _, hdr in ipairs(headerCandidates) do
-            if hdr and (not hdr.IsShown or hdr:IsShown()) then
-                local hdrY = SafeRegionCenterY(hdr)
-                if hdrY then
-                    local hdrScreenY = hdrY * SafeRegionScale(hdr, 1)
-                    if hdrScreenY < mapScreenY - 4 then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-
-    return false
-end
-
-local function GetBottomMinimapHeaderFrame()
-    local mapY = SafeRegionCenterY(Minimap)
-    if not mapY then return nil, nil end
-    local mapScreenY = mapY * SafeRegionScale(Minimap, 1)
-
-    local candidates = {
-        (MinimapCluster and MinimapCluster.ZoneTextButton) or false,
-        _G["MinimapZoneTextButton"] or false,
-        (MinimapCluster and MinimapCluster.HeaderFrame) or false,
-        (MinimapCluster and MinimapCluster.BorderTop) or false,
-        _G["MinimapBorderTop"] or false,
-    }
-
-    local bestFrame = nil
-    local lowestBottomScreen = nil
-    for _, hdr in ipairs(candidates) do
-        if hdr and (not hdr.IsShown or hdr:IsShown()) then
-            local hdrW = hdr.GetWidth and YRG.SafeNumber(hdr:GetWidth(), 0) or 0
-            local hdrH = hdr.GetHeight and YRG.SafeNumber(hdr:GetHeight(), 0) or 0
-            local hdrY = SafeRegionCenterY(hdr)
-            local hdrBottom = SafeRegionBottom(hdr)
-            if hdrW > 12 and hdrH > 6 and hdrY and hdrBottom then
-                local hdrScale = SafeRegionScale(hdr, 1)
-                if (hdrY * hdrScale) < (mapScreenY - 4) then
-                    local bScreen = hdrBottom * hdrScale
-                    if not lowestBottomScreen or bScreen < lowestBottomScreen then
-                        lowestBottomScreen = bScreen
-                        bestFrame = hdr
-                    end
-                end
-            end
-        end
-    end
-    return bestFrame, lowestBottomScreen
-end
-
-local function GetBottomHeaderExtraOffset()
-    local extraOffset = -24
-    local hdr = (MinimapCluster and (MinimapCluster.ZoneTextButton or MinimapCluster.HeaderFrame or MinimapCluster.BorderTop)) or _G["MinimapBorderTop"]
-    if hdr and type(hdr.GetHeight) == "function" then
-        local h = YRG.SafeNumber(hdr:GetHeight(), 0)
-        if h > 10 then
-            extraOffset = -(math.floor(h + 0.5) + 4)
-        end
-    end
-    return extraOffset
-end
-
-local function GetKillPaceMetrics(remXP)
-    local count = #sessionKillsData
-    if count == 0 then
-        return nil, nil, nil, nil
-    end
-
-    local totalXP = 0
-    local validEntries = 0
-    for _, entry in ipairs(sessionKillsData) do
-        local xp = (type(entry) == "table" and entry.xp) or (type(entry) == "number" and entry) or 0
-        if xp > 0 then
-            totalXP = totalXP + xp
-            validEntries = validEntries + 1
-        end
-    end
-    if validEntries == 0 or totalXP <= 0 then
-        return nil, nil, nil, nil
-    end
-
-    local avgXP = totalXP / validEntries
-    local estKills = math.ceil(math.max(remXP, 0) / avgXP)
-
-    local avgInterval = nil
-    if count >= 2 and type(sessionKillsData[1]) == "table" and type(sessionKillsData[count]) == "table" then
-        local totalDt = 0
-        local dtCount = 0
-        for i = 2, count do
-            local prevEntry = sessionKillsData[i - 1]
-            local curEntry = sessionKillsData[i]
-            if type(prevEntry) == "table" and type(curEntry) == "table" then
-                local dt = curEntry.t - prevEntry.t
-                if dt > 0 and dt <= 300 then
-                    totalDt = totalDt + dt
-                    dtCount = dtCount + 1
-                end
-            end
-        end
-        if dtCount > 0 then
-            avgInterval = totalDt / dtCount
-        else
-            local span = sessionKillsData[count].t - sessionKillsData[1].t
-            if span > 0 then
-                avgInterval = span / (count - 1)
-            end
-        end
-    elseif count == 1 and type(sessionKillsData[1]) == "table" and sessionStartTime > 0 then
-        local elapsed = sessionKillsData[1].t - sessionStartTime
-        if elapsed > 0 and elapsed <= 300 then
-            avgInterval = elapsed
-        end
-    end
-
-    local estSeconds = nil
-    if estKills == 0 then
-        estSeconds = 0
-    elseif avgInterval then
-        estSeconds = estKills * avgInterval
-    end
-    return estKills, avgXP, avgInterval, estSeconds
-end
-
-local function FormatTimeEstimate(estSeconds)
-    if estSeconds == nil then
-        return "--"
-    end
-    local roundedSec = math.floor(math.max(0, estSeconds) + 0.5)
-    if roundedSec < 60 then
-        return string.format("%ds", roundedSec)
-    end
-    local fullMins = math.max(1, math.floor((estSeconds / 60) + 0.5))
-    return string.format("%dm", fullMins)
-end
-
-local AMMO_CAPABLE_CLASSES = {
-    HUNTER = true,
-    WARRIOR = true,
-    ROGUE = true,
-}
-
-local CLASS_WEAPON = (Enum and Enum.ItemClass and Enum.ItemClass.Weapon) or 2
-local SUBCLASS_BOW = (Enum and Enum.ItemWeaponSubclass and Enum.ItemWeaponSubclass.Bows) or 2
-local SUBCLASS_GUN = (Enum and Enum.ItemWeaponSubclass and Enum.ItemWeaponSubclass.Guns) or 3
-local SUBCLASS_CROSSBOW = (Enum and Enum.ItemWeaponSubclass and (Enum.ItemWeaponSubclass.Crossbow or Enum.ItemWeaponSubclass.Crossbows)) or 18
-
-local function ClassifyCapableRangedWeapon(itemID)
-    if not itemID then return false, false end
-    local _, _, itemSubType, _, _, classID, subClassID
-    if C_Item and C_Item.GetItemInfoInstant then
-        _, _, itemSubType, _, _, classID, subClassID = C_Item.GetItemInfoInstant(itemID)
-    elseif GetItemInfoInstant then
-        _, _, itemSubType, _, _, classID, subClassID = GetItemInfoInstant(itemID)
-    end
-
-    if not classID or not subClassID then
-        local _, _, _, _, _, _, fullSub, _, _, _, _, fullClass, fullSubClass
-        if C_Item and C_Item.GetItemInfo then
-            _, _, _, _, _, _, fullSub, _, _, _, _, fullClass, fullSubClass = C_Item.GetItemInfo(itemID)
-        elseif GetItemInfo then
-            _, _, _, _, _, _, fullSub, _, _, _, _, fullClass, fullSubClass = GetItemInfo(itemID)
-        end
-        itemSubType = itemSubType or fullSub
-        classID = classID or fullClass
-        subClassID = subClassID or fullSubClass
-    end
-
-    if classID == CLASS_WEAPON then
-        if subClassID == SUBCLASS_GUN then
-            return true, true
-        elseif subClassID == SUBCLASS_BOW or subClassID == SUBCLASS_CROSSBOW then
-            return true, false
-        end
-    end
-
-    if not classID or classID == CLASS_WEAPON then
-        local subLower = type(itemSubType) == "string" and itemSubType:lower() or ""
-        if subLower:find("gun") then
-            return true, true
-        elseif subLower:find("bow") or subLower:find("crossbow") then
-            return true, false
-        end
-    end
-
-    return false, false
-end
-
-local function GetInventoryAndAmmoStatus()
-    local freeNormalSlots = 0
-    local maxBagIndex = NUM_BAG_SLOTS or 4
-    for bagID = 0, maxBagIndex do
-        local numSlots = (C_Container and C_Container.GetContainerNumSlots and C_Container.GetContainerNumSlots(bagID))
-            or (GetContainerNumSlots and GetContainerNumSlots(bagID)) or 0
-        if numSlots and numSlots > 0 then
-            local freeSlots, bagFamily = 0, 0
-            if C_Container and C_Container.GetContainerNumFreeSlots then
-                freeSlots, bagFamily = C_Container.GetContainerNumFreeSlots(bagID)
-            elseif GetContainerNumFreeSlots then
-                freeSlots, bagFamily = GetContainerNumFreeSlots(bagID)
-            end
-            freeSlots = YRG.SafeNumber(freeSlots, 0)
-            bagFamily = YRG.SafeNumber(bagFamily, 0)
-
-            local bagName = (C_Container and C_Container.GetBagName and C_Container.GetBagName(bagID))
-                or (GetBagName and GetBagName(bagID))
-            local lowerName = type(bagName) == "string" and bagName:lower() or ""
-
-            local isQuiver = (bit and bit.band and bit.band(bagFamily, 1) > 0)
-                or (lowerName:find("quiver") ~= nil)
-            local isPouch = (bit and bit.band and bit.band(bagFamily, 2) > 0)
-                or (lowerName:find("ammo") ~= nil or lowerName:find("pouch") ~= nil or lowerName:find("bandolier") ~= nil)
-            local isSoul = (bit and bit.band and bit.band(bagFamily, 4) > 0)
-                or (lowerName:find("soul") ~= nil or lowerName:find("felcloth") ~= nil)
-
-            if bagFamily == 0 and not isQuiver and not isPouch and not isSoul then
-                freeNormalSlots = freeNormalSlots + freeSlots
-            end
-        end
-    end
-
-    -- Gate 1: Only classes that can equip Bows, Crossbows, or Guns
-    local _, playerClass = UnitClass("player")
-    if not (playerClass and AMMO_CAPABLE_CLASSES[playerClass]) then
-        return freeNormalSlots, false, 0, ICON_ARROW
-    end
-
-    -- Gate 2: Require an equipped Bow, Crossbow, or Gun in INVSLOT_RANGED (excludes Thrown, Wands, empty)
-    local rangedSlot = INVSLOT_RANGED or 18
-    local rangedID = GetInventoryItemID and GetInventoryItemID("player", rangedSlot) or nil
-    if type(rangedID) ~= "number" or rangedID <= 0 then
-        return freeNormalSlots, false, 0, ICON_ARROW
-    end
-
-    local hasCapableWeapon, rangedUsesBullets = ClassifyCapableRangedWeapon(rangedID)
-    if not hasCapableWeapon then
-        return freeNormalSlots, false, 0, ICON_ARROW
-    end
-
-    -- Gate 3: Check INVSLOT_AMMO via GetInventoryItemID > 0 (prevents empty-slot phantom 1);
-    -- if empty while Bow/Crossbow/Gun is equipped, report 0 so red flashing warning triggers.
-    local ammoSlot = INVSLOT_AMMO or 0
-    local equippedAmmoID = GetInventoryItemID and GetInventoryItemID("player", ammoSlot) or nil
-    if type(equippedAmmoID) ~= "number" or equippedAmmoID <= 0 then
-        return freeNormalSlots, true, 0, (rangedUsesBullets and ICON_BULLET or ICON_ARROW)
-    end
-
-    local ammoCount = (GetInventoryItemCount and YRG.SafeNumber(GetInventoryItemCount("player", ammoSlot), 0)) or 0
-    local ammoIcon = GetInventoryItemTexture and GetInventoryItemTexture("player", ammoSlot) or nil
-    if not ammoIcon then
-        ammoIcon = rangedUsesBullets and ICON_BULLET or ICON_ARROW
-    end
-
-    return freeNormalSlots, true, ammoCount, ammoIcon
-end
-
-local function GetWarlockSoulShardCount()
-    local _, playerClass = UnitClass("player")
-    if playerClass ~= "WARLOCK" then
-        return false, 0
-    end
-    local count = (C_Item and C_Item.GetItemCount and C_Item.GetItemCount(SOUL_SHARD_ITEM_ID))
-        or (GetItemCount and GetItemCount(SOUL_SHARD_ITEM_ID))
-        or 0
-    return true, YRG.SafeNumber(count, 0)
-end
-
-local MASK_CIRCLE = "Interface\\CharacterFrame\\TempPortraitAlphaMask"
-local TEX_FALLBACK_RING = "Interface\\Minimap\\MiniMap-TrackingBorder"
-
-local function CreatePlacardBadge(parent, iconSide, defaultR, defaultG, defaultB)
-    local side = (iconSide == "LEFT") and "LEFT" or "RIGHT"
-    local holder = CreateFrame("Frame", nil, parent)
-    holder:SetSize(36, 16)
-    holder:EnableMouse(false)
-    holder.iconSide = side
-    holder.hasIcon = false
-    holder.defaultColor = { defaultR or 0.92, defaultG or 0.92, defaultB or 0.92 }
-
-    local iconBox = CreateFrame("Frame", nil, holder)
-    iconBox:SetSize(16, 16)
-    iconBox:SetPoint(side, holder, side, 0, 0)
-    iconBox:EnableMouse(false)
-    holder.iconBox = iconBox
-
-    local bg = iconBox:CreateTexture(nil, "BACKGROUND", nil, 0)
-    bg:SetColorTexture(0.05, 0.04, 0.03, 0.96)
-    local bgMask = iconBox:CreateMaskTexture()
-    bgMask:SetTexture(MASK_CIRCLE, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
-    bg:AddMaskTexture(bgMask)
-    holder.bg = bg
-    holder.bgMask = bgMask
-
-    local icon = iconBox:CreateTexture(nil, "ARTWORK", nil, 0)
-    icon:SetTexCoord(0.04, 0.96, 0.04, 0.96)
-    local iconMask = iconBox:CreateMaskTexture()
-    iconMask:SetTexture(MASK_CIRCLE, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
-    icon:AddMaskTexture(iconMask)
-    holder.icon = icon
-    holder.iconMask = iconMask
-
-    local ring = iconBox:CreateTexture(nil, "OVERLAY", nil, 1)
-    ring:SetAllPoints(iconBox)
-    local hasBagBorder = (C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo("bag-border")) ~= nil
-    if hasBagBorder then
-        ring:SetAtlas("bag-border")
-    else
-        ring:SetTexture(TEX_FALLBACK_RING)
-        ring:SetTexCoord(0.055, 0.555, 0.062, 0.562)
-    end
-    ring:SetVertexColor(1.0, 0.88, 0.50, 1.0)
-    holder.ring = ring
-    holder.useBagAtlas = hasBagBorder
-
-    local text = holder:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    text:SetPoint(side, iconBox, (side == "LEFT") and "RIGHT" or "LEFT", (side == "LEFT") and 3 or -3, 0)
-    text:SetJustifyH(side)
-    text:SetShadowColor(0, 0, 0, 1)
-    text:SetShadowOffset(1, -1)
-    text:SetTextColor(holder.defaultColor[1], holder.defaultColor[2], holder.defaultColor[3], 1.0)
-    holder.text = text
-
-    local ag = text:CreateAnimationGroup()
-    ag:SetLooping("REPEAT")
-    local aOut = ag:CreateAnimation("Alpha")
-    aOut:SetFromAlpha(1.0)
-    aOut:SetToAlpha(0.22)
-    aOut:SetDuration(0.45)
-    aOut:SetOrder(1)
-    local aIn = ag:CreateAnimation("Alpha")
-    aIn:SetFromAlpha(0.22)
-    aIn:SetToAlpha(1.0)
-    aIn:SetDuration(0.45)
-    aIn:SetOrder(2)
-    holder.flashAnim = ag
-
-    function holder:ApplyFontSize(fontSize)
-        local sz = fontSize or 12
-        local ringSz = math.max(16, math.floor(sz * 2.0 + 0.5))
-        local innerSz = math.max(10, math.floor(sz * 1.25 + 0.5))
-        local bgSz = math.max(innerSz, math.floor(ringSz * 0.68 + 0.5))
-        local maskSz = math.floor(innerSz * 1.08 + 0.5)
-        local ox = self.useBagAtlas and 0 or -(ringSz * 0.045)
-        local oy = self.useBagAtlas and 0 or (ringSz * 0.045)
-
-        self.iconBox:SetSize(ringSz, ringSz)
-        self.bg:ClearAllPoints()
-        self.bg:SetPoint("CENTER", self.iconBox, "CENTER", ox, oy)
-        self.bg:SetSize(bgSz, bgSz)
-        self.bgMask:ClearAllPoints()
-        self.bgMask:SetPoint("CENTER", self.iconBox, "CENTER", ox, oy)
-        self.bgMask:SetSize(math.max(maskSz, bgSz), math.max(maskSz, bgSz))
-
-        self.icon:ClearAllPoints()
-        self.icon:SetPoint("CENTER", self.iconBox, "CENTER", ox, oy)
-        self.icon:SetSize(innerSz, innerSz)
-        self.iconMask:ClearAllPoints()
-        self.iconMask:SetPoint("CENTER", self.iconBox, "CENTER", ox, oy)
-        self.iconMask:SetSize(maskSz, maskSz)
-
-        self.text:SetFont(STANDARD_TEXT_FONT, sz, "OUTLINE")
-        self.text:ClearAllPoints()
-        local textW = math.max(YRG.SafeNumber(self.text:GetStringWidth(), 0), 8)
-        if self.hasIcon then
-            self.iconBox:Show()
-            if self.iconSide == "LEFT" then
-                self.text:SetPoint("LEFT", self.iconBox, "RIGHT", 3, 0)
-                self.text:SetJustifyH("LEFT")
-            else
-                self.text:SetPoint("RIGHT", self.iconBox, "LEFT", -3, 0)
-                self.text:SetJustifyH("RIGHT")
-            end
-            self:SetSize(ringSz + 3 + textW, math.max(ringSz, sz))
-        else
-            self.iconBox:Hide()
-            self.text:SetPoint(self.iconSide, self, self.iconSide, 0, 0)
-            self.text:SetJustifyH(self.iconSide)
-            self:SetSize(textW, math.max(sz, 10))
-        end
-    end
-
-    function holder:UpdateBadge(fontSize, texIcon, valueStr, warnState)
-        if texIcon then
-            self.icon:SetTexture(texIcon)
-            self.hasIcon = true
-        else
-            self.hasIcon = false
-        end
-        self.text:SetText(valueStr or "")
-
-        if warnState == "critical" then
-            self.text:SetTextColor(1.0, 0.20, 0.20, 1.0)
-            self.ring:SetVertexColor(1.0, 0.25, 0.25, 1.0)
-            if not self.flashAnim:IsPlaying() then
-                self.flashAnim:Play()
-            end
-        elseif warnState == "warn" then
-            self.text:SetTextColor(1.0, 0.58, 0.08, 1.0)
-            self.ring:SetVertexColor(1.0, 0.62, 0.14, 1.0)
-            if not self.flashAnim:IsPlaying() then
-                self.flashAnim:Play()
-            end
-        else
-            if self.flashAnim:IsPlaying() then
-                self.flashAnim:Stop()
-            end
-            self.text:SetAlpha(1.0)
-            self.text:SetTextColor(self.defaultColor[1], self.defaultColor[2], self.defaultColor[3], 1.0)
-            self.ring:SetVertexColor(1.0, 0.88, 0.50, 1.0)
-        end
-
-        self:ApplyFontSize(fontSize)
-    end
-
-    return holder
-end
-
-local function ShowTrackerTooltip(ownerFrame)
+local function ShowExpTooltip(ownerFrame)
     local curXP = YRG.SafeNumber(UnitXP("player"), 0)
     local maxXP = math.max(YRG.SafeNumber(UnitXPMax("player"), 1), 1)
     local restedXP = YRG.SafeNumber(GetXPExhaustion(), 0)
@@ -1775,66 +1276,53 @@ local function ShowTrackerTooltip(ownerFrame)
     local restedPct = (restedXP / maxXP) * 100
 
     GameTooltip:SetOwner(ownerFrame, "ANCHOR_BOTTOM")
-    GameTooltip:SetText("YRG Experience & Session Tracker", 1.0, 0.82, 0.0)
+    GameTooltip:SetText("YRG Minimap EXP Tracker", 1.0, 0.82, 0.0)
     GameTooltip:AddDoubleLine("Current XP:", string.format("%d / %d (%.1f%%)", curXP, maxXP, pct), 0.9, 0.9, 0.9, 1, 1, 1)
     GameTooltip:AddDoubleLine("Remaining XP:", tostring(remXP), 0.9, 0.9, 0.9, 1, 0.82, 0)
     if restedXP > 0 then
         GameTooltip:AddDoubleLine("Rested Bonus:", string.format("%d (%.1f%%)", restedXP, restedPct), 0.4, 0.75, 1.0, 0.4, 0.75, 1.0)
     end
 
-    local estKills, avgXP, avgInterval, estSeconds = GetKillPaceMetrics(remXP)
-    if estKills and avgXP then
-        GameTooltip:AddDoubleLine("Est. Kills to Level (Last 10):", string.format("%d (Avg %d XP/kill)", estKills, math.floor(avgXP)), 0.7, 0.9, 1.0, 1, 1, 1)
-    end
-    if estSeconds then
-        local paceStr = avgInterval and string.format("%s (%.1fs/kill)", FormatTimeEstimate(estSeconds), avgInterval) or FormatTimeEstimate(estSeconds)
-        GameTooltip:AddDoubleLine("Est. Time to Level:", paceStr, 0.7, 0.9, 1.0, 1, 1, 1)
-    end
-    if C_Map and C_Map.GetPlayerMapPosition then
-        local mapID = C_Map.GetBestMapForUnit("player")
-        if mapID then
-            local pos = C_Map.GetPlayerMapPosition(mapID, "player")
-            if pos and pos.x and pos.y then
-                GameTooltip:AddDoubleLine("Coordinates:", string.format("%.1f, %.1f", pos.x * 100, pos.y * 100), 0.7, 0.7, 0.7, 1, 1, 1)
-            end
-        end
-    end
-
-    local freeSlots, hasAmmoSource, totalAmmo = GetInventoryAndAmmoStatus()
-    GameTooltip:AddDoubleLine("Free Inventory Slots:", tostring(freeSlots), 0.8, 0.8, 0.8, 1, 1, 1)
-    if hasAmmoSource then
-        GameTooltip:AddDoubleLine("Ammo Remaining:", tostring(totalAmmo), 0.8, 0.8, 0.8, 1, 1, 1)
-    end
-    local isWarlock, shardCount = GetWarlockSoulShardCount()
-    if isWarlock then
-        GameTooltip:AddDoubleLine("Soul Shards:", tostring(shardCount), 0.75, 0.5, 1.0, 1, 1, 1)
+    if type(MUI.AppendKillPaceTooltipLines) == "function" then
+        MUI.AppendKillPaceTooltipLines(remXP)
     end
 
     GameTooltip:AddLine(" ")
-    GameTooltip:AddLine("Left-Click: Open YRG Settings", 0.65, 0.65, 0.65)
-    GameTooltip:AddLine("Right-Click: Reset Kill Pace Trackers", 0.65, 0.65, 0.65)
+    GameTooltip:AddLine("Left-Click: Open EXP Tracker Settings", 0.65, 0.65, 0.65)
+    if type(MUI.ResetSessionTrackers) == "function" then
+        GameTooltip:AddLine("Right-Click: Reset Kill Pace Trackers", 0.65, 0.65, 0.65)
+    end
     GameTooltip:Show()
 end
 
-function ExpTracker:ResetSessionTrackers()
-    sessionKillsData = {}
-    sessionStartTime = GetTime()
-    self.lastKnownXP = YRG.SafeNumber(UnitXP("player"), 0)
-    self:UpdateXP()
-    if DEFAULT_CHAT_FRAME then
-        DEFAULT_CHAT_FRAME:AddMessage("|cffffd100YRG:|r Session Kills & Time-to-Level trackers have been reset.")
+local function OnExpPlacardMouseUp(frame, button)
+    if button == "LeftButton" then
+        YRG:OpenSettings("MinimapExpTracker")
+    elseif button == "RightButton" and type(MUI.ResetSessionTrackers) == "function" then
+        MUI.ResetSessionTrackers()
+        if GameTooltip and GameTooltip:IsOwned(frame) then
+            ShowExpTooltip(frame)
+        end
     end
 end
 
-local function OnPlacardMouseUp(frame, button)
-    if button == "LeftButton" then
-        YRG:OpenSettings("MinimapExpTracker")
-    elseif button == "RightButton" then
-        ExpTracker:ResetSessionTrackers()
-        if GameTooltip and GameTooltip:IsOwned(frame) then
-            ShowTrackerTooltip(frame)
-        end
-    end
+function MUI.GetExpAnchorInfo()
+    local db = YRG:GetModuleDB("MinimapExpTracker")
+    if not db or not db.enabled then return nil end
+    if not ExpTracker.container or not ExpTracker.container:IsShown() then return nil end
+    if not ExpTracker.expFrame or not ExpTracker.expFrame:IsShown() then return nil end
+    local mapWidth = (Minimap and Minimap:GetWidth()) or 140
+    local baseRingSize = mapWidth * (512 / 368)
+    local ringBottomRimY = baseRingSize * (56 / 512)
+    local ringTopRimY = -baseRingSize * (42 / 512)
+    local expH = (ExpTracker.expFrame.GetHeight and YRG.SafeNumber(ExpTracker.expFrame:GetHeight(), 20)) or 20
+    return {
+        container = ExpTracker.container,
+        expFrame = ExpTracker.expFrame,
+        ringBottomRimY = ringBottomRimY,
+        ringTopRimY = ringTopRimY,
+        expH = expH,
+    }
 end
 
 function ExpTracker:EnsureFrames()
@@ -1846,6 +1334,7 @@ function ExpTracker:EnsureFrames()
     container:SetPoint("CENTER", Minimap, "CENTER", 0, 0)
     container:EnableMouse(false)
     self.container = container
+    MUI.ringContainer = container
 
     local trackBg = container:CreateTexture(nil, "BACKGROUND", nil, 1)
     trackBg:SetAllPoints(container)
@@ -1872,14 +1361,15 @@ function ExpTracker:EnsureFrames()
     ringBorder:SetTexture(TEX_RING)
     self.ringBorder = ringBorder
 
-    -- PLACARD 1: Separate Bottom-Fixed EXP Percentage Placard (Minimap Header 9-Slice)
+    -- Bottom-Fixed EXP Percentage Placard (Minimap Header 9-Slice)
     local expFrame = CreateFrame("Frame", "YRGMinimapExpPlacard", borderFrame, "BackdropTemplate")
     expFrame:SetFrameLevel(borderFrame:GetFrameLevel() + 4)
     expFrame:EnableMouse(true)
-    expFrame:SetScript("OnEnter", ShowTrackerTooltip)
+    expFrame:SetScript("OnEnter", ShowExpTooltip)
     expFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    expFrame:SetScript("OnMouseUp", OnPlacardMouseUp)
+    expFrame:SetScript("OnMouseUp", OnExpPlacardMouseUp)
     self.expFrame = expFrame
+    MUI.expFrame = expFrame
 
     local pctText = expFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     pctText:SetPoint("CENTER", expFrame, "CENTER", 0, 0)
@@ -1887,29 +1377,6 @@ function ExpTracker:EnsureFrames()
     pctText:SetShadowColor(0, 0, 0, 1)
     pctText:SetShadowOffset(1, -1)
     self.pctText = pctText
-
-    -- PLACARD 2: Dynamic Session & Map Info Placard (Minimap Header 9-Slice)
-    local infoFrame = CreateFrame("Frame", "YRGMinimapInfoPlacard", borderFrame, "BackdropTemplate")
-    infoFrame:SetFrameLevel(borderFrame:GetFrameLevel() + 2)
-    infoFrame:EnableMouse(true)
-    infoFrame:SetScript("OnEnter", ShowTrackerTooltip)
-    infoFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    infoFrame:SetScript("OnMouseUp", OnPlacardMouseUp)
-    self.infoFrame = infoFrame
-    self.shieldFrame = infoFrame
-
-    local rowDivider = infoFrame:CreateTexture(nil, "ARTWORK", nil, 1)
-    rowDivider:SetHeight(1)
-    rowDivider:SetColorTexture(0.65, 0.52, 0.25, 0.60)
-    rowDivider:Hide()
-    self.rowDivider = rowDivider
-
-    self.killBadge = CreatePlacardBadge(infoFrame, "RIGHT", 1.00, 0.84, 0.35)
-    self.coordBadge = CreatePlacardBadge(infoFrame, "LEFT", 0.90, 0.90, 0.90)
-    self.timeBadge = CreatePlacardBadge(infoFrame, "LEFT", 1.00, 0.84, 0.35)
-    self.bagSlotsBadge = CreatePlacardBadge(infoFrame, "RIGHT", 0.92, 0.92, 0.92)
-    self.arrowsBadge = CreatePlacardBadge(infoFrame, "RIGHT", 0.92, 0.92, 0.92)
-    self.shardsBadge = CreatePlacardBadge(infoFrame, "RIGHT", 0.84, 0.58, 1.00)
 end
 
 local suppressDefaultExpGuard = false
@@ -2043,7 +1510,10 @@ local function UpdateEditModeMinimapSelection(forceReapply)
         end)
     end
 
-    if not db or not db.enabled or not ExpTracker.container or not ExpTracker.container:IsShown() or not IsEditModeActive() then
+    local hasRing = (db and db.enabled and ExpTracker.container and ExpTracker.container:IsShown()) and true or false
+    local infoF = MUI.infoFrame
+    local hasInfo = (infoF and type(infoF.IsShown) == "function" and infoF:IsShown()) and true or false
+    if (not hasRing and not hasInfo) or not IsEditModeActive() then
         RestoreEditModeMinimapSelection()
         return
     end
@@ -2100,9 +1570,15 @@ local function UpdateEditModeMinimapSelection(forceReapply)
     end
 
     -- Ring texture uses 512x512 canvas with ~48px side, 42px top, 56px bottom transparent margin
-    ExpandWithFrame(ExpTracker.container, 48 / 512, 48 / 512, 42 / 512, 56 / 512)
-    ExpandWithFrame(ExpTracker.expFrame, 0, 0, 0, 0)
-    ExpandWithFrame(ExpTracker.infoFrame, 0, 0, 0, 0)
+    if ExpTracker.container and ExpTracker.container:IsShown() then
+        ExpandWithFrame(ExpTracker.container, 48 / 512, 48 / 512, 42 / 512, 56 / 512)
+    end
+    if ExpTracker.expFrame and ExpTracker.expFrame:IsShown() then
+        ExpandWithFrame(ExpTracker.expFrame, 0, 0, 0, 0)
+    end
+    if MUI.infoFrame and MUI.infoFrame:IsShown() then
+        ExpandWithFrame(MUI.infoFrame, 0, 0, 0, 0)
+    end
 
     local offLeft = (uLeft - (cL * cScale)) / sScale
     local offRight = (uRight - (cR * cScale)) / sScale
@@ -2131,21 +1607,35 @@ local function UpdateEditModeMinimapSelection(forceReapply)
     updatingSelectionBounds = false
 end
 
+MUI.UpdateEditModeSelection = UpdateEditModeMinimapSelection
+MUI.RestoreEditModeSelection = RestoreEditModeMinimapSelection
+
+function MUI.SyncHeaderAndEditMode()
+    local db = YRG:GetModuleDB("MinimapExpTracker")
+    ApplyMinimapHeaderWidth(db)
+    ApplyMinimapHeaderCenter(db)
+    UpdateEditModeMinimapSelection()
+end
+
+function MUI.NotifyInfoPlacardLayout()
+    if type(MUI.onInfoPlacardLayout) == "function" then
+        MUI.onInfoPlacardLayout()
+    end
+end
+
 function ExpTracker:LayoutPlacardsImpl()
     if not self.container then return end
     local db = YRG:GetModuleDB("MinimapExpTracker")
 
     ApplyHeaderNineSliceStyle(self.expFrame)
-    ApplyHeaderNineSliceStyle(self.infoFrame)
     ApplyMinimapHeaderDarkness(db)
     ApplyLocalTimeSetting(db)
 
     local mapWidth = Minimap:GetWidth() or 140
     local baseRingSize = mapWidth * (512 / 368)
     local ringBottomRimY = baseRingSize * (56 / 512)
-    local ringTopRimY = -baseRingSize * (42 / 512)
 
-    -- 1. Bottom-Fixed EXP Percentage Placard (always visible, font size configurable)
+    -- Bottom-Fixed EXP Percentage Placard (always visible when ring is active)
     local expTSize = db.expTextSize or 14
     local expTopPad = CalculateDynamicExpTopPadding(expTSize)
     self.pctText:SetFont(STANDARD_TEXT_FONT, expTSize, "OUTLINE")
@@ -2161,165 +1651,12 @@ function ExpTracker:LayoutPlacardsImpl()
     self.pctText:ClearAllPoints()
     self.pctText:SetPoint("TOP", self.expFrame, "TOP", 0, -(5 + expTopPad))
     self.expFrame:Show()
-
-    -- 2. Dynamic Session & Map Info Placard
-    -- Row 1: Col 1 (Coords/Gold left-justified) | Col 2 (Bags/Ammo/Shards right-justified expanding left)
-    -- Row 2: Col 1 (Time to Level left-justified) | Col 2 (Est. Mob Kills right-justified)
-    local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 12)
-    local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 12)
-    local pad = db.cellPadding or 10
-    local userOffsetY = YRG.SafeNumber(db.infoPlacardOffsetY, 0)
-    local fixedWidth = YRG.SafeNumber(db.infoPlacardWidth, 200)
-    local dividerAlpha = math.max(0, math.min(1, (YRG.SafeNumber(db.rowDividerOpacityPct, 60)) / 100.0))
-    local extraRowPad = math.max(0, YRG.SafeNumber(db.rowExtraPadding, 4))
-
-    local rowBadges = {
-        { self.coordBadge, row1TSize },
-        { self.bagSlotsBadge, row1TSize },
-        { self.arrowsBadge, row1TSize },
-        { self.shardsBadge, row1TSize },
-        { self.timeBadge, row2TSize },
-        { self.killBadge, row2TSize },
-    }
-    for _, entry in ipairs(rowBadges) do
-        local badge, sz = entry[1], entry[2]
-        if badge then
-            badge:ApplyFontSize(sz)
-            badge:ClearAllPoints()
-            badge:Hide()
-        end
-    end
-    if self.rowDivider then
-        self.rowDivider:ClearAllPoints()
-        self.rowDivider:Hide()
-    end
-
-    -- Row 1 Column 1 (Left-Justified Coordinates or Current Gold)
-    local row1LeftMode = GetRow1LeftMode(db)
-    local hasRow1Col1 = (row1LeftMode ~= "none" and self.coordBadge) and true or false
-
-    -- Row 1 Column 2 (Right-Justified Bag Trackers expanding leftward: Inventory first on far right, then alt trackers)
-    local activeRow1Col2 = {}
-    if db.showBagSlots ~= false and self.bagSlotsBadge then
-        table.insert(activeRow1Col2, self.bagSlotsBadge)
-    end
-    if db.showArrowsRemaining ~= false and self._hasArrowsEquipped and self.arrowsBadge then
-        table.insert(activeRow1Col2, self.arrowsBadge)
-    end
-    if db.showSoulShards ~= false and self._isWarlock and self.shardsBadge then
-        table.insert(activeRow1Col2, self.shardsBadge)
-    end
-
-    -- Row 2 (2 Columns: Time to Level left-justified | Est. Mob Kills right-justified)
-    local hasRow2 = (db.showFarmingRow ~= false) and ((self.timeBadge or self.killBadge) and true or false)
-
-    local hasRow1 = hasRow1Col1 or (#activeRow1Col2 > 0)
-
-    if db.showInfoPlacard == false or (not hasRow1 and not hasRow2) then
-        self.infoFrame:Hide()
-        HandleBuiltInCoordinates(false)
-        UpdateEditModeMinimapSelection()
-        return
-    end
-
-    HandleBuiltInCoordinates(row1LeftMode == "coords")
-
-    local minInfoW = self.infoFrame._yrgNineSliceMinW or 44
-    local minInfoH = self.infoFrame._yrgNineSliceMinH or 20
-    local sidePad = pad + 4
-
-    local badgeGap = math.max(6, math.floor(pad * 0.75 + 0.5))
-    local finalInfoW = math.max(fixedWidth, minInfoW, 44)
-
-    local row1HasRing = (hasRow1Col1 and row1LeftMode == "coords") or (#activeRow1Col2 > 0)
-    local row1VisualH = row1HasRing and math.max(row1TSize, math.floor(row1TSize * 1.75 + 0.5)) or row1TSize
-    local row2VisualH = math.max(row2TSize, math.floor(row2TSize * 1.75 + 0.5))
-    local baseRowGap = math.max(5, math.floor(pad * 0.5 + 0.5))
-    local totalRowSep = baseRowGap + extraRowPad
-    local totalHeight = (hasRow1 and hasRow2)
-        and (row1VisualH + row2VisualH + totalRowSep + (pad * 2) + 2)
-        or ((hasRow1 and row1VisualH or row2VisualH) + (pad * 2) + 2)
-    local finalInfoH = math.max(totalHeight, minInfoH)
-
-    local row1Y = (hasRow1 and hasRow2) and ((row2VisualH + totalRowSep) * 0.5) or 0
-    local row2Y = (hasRow1 and hasRow2) and -((row1VisualH + totalRowSep) * 0.5) or 0
-    local dividerY = (hasRow1 and hasRow2) and ((row2VisualH - row1VisualH) * 0.5) or 0
-
-    -- Horizontal line divider centered between Row 1 and Row 2 when both rows are active
-    if hasRow1 and hasRow2 and self.rowDivider and dividerAlpha > 0 then
-        local divInset = math.max(8, math.floor(sidePad * 0.6))
-        self.rowDivider:SetColorTexture(0.65, 0.52, 0.25, dividerAlpha)
-        self.rowDivider:SetPoint("LEFT", self.infoFrame, "LEFT", divInset, dividerY)
-        self.rowDivider:SetPoint("RIGHT", self.infoFrame, "RIGHT", -divInset, dividerY)
-        self.rowDivider:Show()
-    end
-
-    -- Place Row 1 Col 1 (Coordinates/Gold left-justified)
-    if hasRow1Col1 then
-        self.coordBadge:SetPoint("LEFT", self.infoFrame, "LEFT", sidePad, row1Y)
-        self.coordBadge:Show()
-    end
-
-    -- Place Row 1 Col 2 (Inventory always full right; alt badges expand to the left)
-    if #activeRow1Col2 > 0 then
-        local prevBadge = nil
-        for idx, badge in ipairs(activeRow1Col2) do
-            badge:Show()
-            if idx == 1 then
-                badge:SetPoint("RIGHT", self.infoFrame, "RIGHT", -sidePad, row1Y)
-            else
-                badge:SetPoint("RIGHT", prevBadge, "LEFT", -badgeGap, 0)
-            end
-            prevBadge = badge
-        end
-    end
-
-    -- Place Row 2 (2 Columns: Time to Level left-justified | Est. Mob Kills right-justified)
-    if hasRow2 then
-        if self.timeBadge then
-            self.timeBadge:SetPoint("LEFT", self.infoFrame, "LEFT", sidePad, row2Y)
-            self.timeBadge:Show()
-        end
-        if self.killBadge then
-            self.killBadge:SetPoint("RIGHT", self.infoFrame, "RIGHT", -sidePad, row2Y)
-            self.killBadge:Show()
-        end
-    end
-
-    self.infoFrame:SetSize(finalInfoW, finalInfoH)
-    self.infoFrame:ClearAllPoints()
-
-    local isHeaderBottom = IsMinimapHeaderOnBottom()
-    if isHeaderBottom and db.followMapOrientation then
-        self.infoFrame:SetPoint("BOTTOM", self.container, "TOP", 0, ringTopRimY + 2 + userOffsetY)
-    elseif isHeaderBottom and not db.followMapOrientation then
-        local titleHdr, titleBottomScreen = GetBottomMinimapHeaderFrame()
-        local cBottom = SafeRegionBottom(self.container)
-        local cScale = SafeRegionScale(self.container, 1)
-        local expBottomRelContainer = ringBottomRimY - (expH * 0.5)
-
-        if titleHdr and titleBottomScreen and cBottom then
-            local titleBottomRelContainer = (titleBottomScreen - (cBottom * cScale)) / cScale
-            local anchorBottomRel = math.min(titleBottomRelContainer, expBottomRelContainer)
-            self.infoFrame:SetPoint("TOP", self.container, "BOTTOM", 0, anchorBottomRel - 2 + userOffsetY)
-        else
-            self.infoFrame:SetPoint("TOP", self.expFrame, "BOTTOM", 0, GetBottomHeaderExtraOffset() + 3 + userOffsetY)
-        end
-    else
-        -- Default (title bar on top): anchored directly below the EXP Placard
-        self.infoFrame:SetPoint("TOP", self.expFrame, "BOTTOM", 0, 3 + userOffsetY)
-    end
-
-    self.infoFrame:Show()
-    UpdateEditModeMinimapSelection()
 end
 
 function ExpTracker:LayoutPlacards()
     self:LayoutPlacardsImpl()
-    if not self.container then return end
-    local db = YRG:GetModuleDB("MinimapExpTracker")
-    ApplyMinimapHeaderWidth(db)
-    ApplyMinimapHeaderCenter(db)
+    MUI.NotifyInfoPlacardLayout()
+    MUI.SyncHeaderAndEditMode()
 end
 
 function ExpTracker:ApplyVisualSettings()
@@ -2405,93 +1742,16 @@ function ExpTracker:ApplyHideAddonButtonsSetting(db)
     end
 end
 
-local WARN_RANK = {
-    normal = 0,
-    warn = 1,
-    critical = 2,
-}
-
-local function GetCountWarnState(count, threshold)
-    if count <= 0 then
-        return "critical"
-    elseif threshold > 0 and count <= threshold then
-        return "warn"
-    end
-    return "normal"
-end
-
-local yrgRaidWarningFrame = nil
-
-local function GetOrCreateLocalRaidWarningFrame()
-    if yrgRaidWarningFrame then
-        return yrgRaidWarningFrame
-    end
-    local ok, frame = pcall(CreateFrame, "Frame", "YRGRaidWarningFrame", UIParent, "RaidWarningFrameTemplate")
-    if ok and frame then
-        frame:UnregisterAllEvents()
-        frame:SetFrameStrata("HIGH")
-        if RaidWarningFrame then
-            frame:SetPoint("TOP", RaidWarningFrame, "TOP")
-        else
-            frame:SetPoint("TOP", UIParent, "TOP", 0, -220)
-        end
-        yrgRaidWarningFrame = frame
-        return frame
-    end
-    return nil
-end
-
-local function EmitLocalRaidWarning(msg, isCritical)
-    if not msg or msg == "" then return end
-    local color = isCritical
-        and { r = 1.0, g = 0.16, b = 0.16 }
-        or  { r = 1.0, g = 0.56, b = 0.10 }
-    local rwFrame = GetOrCreateLocalRaidWarningFrame()
-    if rwFrame and type(rwFrame.AddMessage) == "function" then
-        pcall(rwFrame.AddMessage, rwFrame, msg, color, 4.0)
-    elseif type(RaidNotice_AddMessage) == "function" and RaidWarningFrame then
-        pcall(RaidNotice_AddMessage, RaidWarningFrame, msg, color, 4.0)
-    elseif UIErrorsFrame and type(UIErrorsFrame.AddMessage) == "function" then
-        pcall(UIErrorsFrame.AddMessage, UIErrorsFrame, msg, color.r, color.g, color.b, 1.0)
-    end
-end
-
-function ExpTracker:CheckRaidWarningTransition(stateKey, newState, warnMsg, critMsg)
-    local prevState = self[stateKey]
-    if prevState == nil then
-        self[stateKey] = newState
-        return
-    end
-    local prevRank = WARN_RANK[prevState] or 0
-    local newRank = WARN_RANK[newState] or 0
-    if newRank > prevRank then
-        if newState == "warn" then
-            EmitLocalRaidWarning(warnMsg, false)
-        elseif newState == "critical" then
-            EmitLocalRaidWarning(critMsg, true)
-        end
-    end
-    self[stateKey] = newState
-end
-
-local function StopBadgeFlash(badge)
-    if badge and badge.flashAnim and badge.flashAnim:IsPlaying() then
-        badge.flashAnim:Stop()
-    end
-    if badge and badge.text then
-        badge.text:SetAlpha(1.0)
-    end
-end
-
 function ExpTracker:UpdateXP()
     if not self.container then return end
     local db = YRG:GetModuleDB("MinimapExpTracker")
     if not db or not db.enabled then
         self.container:Hide()
-        HandleBuiltInCoordinates(false)
+        ApplyMinimapHeaderWidth(db)
         ApplyMinimapHeaderCenter(db)
         ApplyMinimapHeaderDarkness(db)
-        RestoreEditModeMinimapSelection()
+        MUI.NotifyInfoPlacardLayout()
+        UpdateEditModeMinimapSelection()
         return
     end
 
@@ -2499,8 +1759,8 @@ function ExpTracker:UpdateXP()
     local maxLevel = (GetMaxPlayerLevel and GetMaxPlayerLevel()) or 60
     if db.hideAtMaxLevel and level >= maxLevel then
         self.container:Hide()
-        HandleBuiltInCoordinates(false)
-        RestoreEditModeMinimapSelection()
+        MUI.NotifyInfoPlacardLayout()
+        UpdateEditModeMinimapSelection()
         return
     end
     self.container:Show()
@@ -2529,107 +1789,10 @@ function ExpTracker:UpdateXP()
         self.pctText:SetText(string.format("%d%%", math.floor(pctVal + 0.5)))
     end
 
-    local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 12)
-    local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 12)
-    local row1IconSz = math.max(10, row1TSize)
-    local remXP = math.max(maxXP - curXP, 0)
-    local estKills, _, _, estSeconds = GetKillPaceMetrics(remXP)
-
-    if db.showFarmingRow ~= false then
-        if self.killBadge then
-            local killsStr = estKills and tostring(estKills) or "--"
-            self.killBadge:UpdateBadge(row2TSize, ICON_SKULL, killsStr, "normal")
-        end
-        if self.timeBadge then
-            local timeStr = FormatTimeEstimate(estSeconds)
-            self.timeBadge:UpdateBadge(row2TSize, ICON_WATCH, timeStr, "normal")
-        end
-    end
-
-    local row1LeftMode = GetRow1LeftMode(db)
-    if row1LeftMode == "coords" and self.coordBadge then
-        local coordStr = "--, --"
-        if C_Map and C_Map.GetPlayerMapPosition then
-            local mapID = C_Map.GetBestMapForUnit("player")
-            if mapID then
-                local pos = C_Map.GetPlayerMapPosition(mapID, "player")
-                if pos and pos.x and pos.y then
-                    coordStr = string.format("%.1f, %.1f", pos.x * 100, pos.y * 100)
-                end
-            end
-        end
-        self.coordBadge:UpdateBadge(row1TSize, ICON_MAP, coordStr, "normal")
-    elseif row1LeftMode == "gold" and self.coordBadge then
-        local copper = (type(GetMoney) == "function") and GetMoney() or 0
-        self.coordBadge:UpdateBadge(row1TSize, nil, FormatPlacardMoneyText(copper, row1IconSz), "normal")
-    end
-
-    -- Row 1 Col 2 trackers: Free bag slots, Arrows/Ammo remaining, Warlock Soul Shards
-    local tSize = row1TSize
-    local freeSlots, hasAmmoSource, totalAmmoCount, ammoDisplayIcon = GetInventoryAndAmmoStatus()
-
-    if db.showBagSlots ~= false and self.bagSlotsBadge then
-        local bagThresh = math.max(0, YRG.SafeNumber(db.bagWarnThreshold, 3))
-        local bagState = GetCountWarnState(freeSlots, bagThresh)
-        self.bagSlotsBadge:UpdateBadge(tSize, ICON_BAG, tostring(freeSlots), bagState)
-        if db.bagRaidWarnings then
-            self:CheckRaidWarningTransition(
-                "_lastBagWarnState",
-                bagState,
-                string.format("Low Bag Space! (%d free slot%s left)", freeSlots, freeSlots == 1 and "" or "s"),
-                "Bags Full! No space left!"
-            )
-        else
-            self._lastBagWarnState = nil
-        end
-    else
-        StopBadgeFlash(self.bagSlotsBadge)
-        self._lastBagWarnState = nil
-    end
-
-    self._hasArrowsEquipped = hasAmmoSource and true or false
-    if db.showArrowsRemaining ~= false and hasAmmoSource and self.arrowsBadge then
-        local ammoThresh = math.max(0, YRG.SafeNumber(db.ammoWarnThreshold, 200))
-        local ammoState = GetCountWarnState(totalAmmoCount, ammoThresh)
-        self.arrowsBadge:UpdateBadge(tSize, ammoDisplayIcon or ICON_ARROW, tostring(totalAmmoCount), ammoState)
-        if db.bagRaidWarnings then
-            self:CheckRaidWarningTransition(
-                "_lastAmmoWarnState",
-                ammoState,
-                string.format("Low Ammo! (%d remaining)", totalAmmoCount),
-                "Out of Ammo! No arrows or bullets left!"
-            )
-        else
-            self._lastAmmoWarnState = nil
-        end
-    else
-        StopBadgeFlash(self.arrowsBadge)
-        self._lastAmmoWarnState = nil
-    end
-
-    local isWarlock, shardCount = GetWarlockSoulShardCount()
-    self._isWarlock = isWarlock and true or false
-    if db.showSoulShards ~= false and isWarlock and self.shardsBadge then
-        self.shardsBadge:UpdateBadge(tSize, ICON_SHARD, tostring(shardCount), "normal")
-    else
-        StopBadgeFlash(self.shardsBadge)
-    end
-
     self:LayoutPlacards()
 end
 
 function ExpTracker:OnInitialize(db)
-    if db.showEstimatedTime == false and db.showEstimatedKills == false then
-        db.showFarmingRow = false
-    end
-    db.showEstimatedTime = nil
-    db.showEstimatedKills = nil
-    if db.infoPlacardExtraWidth ~= nil then
-        if db.infoPlacardWidth == nil then
-            db.infoPlacardWidth = math.min(360, math.max(100, 200 + YRG.SafeNumber(db.infoPlacardExtraWidth, 0)))
-        end
-        db.infoPlacardExtraWidth = nil
-    end
     if not db.fillStyle or not FILL_TEXTURES[db.fillStyle] then
         db.fillStyle = "conduit"
     end
@@ -2643,50 +1806,12 @@ function ExpTracker:OnInitialize(db)
     db.expColor = nil
     db.restedColor = nil
     db._fixedColorPickerAlphaV1 = nil
-    if db.row1LeftMode == nil then
-        db.row1LeftMode = (db.showCoordinates == false) and "none" or "coords"
-    elseif db.row1LeftMode ~= "coords" and db.row1LeftMode ~= "gold" and db.row1LeftMode ~= "none" then
-        db.row1LeftMode = "coords"
-    end
-    db.showCoordinates = nil
-    if db.row1TextSize == nil then
-        db.row1TextSize = tonumber(db.textSize) or 12
-    end
-    if db.row2TextSize == nil then
-        db.row2TextSize = tonumber(db.textSize) or 12
-    end
-    db.textSize = nil
 
     self:EnsureFrames()
-    sessionStartTime = GetTime()
     self.eventFrame = CreateFrame("Frame")
-    self.coordTimer = 0
-    self.lastKnownXP = YRG.SafeNumber(UnitXP("player"), 0)
 
-    self.eventFrame:SetScript("OnEvent", function(_, event, arg1)
-        if event == "PLAYER_XP_UPDATE" then
-            local newXP = YRG.SafeNumber(UnitXP("player"), 0)
-            local diff = (self.lastKnownXP and newXP >= self.lastKnownXP) and (newXP - self.lastKnownXP) or 0
-            self.lastKnownXP = newXP
-            if diff > 0 then
-                local now = GetTime()
-                local lastEntry = sessionKillsData[#sessionKillsData]
-                if type(lastEntry) == "table" and (now - lastEntry.t) > 300 then
-                    sessionKillsData = {}
-                end
-                table.insert(sessionKillsData, { xp = diff, t = now })
-                if #sessionKillsData > 10 then
-                    table.remove(sessionKillsData, 1)
-                end
-            end
-            self:UpdateXP()
-        elseif event == "UNIT_INVENTORY_CHANGED" then
-            if arg1 == "player" then
-                self:UpdateXP()
-            end
-        elseif event == "BAG_UPDATE" then
-            self:UpdateXP()
-        elseif event == "PLAYER_REGEN_ENABLED" then
+    self.eventFrame:SetScript("OnEvent", function(_, event)
+        if event == "PLAYER_REGEN_ENABLED" then
             if self._pendingHeaderCenter then
                 self._pendingHeaderCenter = nil
                 local modDB = YRG:GetModuleDB("MinimapExpTracker")
@@ -2697,92 +1822,100 @@ function ExpTracker:OnInitialize(db)
                 end
             end
         else
-            self.lastKnownXP = YRG.SafeNumber(UnitXP("player"), 0)
             self:UpdateXP()
         end
     end)
 
-    self.eventFrame:SetScript("OnUpdate", function(frame, elapsed)
-        frame.coordTimer = (frame.coordTimer or 0) + elapsed
-        if frame.coordTimer >= 0.5 then
-            frame.coordTimer = 0
+    local function OnAnyMinimapLayoutChange()
+        local modDB = YRG:GetModuleDB("MinimapExpTracker")
+        if modDB and modDB.enabled then
+            self:ApplyVisualSettings()
+        else
+            MUI.NotifyInfoPlacardLayout()
+            MUI.SyncHeaderAndEditMode()
+        end
+    end
+
+    if not MUI.hooksRegistered then
+        MUI.hooksRegistered = true
+        Minimap:HookScript("OnSizeChanged", OnAnyMinimapLayoutChange)
+
+        local function SyncMinimapHeaderLayout()
             local modDB = YRG:GetModuleDB("MinimapExpTracker")
             if modDB and modDB.enabled then
-                ExpTracker:UpdateXP()
+                self:LayoutPlacards()
+            else
+                MUI.NotifyInfoPlacardLayout()
+                MUI.SyncHeaderAndEditMode()
+            end
+            if C_Timer and type(C_Timer.After) == "function" then
+                C_Timer.After(0, function()
+                    MUI.SyncHeaderAndEditMode()
+                end)
             end
         end
-    end)
 
-    Minimap:HookScript("OnSizeChanged", function()
-        self:ApplyVisualSettings()
-        self:UpdateXP()
-    end)
+        if MinimapCluster then
+            if type(MinimapCluster.SetHeaderUnderneath) == "function" then
+                hooksecurefunc(MinimapCluster, "SetHeaderUnderneath", SyncMinimapHeaderLayout)
+            end
+            if type(MinimapCluster.Layout) == "function" then
+                hooksecurefunc(MinimapCluster, "Layout", SyncMinimapHeaderLayout)
+            end
+            if type(MinimapCluster.SetEditModeScale) == "function" then
+                hooksecurefunc(MinimapCluster, "SetEditModeScale", SyncMinimapHeaderLayout)
+            end
+        end
 
-    local function SyncMinimapHeaderLayout()
-        self:LayoutPlacards()
-        if C_Timer and type(C_Timer.After) == "function" then
-            C_Timer.After(0, function()
+        local function SyncEditModeSelection()
+            local modDB = YRG:GetModuleDB("MinimapExpTracker")
+            if modDB and modDB.enabled then
+                self:LayoutPlacards()
+            else
+                MUI.NotifyInfoPlacardLayout()
+            end
+            UpdateEditModeMinimapSelection(true)
+            if C_Timer and type(C_Timer.After) == "function" then
+                C_Timer.After(0, function()
+                    UpdateEditModeMinimapSelection(true)
+                end)
+            end
+        end
+
+        if EditModeManagerFrame then
+            EditModeManagerFrame:HookScript("OnShow", SyncEditModeSelection)
+            EditModeManagerFrame:HookScript("OnHide", function()
                 local modDB = YRG:GetModuleDB("MinimapExpTracker")
                 if modDB and modDB.enabled then
-                    ApplyMinimapHeaderWidth(modDB)
-                    ApplyMinimapHeaderCenter(modDB)
+                    self:LayoutPlacards()
+                else
+                    MUI.NotifyInfoPlacardLayout()
                 end
+                RestoreEditModeMinimapSelection()
             end)
+            if type(EditModeManagerFrame.EnterEditMode) == "function" then
+                pcall(hooksecurefunc, EditModeManagerFrame, "EnterEditMode", SyncEditModeSelection)
+            end
+            if type(EditModeManagerFrame.ExitEditMode) == "function" then
+                pcall(hooksecurefunc, EditModeManagerFrame, "ExitEditMode", RestoreEditModeMinimapSelection)
+            end
+            if type(EditModeManagerFrame.UpdateSystems) == "function" then
+                pcall(hooksecurefunc, EditModeManagerFrame, "UpdateSystems", SyncEditModeSelection)
+            end
         end
-    end
-
-    if MinimapCluster then
-        if type(MinimapCluster.SetHeaderUnderneath) == "function" then
-            hooksecurefunc(MinimapCluster, "SetHeaderUnderneath", SyncMinimapHeaderLayout)
+        if EventRegistry and type(EventRegistry.RegisterCallback) == "function" then
+            pcall(EventRegistry.RegisterCallback, EventRegistry, "EditMode.Enter", SyncEditModeSelection, ExpTracker)
+            pcall(EventRegistry.RegisterCallback, EventRegistry, "EditMode.Exit", RestoreEditModeMinimapSelection, ExpTracker)
         end
-        if type(MinimapCluster.Layout) == "function" then
-            hooksecurefunc(MinimapCluster, "Layout", SyncMinimapHeaderLayout)
-        end
-        if type(MinimapCluster.SetEditModeScale) == "function" then
-            hooksecurefunc(MinimapCluster, "SetEditModeScale", SyncMinimapHeaderLayout)
-        end
-    end
-    local function SyncEditModeSelection()
-        self:LayoutPlacards()
-        UpdateEditModeMinimapSelection(true)
-        if C_Timer and type(C_Timer.After) == "function" then
-            C_Timer.After(0, function()
-                UpdateEditModeMinimapSelection(true)
-            end)
-        end
-    end
-    if EditModeManagerFrame then
-        EditModeManagerFrame:HookScript("OnShow", SyncEditModeSelection)
-        EditModeManagerFrame:HookScript("OnHide", function()
-            self:LayoutPlacards()
-            RestoreEditModeMinimapSelection()
-        end)
-        if type(EditModeManagerFrame.EnterEditMode) == "function" then
-            pcall(hooksecurefunc, EditModeManagerFrame, "EnterEditMode", SyncEditModeSelection)
-        end
-        if type(EditModeManagerFrame.ExitEditMode) == "function" then
-            pcall(hooksecurefunc, EditModeManagerFrame, "ExitEditMode", RestoreEditModeMinimapSelection)
-        end
-        if type(EditModeManagerFrame.UpdateSystems) == "function" then
-            pcall(hooksecurefunc, EditModeManagerFrame, "UpdateSystems", SyncEditModeSelection)
-        end
-    end
-    if EventRegistry and type(EventRegistry.RegisterCallback) == "function" then
-        pcall(EventRegistry.RegisterCallback, EventRegistry, "EditMode.Enter", SyncEditModeSelection, ExpTracker)
-        pcall(EventRegistry.RegisterCallback, EventRegistry, "EditMode.Exit", RestoreEditModeMinimapSelection, ExpTracker)
     end
 end
 
 function ExpTracker:OnEnable(db)
     self:EnsureFrames()
-    if sessionStartTime == 0 then sessionStartTime = GetTime() end
     self.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     self.eventFrame:RegisterEvent("PLAYER_XP_UPDATE")
     self.eventFrame:RegisterEvent("UPDATE_EXHAUSTION")
     self.eventFrame:RegisterEvent("PLAYER_LEVEL_UP")
-    self.eventFrame:RegisterEvent("PLAYER_MONEY")
-    self.eventFrame:RegisterEvent("BAG_UPDATE")
-    self.eventFrame:RegisterEvent("UNIT_INVENTORY_CHANGED")
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
     self:ApplyVisualSettings()
     self:UpdateXP()
@@ -2793,6 +1926,7 @@ function ExpTracker:OnEnable(db)
                 ApplyMinimapHeaderWidth(modDB)
                 ApplyMinimapHeaderCenter(modDB)
             end
+            MUI.NotifyInfoPlacardLayout()
         end)
         C_Timer.After(1.0, function()
             local modDB = YRG:GetModuleDB("MinimapExpTracker")
@@ -2804,8 +1938,6 @@ function ExpTracker:OnEnable(db)
 end
 
 function ExpTracker:OnDisable(db)
-    self._lastBagWarnState = nil
-    self._lastAmmoWarnState = nil
     self._pendingHeaderCenter = nil
     if self.eventFrame then
         self.eventFrame:UnregisterAllEvents()
@@ -2813,8 +1945,6 @@ function ExpTracker:OnDisable(db)
     if self.container then
         self.container:Hide()
     end
-    RestoreEditModeMinimapSelection()
-    HandleBuiltInCoordinates(false)
     ApplyMinimapHeaderCenter(db)
     ApplyMinimapHeaderWidth(db)
     ApplyMinimapHeaderDarkness(db)
@@ -2830,16 +1960,13 @@ function ExpTracker:OnDisable(db)
         end
     end
     self:ApplyDefaultExpBarVisibility(db)
+    MUI.NotifyInfoPlacardLayout()
+    UpdateEditModeMinimapSelection()
 end
 
 function ExpTracker:BuildConfigUI(ctx, db)
     local function GetDB()
         return YRG:GetModuleDB("MinimapExpTracker")
-    end
-
-    local function IsPlacardEnabled()
-        local mdb = GetDB()
-        return mdb == nil or mdb.showInfoPlacard ~= false
     end
 
     -- =========================================================================
@@ -2917,40 +2044,6 @@ function ExpTracker:BuildConfigUI(ctx, db)
             local mdb = GetDB()
             if mdb then mdb.hideAddonButtons = val end
             self:ApplyHideAddonButtonsSetting(mdb)
-        end,
-    })
-
-    ctx:AddCheckbox({
-        key = "centerMinimapHeader",
-        name = "Center Minimap Title Bar",
-        tooltip = "Aligns Blizzard's native minimap title bar assembly horizontally over the minimap center.",
-        defaultValue = true,
-        get = function()
-            local mdb = GetDB()
-            return mdb == nil or mdb.centerMinimapHeader ~= false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.centerMinimapHeader = val end
-            ApplyMinimapHeaderCenter(mdb)
-            self:LayoutPlacards()
-        end,
-    })
-
-    ctx:AddCheckbox({
-        key = "matchPlacardWidth",
-        name = "Stretch Title Bar to Match Placard Width",
-        tooltip = "Resizes Blizzard's minimap title bar so the combined header assembly (including Tracking and Calendar icons when visible) matches your placard width.",
-        defaultValue = false,
-        get = function()
-            local mdb = GetDB()
-            return mdb and mdb.matchPlacardWidth == true or false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.matchPlacardWidth = val end
-            ApplyMinimapHeaderWidth(mdb)
-            self:LayoutPlacards()
         end,
     })
 
@@ -3091,223 +2184,6 @@ function ExpTracker:BuildConfigUI(ctx, db)
             self:ApplyVisualSettings()
         end,
     })
-
-    -- =========================================================================
-    -- SECTION 3: Dynamic Session & Map Info Placard
-    -- =========================================================================
-    ctx:AddHeader("3. Dynamic Info Placard")
-
-    local placardChildVars = {
-        "YRG_MinimapExpTracker_followMapOrientation",
-        "YRG_MinimapExpTracker_infoPlacardWidth",
-        "YRG_MinimapExpTracker_cellPadding",
-        "YRG_MinimapExpTracker_infoPlacardOffsetY",
-        "YRG_MinimapExpTracker_rowDividerOpacityPct",
-        "YRG_MinimapExpTracker_rowExtraPadding",
-        "YRG_MinimapExpTracker_row1LeftMode",
-        "YRG_MinimapExpTracker_row1TextSize",
-        "YRG_MinimapExpTracker_showBagSlots",
-        "YRG_MinimapExpTracker_showArrowsRemaining",
-        "YRG_MinimapExpTracker_showSoulShards",
-        "YRG_MinimapExpTracker_bagWarnThreshold",
-        "YRG_MinimapExpTracker_ammoWarnThreshold",
-        "YRG_MinimapExpTracker_bagRaidWarnings",
-        "YRG_MinimapExpTracker_showFarmingRow",
-        "YRG_MinimapExpTracker_row2TextSize",
-    }
-
-    ctx:AddCheckbox({
-        key = "showInfoPlacard",
-        name = "Enable Dynamic Info Placard",
-        tooltip = "Toggles the secondary dynamic-fit info placard displaying coordinates, bag/ammo counts, and farming stats.",
-        defaultValue = true,
-        notifies = placardChildVars,
-        get = IsPlacardEnabled,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.showInfoPlacard = val end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    ctx:AddCheckbox({
-        key = "followMapOrientation",
-        name = "Follow Map Header Orientation (Flip to Top)",
-        tooltip = "When checked, stays anchored below the EXP Placard if the minimap title is on top, and flips to the top if the title is moved to the bottom in Edit Mode.",
-        defaultValue = true,
-        canModify = IsPlacardEnabled,
-        get = function()
-            local mdb = GetDB()
-            return mdb == nil or mdb.followMapOrientation ~= false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.followMapOrientation = val end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    local function AddPlacardSlider(key, name, tooltip, minVal, maxVal, step, defaultVal, formatFn)
-        ctx:AddSlider({
-            key = key,
-            name = name,
-            tooltip = tooltip,
-            min = minVal, max = maxVal, step = step, defaultValue = defaultVal,
-            format = formatFn,
-            canModify = IsPlacardEnabled,
-            get = function()
-                local mdb = GetDB()
-                if mdb and mdb[key] ~= nil then
-                    return mdb[key]
-                end
-                return defaultVal
-            end,
-            set = function(val)
-                local mdb = GetDB()
-                if mdb then mdb[key] = math.floor(val + 0.5) end
-                self:ApplyVisualSettings()
-            end,
-        })
-    end
-
-    AddPlacardSlider("infoPlacardWidth", "Info Placard Width", "Fixed width in pixels of the Dynamic Info Placard.", 100, 360, 2, 200, function(v) return string.format("%d px", v) end)
-    AddPlacardSlider("cellPadding", "Info Cell Padding", "Inner padding around placard content in pixels.", 2, 20, 1, 10, function(v) return string.format("%d px", v) end)
-    AddPlacardSlider("infoPlacardOffsetY", "Info Placard Vertical Offset", "Fine vertical offset adjustment for the Dynamic Info Placard.", -30, 30, 1, 0, function(v) return string.format("%d px", v) end)
-    AddPlacardSlider("rowDividerOpacityPct", "Row Divider Line Opacity (%)", "Opacity of the horizontal divider line between Row 1 and Row 2.", 0, 100, 5, 60, function(v) return string.format("%d%%", v) end)
-    AddPlacardSlider("rowExtraPadding", "Row 2 Vertical Padding", "Extra spacing between Row 1 and Row 2 inside the Dynamic Info Placard.", 0, 20, 1, 4, function(v) return string.format("%d px", v) end)
-
-    -- =========================================================================
-    -- SUB-SECTION 3A: Row 1 — Trackers & Bags
-    -- =========================================================================
-    ctx:AddHeader("3A. Row 1 — Trackers & Bags")
-
-    AddPlacardSlider("row1TextSize", "Row 1 Font Size", "Font and icon size used for Row 1 (Coordinates/Gold and Bag/Ammo trackers).", 8, 18, 1, 12, function(v) return string.format("%d px", v) end)
-
-    ctx:AddDropdown({
-        key = "row1LeftMode",
-        name = "Row 1 Left Display",
-        tooltip = "Choose what appears on the left side of Row 1: Coordinates (default, hides built-in minimap coordinates), Current Gold (with gold/silver/copper icons), or None.",
-        defaultValue = "coords",
-        options = ROW1_LEFT_OPTIONS,
-        canModify = IsPlacardEnabled,
-        get = function()
-            return GetRow1LeftMode(GetDB())
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then
-                mdb.row1LeftMode = (val == "gold" or val == "none") and val or "coords"
-            end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    ctx:AddCheckbox({
-        key = "showBagSlots",
-        name = "Show Inventory Free Slots",
-        tooltip = "Displays remaining free general bag slots far-right in Row 1 Column 2.",
-        defaultValue = true,
-        canModify = IsPlacardEnabled,
-        get = function()
-            local mdb = GetDB()
-            return mdb == nil or mdb.showBagSlots ~= false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.showBagSlots = val end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    ctx:AddCheckbox({
-        key = "showArrowsRemaining",
-        name = "Show Arrows / Ammo Remaining",
-        tooltip = "Displays equipped arrows or bullets expanding left in Row 1 Column 2 for Hunters, Warriors, and Rogues with a Bow, Crossbow, or Gun equipped.",
-        defaultValue = true,
-        canModify = IsPlacardEnabled,
-        get = function()
-            local mdb = GetDB()
-            return mdb == nil or mdb.showArrowsRemaining ~= false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.showArrowsRemaining = val end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    ctx:AddCheckbox({
-        key = "showSoulShards",
-        name = "Show Soul Shards (Warlock)",
-        tooltip = "Displays Soul Shards expanding left in Row 1 Column 2 (Warlock only).",
-        defaultValue = true,
-        canModify = IsPlacardEnabled,
-        get = function()
-            local mdb = GetDB()
-            return mdb == nil or mdb.showSoulShards ~= false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.showSoulShards = val end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    AddPlacardSlider("bagWarnThreshold", "Inventory Low Warning Threshold", "Free general bag slots threshold to trigger low-space warning highlight / raid warning (0 = Off).", 0, 20, 1, 3, function(v)
-        return (v <= 0) and "Off" or string.format("%d", v)
-    end)
-
-    AddPlacardSlider("ammoWarnThreshold", "Ammo Low Warning Threshold", "Equipped arrow/bullet count threshold to trigger low-ammo warning highlight / raid warning (0 = Off).", 0, 1000, 10, 200, function(v)
-        return (v <= 0) and "Off" or string.format("%d", v)
-    end)
-
-    ctx:AddCheckbox({
-        key = "bagRaidWarnings",
-        name = "Include Raid Warnings (Inventory & Ammo)",
-        tooltip = "Shows a local center-screen Raid Warning once when bag space or ammo drops below the low threshold (orange) or hits 0 remaining (red).",
-        defaultValue = false,
-        canModify = IsPlacardEnabled,
-        get = function()
-            local mdb = GetDB()
-            return (mdb and mdb.bagRaidWarnings) and true or false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.bagRaidWarnings = val end
-            if val then
-                self._lastBagWarnState = "normal"
-                self._lastAmmoWarnState = "normal"
-            else
-                self._lastBagWarnState = nil
-                self._lastAmmoWarnState = nil
-            end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    -- =========================================================================
-    -- SUB-SECTION 3B: Row 2 — Farming Data
-    -- =========================================================================
-    ctx:AddHeader("3B. Row 2 — Farming Data")
-
-    ctx:AddCheckbox({
-        key = "showFarmingRow",
-        name = "Enable Farming Data Row (Time to Level & Kills)",
-        tooltip = "Displays the 2-column Row 2 farming bar (Estimated Time to Level left-justified, Estimated Mob Kills right-justified).",
-        defaultValue = true,
-        canModify = IsPlacardEnabled,
-        get = function()
-            local mdb = GetDB()
-            return mdb == nil or mdb.showFarmingRow ~= false
-        end,
-        set = function(val)
-            local mdb = GetDB()
-            if mdb then mdb.showFarmingRow = val end
-            self:ApplyVisualSettings()
-        end,
-    })
-
-    AddPlacardSlider("row2TextSize", "Row 2 Font Size", "Font and icon size used for Row 2 (Estimated Time to Level and Mob Kills).", 8, 18, 1, 12, function(v) return string.format("%d px", v) end)
 end
 
 YRG:RegisterModule("MinimapExpTracker", ExpTracker)
