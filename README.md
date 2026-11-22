@@ -3,7 +3,7 @@
 Modular UI and Quality-of-Life suite for **World of Warcraft Forever (`1.60.1` / `## Interface: 16001`)**, designed to work cleanly across desktop (Keyboard/Mouse) and Steamdeck / Controller UI mode.
 
 - **Version:** `2.4.3`
-- **Author:** YulRun Gaming
+- **Author:** Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP
 - **SavedVariables:** `YRGDB`
 - **Settings Command:** `/yrg`
 
@@ -45,6 +45,7 @@ Each module can be toggled independently on the main `YRG` panel and has its own
 - **Non-Controller Reagent Bag Merge:** Optionally merges your Reagent Bag slots directly into the bottom of Blizzard's Combined Bags window below a subtle dark separator line, with a soft purple tint on empty reagent slots while preserving native item-quality borders on items.
 - **Bag Automation & Vendor Utilities (All Modes):**
   - **Auto-Sort Bags on Open**
+  - **Auto-Open Clams on Loot** (opens looted clams out of combat when general bag space is available)
   - **Auto-Repair Gear at Vendor NPC** with an adjustable copper/silver/gold repair cap (`Unlimited` or `1s–10g`)
   - **Auto-Sell Grey (Poor) Items at Vendor NPC** paired with a **BetterBags: Exclusion List** subpage (supports manual text entry, Shift-Click item links, and drag-and-drop)
 
@@ -68,7 +69,8 @@ Independent minimap placard that works seamlessly alongside **Minimap EXP Tracke
 ### 5. ClassImprovementsModule (`Modules/ClassImprovementsModule.lua`)
 - **Druid Class Bars:** Displays a secondary Mana bar below Rage or Energy on the Player Frame when shifted into Bear or Cat Form.
 - **Nameplate Combo Points:** Displays 5 circular combo point pips for Rogues and Cat Form Druids on targeted enemy nameplates, either `Below Nameplate (Smart)` (automatically drops beneath active enemy cast bars) or `Right of Health Bar`, with configurable size, spacing, scale, X/Y offsets, cast-bar extra drop, and a 4/5 test preview toggle.
-- **OB Prep (One-Button Prep):** Cross-class single-button preparation via the `YRGOBP` macro (`/yrgobprep`, with `/yrgrogueprep` / `YRGRP` preserved for backwards compatibility). Checks and applies 1 action per press in priority order: **Poisons** (Rogues) → **Item Enhancements** (`Wizard / Mana Oils`, superseding `Sharpening / Weight Stones` when both are checked) → **Food Buff** → **Potions / Elixirs** → **Class Self-Buffs** (level-aware priority per class or custom **Override Default Class Buffs CSV**). Features separate early-overbuff sliders for Weapons/Poisons and Buffs/Consumables plus a **OB Prep: Consumables & Buffs** subpage for Shift-Click / drag-and-drop configuration.
+- **OB Prep (One-Button Prep):** Cross-class single-button preparation via the `YRGOBP` macro (`/yrgobprep`, with `/yrgrogueprep` / `YRGRP` preserved for backwards compatibility). Checks and applies 1 action per press in priority order: **Poisons** (Rogues) → **Item Enhancements** (`Wizard / Mana Oils`, superseding `Sharpening / Weight Stones` when both are checked) → **Food Buff** → **Potions / Elixirs** → **Class Self-Buffs** (level-aware priority per class or custom **Override Default Class Buffs CSV**). Automatically warns and skips missing or unusable steps so later buffs still apply, and prevents getting stuck on more powerful active buffs via both proactive aura/rank checks and live `UI_ERROR_MESSAGE` tracking. Features separate early-overbuff sliders for Weapons/Poisons and Buffs/Consumables plus a **OB Prep: Consumables & Buffs** subpage for Shift-Click / drag-and-drop configuration.
+- **Hunter Pet AutoFeeder:** Automatically detects your pet's diet (`GetPetFoodTypes` + family fallback) and picks the lowest-quality usable food for its level first. Supports both Controller/SteamDeck activation via the `YRGPF` macro (`/yrg petfeed`) and PC activation by clicking the Pet Happiness frame (`PetFrameHappiness`), prints what was fed (or why no usable food was found) to chat, and includes an **Ignore Crafted / Buff Foods** toggle plus a **Hunter Pet AutoFeeder: Blacklist** subpage supporting typing, Shift-Click links, and drag-and-drop.
 
 ---
 
@@ -80,7 +82,8 @@ Independent minimap placard that works seamlessly alongside **Minimap EXP Tracke
 | `/bagstrip` / `/betterbags` | Prints BetterBagsModule status |
 | `/yrgbagdebug` | Captures container/slot layout diagnostics to `YRGDB` |
 | `/yrgcast` | Prints target nameplate, combo point anchor, and cast bar diagnostics |
-| `/yrgobprep` (alias `/yrgrogueprep`) | Evaluates and prepares 1 OB Prep step (supports `status`, `macro`, and `debug`) |
+| `/yrgobprep` (alias `/yrgrogueprep`) | Evaluates and prepares 1 OB Prep step (supports `status`, `macro`, `clear`, and `debug`) |
+| `/yrg petfeed` (alias `/yrgpetfeed`) | Evaluates and prepares Hunter Pet AutoFeeder (supports `status`, `macro`, `clear`, and `debug`) |
 
 ---
 

@@ -2,9 +2,11 @@ local addonName, YRG = ...
 _G.YRG = YRG
 
 YRG.version = "2.4.3"
+YRG.author = "Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP"
 YRG.modules = {}
 YRG.moduleOrder = {}
 YRG.extraCategories = {}
+YRG.slashSubcommands = {}
 
 local TEX_CHAT_GRADIENT = "Interface\\AddOns\\YRG\\Textures\\ChatGradientBg"
 
@@ -48,24 +50,24 @@ end
 
 local defaultDB = {
     steamdeck = {
-        disableChatScrollBar = false,
-        hideChatEditBox = false,
-        autoFadeChatTabs = false,
-        gradientChatBackground = false,
+        disableChatScrollBar = true,
+        hideChatEditBox = true,
+        autoFadeChatTabs = true,
+        gradientChatBackground = true,
         chatGradientMainOnly = true,
-        chatGradientWidthPct = 100,
-        chatGradientHeightPct = 100,
-        chatGradientOpacityPct = 45,
-        fadeChatTopText = false,
-        chatTextTopFadePct = 35,
-        fadeChatOnInactivity = false,
+        chatGradientWidthPct = 135,
+        chatGradientHeightPct = 135,
+        chatGradientOpacityPct = 65,
+        fadeChatTopText = true,
+        chatTextTopFadePct = 45,
+        fadeChatOnInactivity = true,
         chatInactivityIncludeFloating = true,
         chatInactivityMinutes = 5,
-        quickLoot = false,
+        quickLoot = true,
         quickLootDelay = 0.3,
-        maxCameraZoom = false,
-        fasterMovieSkip = false,
-        showFlightTimes = false,
+        maxCameraZoom = true,
+        fasterMovieSkip = true,
+        showFlightTimes = true,
         flightBarPos = { point = "TOP", relPoint = "TOP", x = 0, y = -66 },
         _origChatX = nil,
         _origChatY = nil,
@@ -158,6 +160,12 @@ end
 function YRG:RegisterExtraCategory(id, category)
     if id and category then
         self.extraCategories[id] = category
+    end
+end
+
+function YRG:RegisterSlashSubcommand(cmd, handler)
+    if type(cmd) == "string" and cmd ~= "" and type(handler) == "function" then
+        self.slashSubcommands[cmd:lower()] = handler
     end
 end
 
@@ -636,7 +644,7 @@ local function HookFontStringAlpha(region, cf)
                 return
             end
             local sdb = YRG:GetSteamdeckDB()
-            local fadePct = (sdb and tonumber(sdb.chatTextTopFadePct)) or 35
+            local fadePct = (sdb and tonumber(sdb.chatTextTopFadePct)) or 45
             local topFade = ComputeLineTopFade(self, targetCF, fadePct)
             if topFade < 0.999 then
                 local target = blizzAlpha * topFade
@@ -658,7 +666,7 @@ local function ApplyChatTopTextFade(cf, index)
     local shouldFade = ShouldApplyTopTextFade(cf, index)
     if not shouldFade and not chatFrameMeta[cf] then return end
     local sdb = YRG:GetSteamdeckDB()
-    local fadePct = (sdb and tonumber(sdb.chatTextTopFadePct)) or 35
+    local fadePct = (sdb and tonumber(sdb.chatTextTopFadePct)) or 45
     local shown = (type(cf.IsShown) == "function") and cf:IsShown()
 
     for _, region in ipairs({ cf.FontStringContainer:GetRegions() }) do
@@ -798,9 +806,9 @@ local function UpdateChatFrameGradientBg(cf, index)
             meta.gradBg = grad
         end
 
-        local widthPct = (sdb and tonumber(sdb.chatGradientWidthPct)) or 100
-        local heightPct = (sdb and tonumber(sdb.chatGradientHeightPct)) or 100
-        local opacityPct = (sdb and tonumber(sdb.chatGradientOpacityPct)) or 45
+        local widthPct = (sdb and tonumber(sdb.chatGradientWidthPct)) or 135
+        local heightPct = (sdb and tonumber(sdb.chatGradientHeightPct)) or 135
+        local opacityPct = (sdb and tonumber(sdb.chatGradientOpacityPct)) or 65
         local baseAlpha = math.max(0, math.min(1, opacityPct / 100.0))
 
         local baseW = math.max((cf:GetWidth() or 320) + 8, 40)
@@ -886,7 +894,7 @@ end
 local function SetChatWindowsContentAlpha(alpha)
     currentChatFadeAlpha = alpha
     local sdb = YRG:GetSteamdeckDB()
-    local opacityPct = (sdb and tonumber(sdb.chatGradientOpacityPct)) or 45
+    local opacityPct = (sdb and tonumber(sdb.chatGradientOpacityPct)) or 65
     local baseAlpha = math.max(0, math.min(1, opacityPct / 100.0))
     local includeFloating = not sdb or (sdb.chatInactivityIncludeFloating ~= false)
 
@@ -2835,18 +2843,26 @@ local function BuildSettingsPanels()
     local sdb = YRG:GetSteamdeckDB()
 
     -- =========================================================================
+    -- BASE ADDON INFO
+    -- =========================================================================
+    mainCtx:AddHeader(
+        "|cffffd100Author:|r " .. YRG.author,
+        "|cffffd100YRG|r - YulRun Gaming Master Addon\nVersion: " .. YRG.version .. "\nAuthor: " .. YRG.author
+    )
+
+    -- =========================================================================
     -- BASE ADDON SETTINGS: Steamdeck & Compact Chat Improvements
     -- =========================================================================
     mainCtx:AddHeader(
         "Steamdeck & Compact Chat Improvements",
-        "Version " .. YRG.version .. " — Chat scrollbar, editbox, auto-fade, and gradient styling tuned for Steamdeck and compact UIs."
+        "Version " .. YRG.version .. " — Author: " .. YRG.author .. "\n\nChat scrollbar, editbox, auto-fade, and gradient styling tuned for Steamdeck and compact UIs."
     )
 
     mainCtx:AddCheckbox({
         key = "disableChatScrollBar",
         name = "Disable Chat Window Scroll Bar (Snap Left)",
         tooltip = "Permanently hides the chat scroll bar and side button strip so they never pop up, and snaps the chat frame closer to the left edge.",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().disableChatScrollBar end,
         set = function(val)
             YRG:GetSteamdeckDB().disableChatScrollBar = val
@@ -2858,7 +2874,7 @@ local function BuildSettingsPanels()
         key = "hideChatEditBox",
         name = "Auto-Hide Chat Input Box (Overlap & Snap to Bottom)",
         tooltip = "Moves the chat input box up to overlap the bottom of the chat frame and hides it until you press Enter to type, allowing the chat frame to snap down.",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().hideChatEditBox end,
         set = function(val)
             YRG:GetSteamdeckDB().hideChatEditBox = val
@@ -2870,7 +2886,7 @@ local function BuildSettingsPanels()
         key = "autoFadeChatTabs",
         name = "Auto-Fade Chat Tabs & Scroll Bar (Show Only on Hover)",
         tooltip = "Fades out chat tabs and the scroll bar when idle, only showing them when hovering over the chat box or tab bar.",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().autoFadeChatTabs end,
         set = function(val)
             YRG:GetSteamdeckDB().autoFadeChatTabs = val
@@ -2888,7 +2904,7 @@ local function BuildSettingsPanels()
         key = "gradientChatBackground",
         name = "Replace Chat Background with Forever-Tinted Gradient",
         tooltip = "Replaces the default chat background with a doubled-up warm dark-brown/black half-radial gradient that fades smoothly toward the top and right.",
-        defaultValue = false,
+        defaultValue = true,
         notifies = gradientVars,
         get = function() return YRG:GetSteamdeckDB().gradientChatBackground end,
         set = function(val)
@@ -2926,10 +2942,10 @@ local function BuildSettingsPanels()
         key = "chatGradientWidthPct",
         name = "Gradient Width (%)",
         tooltip = "Horizontal stretch percentage of the chat half-radial gradient background.",
-        min = 50, max = 200, step = 5, defaultValue = 100,
+        min = 50, max = 200, step = 5, defaultValue = 135,
         format = function(v) return string.format("%d%%", v) end,
         canModify = IsGradientEnabled,
-        get = function() return YRG:GetSteamdeckDB().chatGradientWidthPct or 100 end,
+        get = function() return YRG:GetSteamdeckDB().chatGradientWidthPct or 135 end,
         set = function(val)
             YRG:GetSteamdeckDB().chatGradientWidthPct = val
             YRG:ApplySteamdeckSettings()
@@ -2940,10 +2956,10 @@ local function BuildSettingsPanels()
         key = "chatGradientHeightPct",
         name = "Gradient Height (%)",
         tooltip = "Vertical stretch percentage of the chat half-radial gradient background.",
-        min = 25, max = 200, step = 5, defaultValue = 100,
+        min = 25, max = 200, step = 5, defaultValue = 135,
         format = function(v) return string.format("%d%%", v) end,
         canModify = IsGradientEnabled,
-        get = function() return YRG:GetSteamdeckDB().chatGradientHeightPct or 100 end,
+        get = function() return YRG:GetSteamdeckDB().chatGradientHeightPct or 135 end,
         set = function(val)
             YRG:GetSteamdeckDB().chatGradientHeightPct = val
             YRG:ApplySteamdeckSettings()
@@ -2954,10 +2970,10 @@ local function BuildSettingsPanels()
         key = "chatGradientOpacityPct",
         name = "Gradient Opacity (%)",
         tooltip = "Opacity percentage of the half-radial chat background gradient.",
-        min = 5, max = 100, step = 5, defaultValue = 45,
+        min = 5, max = 100, step = 5, defaultValue = 65,
         format = function(v) return string.format("%d%%", v) end,
         canModify = IsGradientEnabled,
-        get = function() return YRG:GetSteamdeckDB().chatGradientOpacityPct or 45 end,
+        get = function() return YRG:GetSteamdeckDB().chatGradientOpacityPct or 65 end,
         set = function(val)
             YRG:GetSteamdeckDB().chatGradientOpacityPct = val
             YRG:ApplySteamdeckSettings()
@@ -2968,7 +2984,7 @@ local function BuildSettingsPanels()
         key = "fadeChatTopText",
         name = "Fade Chat Text Near Top Edge",
         tooltip = "Softly fades chat lines as they scroll into the top portion of the chat window to blend cleanly with the gradient background.",
-        defaultValue = false,
+        defaultValue = true,
         notifies = { "YRG_Main_chatTextTopFadePct", "YRG_Main_chatGradientMainOnly" },
         get = function() return YRG:GetSteamdeckDB().fadeChatTopText and true or false end,
         set = function(val)
@@ -2981,10 +2997,10 @@ local function BuildSettingsPanels()
         key = "chatTextTopFadePct",
         name = "Top Text Fade Amount (%)",
         tooltip = "Percentage of the chat window height from the top edge over which chat text fades out.",
-        min = 10, max = 75, step = 5, defaultValue = 35,
+        min = 10, max = 75, step = 5, defaultValue = 45,
         format = function(v) return string.format("%d%%", v) end,
         canModify = IsTopTextFadeEnabled,
-        get = function() return YRG:GetSteamdeckDB().chatTextTopFadePct or 35 end,
+        get = function() return YRG:GetSteamdeckDB().chatTextTopFadePct or 45 end,
         set = function(val)
             YRG:GetSteamdeckDB().chatTextTopFadePct = val
             YRG:ApplySteamdeckSettings()
@@ -2995,7 +3011,7 @@ local function BuildSettingsPanels()
         key = "fadeChatOnInactivity",
         name = "Fade Chat Window When No New Messages",
         tooltip = "Automatically fades out the chat window when no new chat messages have been received for the configured number of minutes.",
-        defaultValue = false,
+        defaultValue = true,
         notifies = { "YRG_Main_chatInactivityIncludeFloating", "YRG_Main_chatInactivityMinutes" },
         get = function() return YRG:GetSteamdeckDB().fadeChatOnInactivity end,
         set = function(val)
@@ -3045,7 +3061,7 @@ local function BuildSettingsPanels()
         key = "quickLoot",
         name = "Quick Loot (Faster Auto Loot)",
         tooltip = "Accelerates looting all items immediately on LOOT_READY when Auto Loot is active (hold your Auto Loot modifier key to loot manually). Modeled after Leatrix Plus.",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().quickLoot end,
         set = function(val)
             YRG:GetSteamdeckDB().quickLoot = val
@@ -3057,7 +3073,7 @@ local function BuildSettingsPanels()
         key = "maxCameraZoom",
         name = "Max Camera Zoom",
         tooltip = "Increases maximum camera zoom distance factor from 1.9 to 2.6 (modeled after Leatrix Plus).",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().maxCameraZoom end,
         set = function(val)
             YRG:GetSteamdeckDB().maxCameraZoom = val
@@ -3069,7 +3085,7 @@ local function BuildSettingsPanels()
         key = "fasterMovieSkip",
         name = "Faster Movie Skip",
         tooltip = "Allows Space, Escape, or Enter to cancel in-game cinematics and movies without confirmation prompts (modeled after Leatrix Plus).",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().fasterMovieSkip end,
         set = function(val)
             YRG:GetSteamdeckDB().fasterMovieSkip = val
@@ -3081,7 +3097,7 @@ local function BuildSettingsPanels()
         key = "showFlightTimes",
         name = "Show Flight Times",
         tooltip = "Displays estimated flight durations in taxi map tooltips and shows a draggable flight countdown progress bar while flying (modeled after Leatrix Plus).",
-        defaultValue = false,
+        defaultValue = true,
         get = function() return YRG:GetSteamdeckDB().showFlightTimes end,
         set = function(val)
             YRG:GetSteamdeckDB().showFlightTimes = val
@@ -3226,6 +3242,15 @@ loader:SetScript("OnEvent", function(self, event, arg1)
 end)
 
 SLASH_YRG1 = "/yrg"
-SlashCmdList["YRG"] = function()
+SlashCmdList["YRG"] = function(msg)
+    local clean = (type(msg) == "string") and msg:gsub("^%s+", ""):gsub("%s+$", "") or ""
+    if clean ~= "" then
+        local cmd, rest = clean:match("^(%S+)%s*(.*)$")
+        local handler = cmd and YRG.slashSubcommands and YRG.slashSubcommands[cmd:lower()]
+        if handler then
+            handler(rest or "")
+            return
+        end
+    end
     YRG:OpenSettings()
 end

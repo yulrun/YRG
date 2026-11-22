@@ -13,8 +13,8 @@ local MASK_CIRCLE = "Interface\\CharacterFrame\\TempPortraitAlphaMask"
 local TEX_FALLBACK_RING = "Interface\\Minimap\\MiniMap-TrackingBorder"
 
 local ROW1_LEFT_OPTIONS = {
-    { value = "coords", label = "Coordinates (Default)" },
-    { value = "gold",   label = "Current Gold" },
+    { value = "gold",   label = "Current Gold (Default)" },
+    { value = "coords", label = "Coordinates" },
     { value = "none",   label = "None (Hidden)" },
 }
 
@@ -29,14 +29,14 @@ local PLACARD_ANCHOR_OPTIONS = {
 }
 
 local function GetRow1LeftMode(db)
-    if not db then return "coords" end
+    if not db then return "gold" end
     if db.row1LeftMode == "coords" or db.row1LeftMode == "gold" or db.row1LeftMode == "none" then
         return db.row1LeftMode
     end
     if db.showCoordinates == false then
         return "none"
     end
-    return "coords"
+    return "gold"
 end
 
 local function FormatPlacardMoneyText(copper, iconSz)
@@ -64,27 +64,30 @@ local InfoPlacard = {
         enabled = true,
         placardLocation = "BOTTOM",
         placardAnchorPoint = "ZONE_TITLE",
-        infoPlacardOffsetY = 0,
-        infoPlacardWidth = 200,
-        rowDividerOpacityPct = 60,
-        rowExtraPadding = 4,
-        row1LeftMode = "coords",
+        infoPlacardOffsetY = -1,
+        infoPlacardWidth = 254,
+        rowDividerOpacityPct = 15,
+        rowExtraPadding = 6,
+        row1LeftMode = "gold",
         showBagSlots = true,
         showArrowsRemaining = true,
         showSoulShards = true,
         showFarmingRow = true,
-        bagWarnThreshold = 3,
+        bagWarnThreshold = 5,
         ammoWarnThreshold = 200,
         ammoWarnThresholdMelee = 25,
-        bagRaidWarnings = false,
-        cellPadding = 10,
-        row1TextSize = 12,
-        row2TextSize = 12,
+        bagRaidWarnings = true,
+        cellPadding = 9,
+        row1TextSize = 13,
+        row2TextSize = 14,
     }
 }
 
 local sessionKillsData = {}
-local sessionStartTime = 0
+local windowStartTime = nil
+local activeCombatStart = nil
+local lastCombatEnd = nil
+local inCombatState = false
 
 local function GetMinimapUI()
     YRG.MinimapUI = YRG.MinimapUI or {}
@@ -127,15 +130,56 @@ end
 -- =========================================================================
 -- MOB KILL PACE & TIME-TO-LEVEL TRACKING (Excludes Quests & Exploration)
 -- =========================================================================
+local COMBAT_XP_KILL_WINDOW_MAX_SIZE = 10
+local COMBAT_XP_MAX_OUT_OF_COMBAT_GAP = 120 -- >2m out-of-combat gap starts a fresh grind window
+local COMBAT_XP_IDLE_RESET_SEC = 300        -- >5m with no kills clears pace display
+
 local function BuildCombatXPPattern(fmt)
     if type(fmt) ~= "string" or fmt == "" then return nil end
-    local p = fmt
-    p = p:gsub("%%[0-9$]*s", "\1S\1")
-    p = p:gsub("%%[0-9$]*d", "\1D\1")
-    p = p:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-    p = p:gsub("\1S\1", ".+")
-    p = p:gsub("\1D\1", "(%%d+)")
-    return p
+    local out, order = {}, {}
+    local i = 1
+    while i <= #fmt do
+        local c = fmt:sub(i, i)
+        if c == "%" then
+            local pos, conv = fmt:match("^%%(%d+)%$([sd])", i)
+            local skip
+            if conv then
+                skip = #tostring(pos) + 3
+            else
+                conv = fmt:match("^%%([sd])", i)
+                skip = 2
+            end
+            if conv then
+                local argIdx = tonumber(pos) or (#order + 1)
+                table.insert(order, { argIdx = argIdx, conv = conv })
+                table.insert(out, conv == "d" and "([%d%.,]+)" or "(.-)")
+                i = i + skip
+            elseif fmt:sub(i + 1, i + 1) == "%" then
+                table.insert(out, "%%")
+                i = i + 2
+            else
+                table.insert(out, "%%")
+                i = i + 1
+            end
+        elseif c:find("[%(%)%.%%%+%-%*%?%[%]%^%$]") then
+            table.insert(out, "%" .. c)
+            i = i + 1
+        else
+            table.insert(out, c)
+            i = i + 1
+        end
+    end
+
+    local dCapIdx = nil
+    for k, meta in ipairs(order) do
+        if meta.conv == "d" then
+            if dCapIdx == nil or meta.argIdx < (order[dCapIdx] and order[dCapIdx].argIdx or 999) then
+                dCapIdx = k
+            end
+        end
+    end
+    if not dCapIdx then return nil end
+    return { pattern = "^" .. table.concat(out), dCaptureIndex = dCapIdx }
 end
 
 local combatXPPatterns = nil
@@ -145,9 +189,9 @@ local function GetCombatXPPatterns()
         return combatXPPatterns
     end
     combatXPPatterns = {}
+    -- Match ONLY creature-kill XP messages (with dying unit name), never UNNAMED quest/exploration XP
     for _, globalKey in ipairs({
         "COMBATLOG_XPGAIN_FIRSTPERSON",
-        "COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED",
         "COMBATLOG_XPGAIN_EXHAUSTION1",
         "COMBATLOG_XPGAIN_EXHAUSTION2",
         "COMBATLOG_XPGAIN_EXHAUSTION4",
@@ -160,48 +204,109 @@ local function GetCombatXPPatterns()
             table.insert(combatXPPatterns, pat)
         end
     end
-    table.insert(combatXPPatterns, "gain%s+(%d+)%s+experience")
+    table.insert(combatXPPatterns, {
+        pattern = "^.-%s+dies,?%s+you%s+gain%s+([%d%.,]+)%s+experience",
+        dCaptureIndex = 1,
+    })
     return combatXPPatterns
 end
 
 local function ParseCombatKillXP(rawMsg)
     local msg = YRG.SafeString(rawMsg, nil)
     if not msg or msg == "" then return nil end
-    for _, pat in ipairs(GetCombatXPPatterns()) do
-        local numStr = msg:match(pat)
-        local xp = tonumber(numStr)
-        if xp and xp > 0 then
-            return xp
+    for _, spec in ipairs(GetCombatXPPatterns()) do
+        local caps = { msg:match(spec.pattern) }
+        if #caps > 0 then
+            local rawNum = caps[spec.dCaptureIndex]
+            if type(rawNum) == "string" then
+                local digits = rawNum:gsub("[^%d]", "")
+                local xp = tonumber(digits)
+                if xp and xp > 0 then
+                    return xp
+                end
+            end
         end
+    end
+    return nil
+end
+
+local function GetEffectivePullStart(now)
+    if inCombatState and activeCombatStart and activeCombatStart <= now then
+        return activeCombatStart
+    end
+    if lastCombatEnd and (now - lastCombatEnd) <= 2.0 and activeCombatStart and activeCombatStart <= now then
+        return activeCombatStart
     end
     return nil
 end
 
 local function RecordMobKillXP(xp, now)
     if type(xp) ~= "number" or xp <= 0 then return end
+    local pullStart = GetEffectivePullStart(now)
     local lastEntry = sessionKillsData[#sessionKillsData]
-    if type(lastEntry) == "table" and (now - lastEntry.t) > 300 then
-        sessionKillsData = {}
+
+    if type(lastEntry) == "table" then
+        local idleSinceKill = now - lastEntry.t
+        local outOfCombatRef = (pullStart and pullStart > lastEntry.t) and pullStart or now
+        local gapBetweenPulls = outOfCombatRef - lastEntry.t
+        if idleSinceKill > COMBAT_XP_IDLE_RESET_SEC or gapBetweenPulls > COMBAT_XP_MAX_OUT_OF_COMBAT_GAP then
+            sessionKillsData = {}
+            windowStartTime = nil
+            lastEntry = nil
+        end
     end
-    table.insert(sessionKillsData, { xp = xp, t = now })
-    if #sessionKillsData > 10 then
-        table.remove(sessionKillsData, 1)
+
+    if #sessionKillsData == 0 then
+        -- First kill in window: anchor window start cleanly at combat pull start when available
+        windowStartTime = pullStart
+    end
+
+    table.insert(sessionKillsData, {
+        xp = xp,
+        t = now,
+        pullStart = pullStart,
+    })
+
+    if #sessionKillsData > COMBAT_XP_KILL_WINDOW_MAX_SIZE then
+        local removed = table.remove(sessionKillsData, 1)
+        local newFirst = sessionKillsData[1]
+        if type(removed) == "table" and type(newFirst) == "table" then
+            if newFirst.pullStart and removed.pullStart and math.abs(newFirst.pullStart - removed.pullStart) < 0.05 then
+                -- Same AoE/multi-mob pull still occupies the front of the window: advance linearly across its shared span
+                local baseStart = windowStartTime or newFirst.pullStart
+                local sharedLastT = removed.t
+                local remInPull = 1
+                for _, e in ipairs(sessionKillsData) do
+                    if type(e) == "table" and e.pullStart and math.abs(e.pullStart - newFirst.pullStart) < 0.05 then
+                        remInPull = remInPull + 1
+                        if e.t > sharedLastT then
+                            sharedLastT = e.t
+                        end
+                    else
+                        break
+                    end
+                end
+                windowStartTime = baseStart + (math.max(0, sharedLastT - baseStart) / remInPull)
+            else
+                windowStartTime = removed.t
+            end
+        end
     end
 end
 
-local function MatchesRecentQuestXP(questTurnIn, xp, now, allowZeroQuestXP)
-    if not questTurnIn or (now - questTurnIn.t) > 0.5 then
-        return false
-    end
-    if questTurnIn.xp > 0 then
-        return xp == questTurnIn.xp
-    end
-    return allowZeroQuestXP and true or false
+local function IsQuestXPBlocked(questTurnInUntil, now)
+    return (questTurnInUntil and now <= questTurnInUntil) and true or false
 end
 
 local function GetKillPaceMetrics(remXP)
     local count = #sessionKillsData
     if count == 0 then
+        return nil, nil, nil, nil
+    end
+
+    local now = (type(GetTime) == "function") and GetTime() or 0
+    local lastEntry = sessionKillsData[count]
+    if type(lastEntry) == "table" and now > 0 and (now - lastEntry.t) > COMBAT_XP_IDLE_RESET_SEC then
         return nil, nil, nil, nil
     end
 
@@ -222,32 +327,17 @@ local function GetKillPaceMetrics(remXP)
     local estKills = math.ceil(math.max(remXP, 0) / avgXP)
 
     local avgInterval = nil
-    if count >= 2 and type(sessionKillsData[1]) == "table" and type(sessionKillsData[count]) == "table" then
-        local totalDt = 0
-        local dtCount = 0
-        for i = 2, count do
-            local prevEntry = sessionKillsData[i - 1]
-            local curEntry = sessionKillsData[i]
-            if type(prevEntry) == "table" and type(curEntry) == "table" then
-                local dt = curEntry.t - prevEntry.t
-                if dt >= 0 and dt <= 300 then
-                    totalDt = totalDt + dt
-                    dtCount = dtCount + 1
-                end
+    if type(lastEntry) == "table" then
+        if windowStartTime and lastEntry.t > windowStartTime then
+            local totalDuration = lastEntry.t - windowStartTime
+            if totalDuration >= 0.5 then
+                avgInterval = totalDuration / count
             end
-        end
-        if dtCount > 0 and totalDt > 0 then
-            avgInterval = totalDt / dtCount
-        else
-            local span = sessionKillsData[count].t - sessionKillsData[1].t
-            if span > 0 then
+        elseif count >= 2 and type(sessionKillsData[1]) == "table" then
+            local span = lastEntry.t - sessionKillsData[1].t
+            if span >= 0.5 then
                 avgInterval = span / (count - 1)
             end
-        end
-    elseif count == 1 and type(sessionKillsData[1]) == "table" and sessionStartTime > 0 then
-        local elapsed = sessionKillsData[1].t - sessionStartTime
-        if elapsed > 0 and elapsed <= 300 then
-            avgInterval = elapsed
         end
     end
 
@@ -692,14 +782,17 @@ function InfoPlacard:SyncXPBaseline(clearPending)
     self.lastMaxXP = math.max(YRG.SafeNumber(UnitXPMax("player"), 1), 1)
     if clearPending then
         self._pendingXPUpdate = nil
-        self._pendingUnparsedCombatAt = nil
-        self._lastQuestTurnIn = nil
+        self._pendingSecretCombatAt = nil
+        self._questTurnInUntil = nil
     end
 end
 
 function InfoPlacard:ResetSessionTrackers()
     sessionKillsData = {}
-    sessionStartTime = GetTime()
+    windowStartTime = nil
+    lastCombatEnd = nil
+    inCombatState = (type(InCombatLockdown) == "function" and InCombatLockdown()) and true or false
+    activeCombatStart = inCombatState and GetTime() or nil
     self:SyncXPBaseline(true)
     self:UpdateInfo()
     if DEFAULT_CHAT_FRAME then
@@ -727,8 +820,13 @@ function InfoPlacard:EnsureFrames()
     local mui = GetMinimapUI()
     local parent = Minimap or UIParent
     local infoFrame = CreateFrame("Frame", "YRGMinimapInfoPlacard", parent, "BackdropTemplate")
-    infoFrame:SetFrameStrata((parent.GetFrameStrata and parent:GetFrameStrata()) or "MEDIUM")
-    infoFrame:SetFrameLevel(((parent.GetFrameLevel and parent:GetFrameLevel()) or 1) + 9)
+    local bestStrata = (parent.GetFrameStrata and parent:GetFrameStrata()) or "MEDIUM"
+    local baseLvl = (parent.GetFrameLevel and parent:GetFrameLevel()) or 1
+    if type(mui.GetMinimapOverlayBaseLayer) == "function" then
+        bestStrata, baseLvl = mui.GetMinimapOverlayBaseLayer()
+    end
+    infoFrame:SetFrameStrata(bestStrata)
+    infoFrame:SetFrameLevel(baseLvl + 6)
     infoFrame:EnableMouse(true)
     infoFrame:SetScript("OnEnter", ShowInfoTooltip)
     infoFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -769,13 +867,13 @@ function InfoPlacard:LayoutPlacard()
         mui.ApplyHeaderNineSliceStyle(self.infoFrame)
     end
 
-    local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 12)
-    local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 12)
-    local pad = db.cellPadding or 10
-    local userOffsetY = YRG.SafeNumber(db.infoPlacardOffsetY, 0)
-    local fixedWidth = YRG.SafeNumber(db.infoPlacardWidth, 200)
-    local dividerAlpha = math.max(0, math.min(1, (YRG.SafeNumber(db.rowDividerOpacityPct, 60)) / 100.0))
-    local extraRowPad = math.max(0, YRG.SafeNumber(db.rowExtraPadding, 4))
+    local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 13)
+    local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 14)
+    local pad = db.cellPadding or 9
+    local userOffsetY = YRG.SafeNumber(db.infoPlacardOffsetY, -1)
+    local fixedWidth = YRG.SafeNumber(db.infoPlacardWidth, 254)
+    local dividerAlpha = math.max(0, math.min(1, (YRG.SafeNumber(db.rowDividerOpacityPct, 15)) / 100.0))
+    local extraRowPad = math.max(0, YRG.SafeNumber(db.rowExtraPadding, 6))
 
     local rowBadges = {
         { self.coordBadge, row1TSize },
@@ -955,8 +1053,8 @@ function InfoPlacard:UpdateInfo()
     local maxXP = math.max(YRG.SafeNumber(UnitXPMax("player"), 1), 1)
     local remXP = math.max(maxXP - curXP, 0)
 
-    local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 12)
-    local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 12)
+    local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 13)
+    local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 14)
     local row1IconSz = math.max(10, row1TSize)
 
     if db.showFarmingRow ~= false then
@@ -993,7 +1091,7 @@ function InfoPlacard:UpdateInfo()
     local freeSlots, hasAmmoSource, totalAmmoCount, ammoDisplayIcon, playerClass = GetInventoryAndAmmoStatus()
 
     if db.showBagSlots ~= false and self.bagSlotsBadge then
-        local bagThresh = math.max(0, YRG.SafeNumber(db.bagWarnThreshold, 3))
+        local bagThresh = math.max(0, YRG.SafeNumber(db.bagWarnThreshold, 5))
         local bagState = GetCountWarnState(freeSlots, bagThresh)
         self.bagSlotsBadge:UpdateBadge(tSize, ICON_BAG, tostring(freeSlots), bagState)
         if db.bagRaidWarnings then
@@ -1108,13 +1206,12 @@ function InfoPlacard:OnInitialize(db)
         db.placardAnchorPoint = "ZONE_TITLE"
     end
     if db.row1LeftMode ~= "coords" and db.row1LeftMode ~= "gold" and db.row1LeftMode ~= "none" then
-        db.row1LeftMode = "coords"
+        db.row1LeftMode = "gold"
     end
-    if db.row1TextSize == nil then db.row1TextSize = 12 end
-    if db.row2TextSize == nil then db.row2TextSize = 12 end
+    if db.row1TextSize == nil then db.row1TextSize = 13 end
+    if db.row2TextSize == nil then db.row2TextSize = 14 end
 
     self:EnsureFrames()
-    sessionStartTime = GetTime()
     self.eventFrame = CreateFrame("Frame")
     self.coordTimer = 0
     self:SyncXPBaseline(true)
@@ -1137,32 +1234,39 @@ function InfoPlacard:OnInitialize(db)
     end
 
     self.eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2)
-        if event == "CHAT_MSG_COMBAT_XP_GAIN" then
+        if event == "PLAYER_REGEN_DISABLED" then
+            local now = GetTime()
+            if not inCombatState then
+                inCombatState = true
+                activeCombatStart = now
+            end
+        elseif event == "CHAT_MSG_COMBAT_XP_GAIN" then
             -- Track only creature kill XP from combat XP messages so quest turn-ins and exploration do not skew pace
             local now = GetTime()
-            local parsedXP = ParseCombatKillXP(arg1)
-            if parsedXP and parsedXP > 0 then
-                self._pendingXPUpdate = nil
-                if not MatchesRecentQuestXP(self._lastQuestTurnIn, parsedXP, now, false) then
-                    RecordMobKillXP(parsedXP, now)
-                end
-            elseif self._pendingXPUpdate and (now - self._pendingXPUpdate.t) <= 0.5 then
-                local pendingXP = self._pendingXPUpdate.xp
-                self._pendingXPUpdate = nil
-                if not MatchesRecentQuestXP(self._lastQuestTurnIn, pendingXP, now, true) then
-                    RecordMobKillXP(pendingXP, now)
+            if YRG.IsSecret and YRG.IsSecret(arg1) then
+                if self._pendingXPUpdate and (now - self._pendingXPUpdate.t) <= 0.5 then
+                    local pendingXP = self._pendingXPUpdate.xp
+                    self._pendingXPUpdate = nil
+                    if not IsQuestXPBlocked(self._questTurnInUntil, now) then
+                        RecordMobKillXP(pendingXP, now)
+                    end
+                elseif not IsQuestXPBlocked(self._questTurnInUntil, now) then
+                    self._pendingSecretCombatAt = now
                 end
             else
-                self._pendingUnparsedCombatAt = now
+                local parsedXP = ParseCombatKillXP(arg1)
+                self._pendingXPUpdate = nil
+                self._pendingSecretCombatAt = nil
+                if parsedXP and parsedXP > 0 and not IsQuestXPBlocked(self._questTurnInUntil, now) then
+                    RecordMobKillXP(parsedXP, now)
+                end
             end
             self:UpdateInfo()
         elseif event == "QUEST_TURNED_IN" then
             local now = GetTime()
-            local questXP = YRG.SafeNumber(arg2, 0)
-            self._lastQuestTurnIn = { xp = questXP, t = now }
-            if self._pendingXPUpdate and (now - self._pendingXPUpdate.t) <= 0.5 then
-                self._pendingXPUpdate = nil
-            end
+            self._questTurnInUntil = now + 2.5
+            self._pendingXPUpdate = nil
+            self._pendingSecretCombatAt = nil
             self:SyncXPBaseline(false)
             self:UpdateInfo()
         elseif event == "PLAYER_XP_UPDATE" then
@@ -1179,12 +1283,12 @@ function InfoPlacard:OnInitialize(db)
             end
             self.lastKnownXP = newXP
             self.lastMaxXP = newMaxXP
-            if diff > 0 and not MatchesRecentQuestXP(self._lastQuestTurnIn, diff, now, true) then
-                if self._pendingUnparsedCombatAt and (now - self._pendingUnparsedCombatAt) <= 0.5 then
-                    self._pendingUnparsedCombatAt = nil
+            if diff > 0 and not IsQuestXPBlocked(self._questTurnInUntil, now) then
+                if self._pendingSecretCombatAt and (now - self._pendingSecretCombatAt) <= 0.5 then
+                    self._pendingSecretCombatAt = nil
                     RecordMobKillXP(diff, now)
                 else
-                    -- Stash passively in case CHAT_MSG_COMBAT_XP_GAIN arrives right after with an unparseable/secret string
+                    -- Stash passively in case CHAT_MSG_COMBAT_XP_GAIN arrives right after with a secret payload (instances)
                     self._pendingXPUpdate = { xp = diff, t = now }
                 end
             end
@@ -1194,8 +1298,14 @@ function InfoPlacard:OnInitialize(db)
                 self:UpdateInfo()
             end
         elseif event == "PLAYER_REGEN_ENABLED" then
+            inCombatState = false
+            lastCombatEnd = GetTime()
             self:LayoutPlacard()
         elseif event == "PLAYER_ENTERING_WORLD" then
+            inCombatState = (type(InCombatLockdown) == "function" and InCombatLockdown()) and true or false
+            if inCombatState then
+                activeCombatStart = GetTime()
+            end
             self:SyncXPBaseline(true)
             self:UpdateInfo()
         else
@@ -1206,7 +1316,10 @@ end
 
 function InfoPlacard:OnEnable(db)
     self:EnsureFrames()
-    if sessionStartTime == 0 then sessionStartTime = GetTime() end
+    inCombatState = (type(InCombatLockdown) == "function" and InCombatLockdown()) and true or false
+    if inCombatState and not activeCombatStart then
+        activeCombatStart = GetTime()
+    end
     self:SyncXPBaseline(true)
     self.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     self.eventFrame:RegisterEvent("PLAYER_XP_UPDATE")
@@ -1217,6 +1330,7 @@ function InfoPlacard:OnEnable(db)
     self.eventFrame:RegisterEvent("PLAYER_MONEY")
     self.eventFrame:RegisterEvent("BAG_UPDATE")
     self.eventFrame:RegisterEvent("UNIT_INVENTORY_CHANGED")
+    self.eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
     self.eventFrame:SetScript("OnUpdate", function(frame, elapsed)
@@ -1337,24 +1451,24 @@ function InfoPlacard:BuildConfigUI(ctx, db)
         end,
     })
 
-    AddPlacardSlider("infoPlacardOffsetY", "Vertical Offset from Anchor", "Vertical offset in pixels from the selected Anchor Point to align placard placement.", -30, 30, 1, 0, function(v) return string.format("%d px", v) end)
-    AddPlacardSlider("infoPlacardWidth", "Info Placard Width", "Fixed width in pixels of the Dynamic Info Placard.", 100, 360, 2, 200, function(v) return string.format("%d px", v) end)
-    AddPlacardSlider("cellPadding", "Info Cell Padding", "Inner padding around placard content in pixels.", 2, 20, 1, 10, function(v) return string.format("%d px", v) end)
-    AddPlacardSlider("rowDividerOpacityPct", "Row Divider Line Opacity (%)", "Opacity of the horizontal divider line between Row 1 and Row 2.", 0, 100, 5, 60, function(v) return string.format("%d%%", v) end)
-    AddPlacardSlider("rowExtraPadding", "Row 2 Vertical Padding", "Extra spacing between Row 1 and Row 2 inside the Dynamic Info Placard.", 0, 20, 1, 4, function(v) return string.format("%d px", v) end)
+    AddPlacardSlider("infoPlacardOffsetY", "Vertical Offset from Anchor", "Vertical offset in pixels from the selected Anchor Point to align placard placement.", -30, 30, 1, -1, function(v) return string.format("%d px", v) end)
+    AddPlacardSlider("infoPlacardWidth", "Info Placard Width", "Fixed width in pixels of the Dynamic Info Placard.", 100, 360, 2, 254, function(v) return string.format("%d px", v) end)
+    AddPlacardSlider("cellPadding", "Info Cell Padding", "Inner padding around placard content in pixels.", 2, 20, 1, 9, function(v) return string.format("%d px", v) end)
+    AddPlacardSlider("rowDividerOpacityPct", "Row Divider Line Opacity (%)", "Opacity of the horizontal divider line between Row 1 and Row 2.", 0, 100, 5, 15, function(v) return string.format("%d%%", v) end)
+    AddPlacardSlider("rowExtraPadding", "Row 2 Vertical Padding", "Extra spacing between Row 1 and Row 2 inside the Dynamic Info Placard.", 0, 20, 1, 6, function(v) return string.format("%d px", v) end)
 
     -- =========================================================================
     -- SECTION 2: Row 1 — Trackers & Bags
     -- =========================================================================
     ctx:AddHeader("2. Row 1 — Trackers & Bags")
 
-    AddPlacardSlider("row1TextSize", "Row 1 Font Size", "Font and icon size used for Row 1 (Coordinates/Gold and Bag/Ammo trackers).", 8, 18, 1, 12, function(v) return string.format("%d px", v) end)
+    AddPlacardSlider("row1TextSize", "Row 1 Font Size", "Font and icon size used for Row 1 (Coordinates/Gold and Bag/Ammo trackers).", 8, 18, 1, 13, function(v) return string.format("%d px", v) end)
 
     ctx:AddDropdown({
         key = "row1LeftMode",
         name = "Row 1 Left Display",
-        tooltip = "Choose what appears on the left side of Row 1: Coordinates (default, hides built-in minimap coordinates), Current Gold (with gold/silver/copper icons), or None.",
-        defaultValue = "coords",
+        tooltip = "Choose what appears on the left side of Row 1: Current Gold (default, with gold/silver/copper icons), Coordinates (hides built-in minimap coordinates), or None.",
+        defaultValue = "gold",
         options = ROW1_LEFT_OPTIONS,
         get = function()
             return GetRow1LeftMode(GetDB())
@@ -1362,7 +1476,7 @@ function InfoPlacard:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then
-                mdb.row1LeftMode = (val == "gold" or val == "none") and val or "coords"
+                mdb.row1LeftMode = (val == "coords" or val == "none") and val or "gold"
             end
             self:UpdateInfo()
         end,
@@ -1420,7 +1534,7 @@ function InfoPlacard:BuildConfigUI(ctx, db)
         return (v <= 0) and "Off" or string.format("%d", v)
     end
 
-    AddPlacardSlider("bagWarnThreshold", "Inventory Low Warning Threshold", "Free general bag slots threshold to trigger low-space warning highlight / raid warning (0 = Off).", 0, 20, 1, 3, FormatCountThreshold)
+    AddPlacardSlider("bagWarnThreshold", "Inventory Low Warning Threshold", "Free general bag slots threshold to trigger low-space warning highlight / raid warning (0 = Off).", 0, 20, 1, 5, FormatCountThreshold)
 
     AddPlacardSlider("ammoWarnThreshold", "Ammo Low Warning (Hunter)", "Equipped arrow/bullet count threshold for Hunters to trigger low-ammo warning highlight / raid warning (0 = Off).", 0, 1000, 10, 200, FormatCountThreshold)
 
@@ -1430,7 +1544,7 @@ function InfoPlacard:BuildConfigUI(ctx, db)
         key = "bagRaidWarnings",
         name = "Include Raid Warnings (Inventory & Ammo)",
         tooltip = "Shows a local center-screen Raid Warning once when bag space or ammo drops below the low threshold (orange) or hits 0 remaining (red).",
-        defaultValue = false,
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.bagRaidWarnings) and true or false
@@ -1470,7 +1584,7 @@ function InfoPlacard:BuildConfigUI(ctx, db)
         end,
     })
 
-    AddPlacardSlider("row2TextSize", "Row 2 Font Size", "Font and icon size used for Row 2 (Estimated Time to Level and Mob Kills).", 8, 18, 1, 12, function(v) return string.format("%d px", v) end)
+    AddPlacardSlider("row2TextSize", "Row 2 Font Size", "Font and icon size used for Row 2 (Estimated Time to Level and Mob Kills).", 8, 18, 1, 14, function(v) return string.format("%d px", v) end)
 end
 
 YRG:RegisterModule("DynamicInfoPlacard", InfoPlacard)

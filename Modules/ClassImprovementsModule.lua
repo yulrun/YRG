@@ -24,9 +24,14 @@ local POSITION_OPTIONS = {
     { label = "Right of Health Bar",     value = "RIGHT" },
 }
 
+local DEFAULT_OB_PREP_ELIXIRS = {
+    "Elixir of Minor Defense",
+    "Elixir of Minor Strength",
+}
+
 local ClassImprovements = {
     name = "ClassImprovementsModule",
-    description = "Class UI enhancements including circular nameplate combo points (Rogues/Cat Form), Druid form Mana bar, and OB Prep (One-Button Prep).",
+    description = "Class UI enhancements including circular nameplate combo points (Rogues/Cat Form), Druid form Mana bar, OB Prep (One-Button Prep), and Hunter Pet AutoFeeder.",
     defaultEnabled = true,
     defaults = {
         enabled = true,
@@ -38,19 +43,22 @@ local ClassImprovements = {
         castBarDrop = 6,
         scale = 1.0,
         showDruidManaBar = true,
-        obPrepMainHand = "NONE",
-        obPrepOffHand = "NONE",
-        obPrepUseStones = false,
+        obPrepMainHand = "INSTANT_BEST",
+        obPrepOffHand = "INSTANT_BEST",
+        obPrepUseStones = true,
         obPrepUseWizardOils = false,
-        obPrepWeaponOverbuffMinutes = 0,
+        obPrepWeaponOverbuffMinutes = 5,
         obPrepAutoSelfBuff = true,
-        obPrepBuffOverbuffMinutes = 0,
-        obPrepUseFoodBuff = false,
-        obPrepFoodName = "",
-        obPrepUseElixirs = false,
+        obPrepBuffOverbuffMinutes = 5,
+        obPrepUseFoodBuff = true,
+        obPrepFoodName = "Longjaw Mud Snapper",
+        obPrepUseElixirs = true,
         obPrepElixirList = {},
         obPrepOverrideBuffs = false,
         obPrepOverrideBuffsCSV = "",
+        petFeederEnabled = true,
+        petFeederIgnoreCrafted = true,
+        petFeederBlacklist = {},
     }
 }
 
@@ -592,6 +600,10 @@ end
 local EnsureRoguePrepButtons
 local EnsureRoguePrepMacro
 local HandleReplaceEnchantEvent
+local HandlePrepUIError
+local HandlePrepUnitSpellcast
+local HandlePrepStateInvalidation
+local PetFeeder = {}
 
 function ClassImprovements:OnInitialize(db)
     -- Migrate from previous ComboPoints module key or standalone ForeverComboPlatesDB
@@ -645,18 +657,33 @@ function ClassImprovements:OnInitialize(db)
     if type(db.obPrepElixirList) ~= "table" then
         db.obPrepElixirList = {}
     end
+    if not db._initializedDefaultElixirsV1 then
+        db._initializedDefaultElixirsV1 = true
+        if #db.obPrepElixirList == 0 then
+            for _, itemName in ipairs(DEFAULT_OB_PREP_ELIXIRS) do
+                table.insert(db.obPrepElixirList, itemName)
+            end
+        end
+    end
+
+    if type(db.petFeederBlacklist) ~= "table" then
+        db.petFeederBlacklist = {}
+    end
 
     db.pipSize = math.max(8, math.min(32, math.floor(YRG.SafeNumber(db.pipSize, 18) + 0.5)))
-    db.obPrepWeaponOverbuffMinutes = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db.obPrepWeaponOverbuffMinutes, 0) + 0.5)))
-    db.obPrepBuffOverbuffMinutes = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db.obPrepBuffOverbuffMinutes, 0) + 0.5)))
+    db.obPrepWeaponOverbuffMinutes = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db.obPrepWeaponOverbuffMinutes, 5) + 0.5)))
+    db.obPrepBuffOverbuffMinutes = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db.obPrepBuffOverbuffMinutes, 5) + 0.5)))
 
     self:EnsureFrames()
     if EnsureRoguePrepButtons then
         EnsureRoguePrepButtons()
     end
+    if PetFeeder.EnsureUI then
+        PetFeeder.EnsureUI()
+    end
 
     self.eventFrame = CreateFrame("Frame")
-    self.eventFrame:SetScript("OnEvent", function(_, event, arg1)
+    self.eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
         local modDB = YRG:GetModuleDB("ClassImprovementsModule")
         if not modDB or not modDB.enabled then return end
 
@@ -676,13 +703,44 @@ function ClassImprovements:OnInitialize(db)
             if EnsureRoguePrepMacro then
                 EnsureRoguePrepMacro(false, false)
             end
+            if HandlePrepStateInvalidation then
+                HandlePrepStateInvalidation(event)
+            end
+            if PetFeeder.OnEvent then
+                PetFeeder.OnEvent(event, arg1, arg2, arg3)
+            end
         elseif event == "UPDATE_MACROS" then
             if EnsureRoguePrepMacro then
                 EnsureRoguePrepMacro(false, false)
             end
+            if PetFeeder.OnEvent then
+                PetFeeder.OnEvent(event, arg1, arg2, arg3)
+            end
         elseif event == "REPLACE_ENCHANT" then
             if HandleReplaceEnchantEvent then
                 HandleReplaceEnchantEvent()
+            end
+        elseif event == "UI_ERROR_MESSAGE" then
+            if HandlePrepUIError then
+                HandlePrepUIError(arg1, arg2)
+            end
+            if PetFeeder.OnEvent then
+                PetFeeder.OnEvent(event, arg1, arg2, arg3)
+            end
+        elseif event == "PLAYER_EQUIPMENT_CHANGED" or event == "BAG_UPDATE_DELAYED" or event == "UNIT_INVENTORY_CHANGED" then
+            if event ~= "UNIT_INVENTORY_CHANGED" or arg1 == "player" then
+                if HandlePrepStateInvalidation then
+                    HandlePrepStateInvalidation(event)
+                end
+                if PetFeeder.OnEvent then
+                    PetFeeder.OnEvent(event, arg1, arg2, arg3)
+                end
+            end
+        elseif event == "UNIT_PET" or event == "PET_UI_UPDATE" or event == "UNIT_HAPPINESS"
+            or event == "PLAYER_REGEN_ENABLED" or event == "PLAYER_REGEN_DISABLED"
+            or event == "EDIT_MODE_LAYOUTS_UPDATED" or event == "UNIT_LEVEL" or event == "PLAYER_LEVEL_UP" then
+            if PetFeeder.OnEvent then
+                PetFeeder.OnEvent(event, arg1, arg2, arg3)
             end
         elseif event == "PLAYER_TARGET_CHANGED"
             or event == "NAME_PLATE_UNIT_ADDED"
@@ -695,10 +753,18 @@ function ClassImprovements:OnInitialize(db)
             if event == "UPDATE_SHAPESHIFT_FORM" or arg1 == "player" then
                 self:UpdateTargetNameplate()
                 DeferredRefresh()
+                if event == "UPDATE_SHAPESHIFT_FORM" and HandlePrepStateInvalidation then
+                    HandlePrepStateInvalidation(event)
+                end
             end
         elseif event == "UNIT_AURA" then
-            if arg1 == "player" and playerClass == "DRUID" then
-                self:UpdateTargetNameplate()
+            if arg1 == "player" then
+                if playerClass == "DRUID" then
+                    self:UpdateTargetNameplate()
+                end
+                if HandlePrepStateInvalidation then
+                    HandlePrepStateInvalidation(event)
+                end
             end
         elseif event == "UNIT_POWER_UPDATE" or event == "UNIT_POWER_FREQUENT" or event == "UNIT_COMBO_POINTS" then
             if arg1 == "player" or arg1 == nil then
@@ -717,6 +783,14 @@ function ClassImprovements:OnInitialize(db)
             or event == "UNIT_SPELLCAST_CHANNEL_START"
             or event == "UNIT_SPELLCAST_CHANNEL_UPDATE"
             or event == "UNIT_SPELLCAST_CHANNEL_STOP" then
+            if arg1 == "player" then
+                if HandlePrepUnitSpellcast then
+                    HandlePrepUnitSpellcast(event, arg3)
+                end
+                if PetFeeder.OnEvent then
+                    PetFeeder.OnEvent(event, arg1, arg2, arg3)
+                end
+            end
             local matchesTarget = (arg1 == "target")
             if not matchesTarget and arg1 ~= "player" and type(arg1) == "string" and UnitExists("target") and UnitIsUnit then
                 local okU, same = pcall(UnitIsUnit, arg1, "target")
@@ -751,11 +825,26 @@ function ClassImprovements:OnEnable(db)
     if EnsureRoguePrepButtons then
         EnsureRoguePrepButtons()
     end
+    if PetFeeder.EnsureUI then
+        PetFeeder.EnsureUI()
+    end
     playerClass = select(2, UnitClass("player"))
 
     self.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     self.eventFrame:RegisterEvent("UPDATE_MACROS")
     self.eventFrame:RegisterEvent("REPLACE_ENCHANT")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "UI_ERROR_MESSAGE")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "BAG_UPDATE_DELAYED")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "PLAYER_EQUIPMENT_CHANGED")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "UNIT_INVENTORY_CHANGED")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "UNIT_PET")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "PET_UI_UPDATE")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "UNIT_HAPPINESS")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "PLAYER_REGEN_ENABLED")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "PLAYER_REGEN_DISABLED")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "EDIT_MODE_LAYOUTS_UPDATED")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "UNIT_LEVEL")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "PLAYER_LEVEL_UP")
     self.eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
     self.eventFrame:RegisterEvent("UNIT_POWER_UPDATE")
     self.eventFrame:RegisterEvent("UNIT_POWER_FREQUENT")
@@ -778,6 +867,9 @@ function ClassImprovements:OnEnable(db)
     self:ApplyLayout()
     self:UpdateTargetNameplate()
     self:UpdateDruidManaBar()
+    if PetFeeder.OnEnable then
+        PetFeeder.OnEnable()
+    end
 end
 
 -- ============================================================================
@@ -1052,6 +1144,12 @@ function ClassImprovements:OnDisable(db)
     lastAnchorTarget = nil
     lastAnchorExtraDrop = 0
     lastAnchorSource = "None"
+    if HandlePrepStateInvalidation then
+        HandlePrepStateInvalidation("DISABLE")
+    end
+    if PetFeeder.OnDisable then
+        PetFeeder.OnDisable()
+    end
     if self.eventFrame then
         self.eventFrame:UnregisterAllEvents()
     end
@@ -1185,37 +1283,103 @@ do
     SHARP_SUBCLASSES[(ws and ws.Polearm) or 6] = true
     SHARP_SUBCLASSES[(ws and ws.Sword1H) or 7] = true
     SHARP_SUBCLASSES[(ws and ws.Sword2H) or 8] = true
-    SHARP_SUBCLASSES[(ws and ws.Unarmed) or 13] = true
     SHARP_SUBCLASSES[(ws and ws.Dagger) or 15] = true
     BLUNT_SUBCLASSES[(ws and ws.Mace1H) or 4] = true
     BLUNT_SUBCLASSES[(ws and ws.Mace2H) or 5] = true
     BLUNT_SUBCLASSES[(ws and ws.Staff) or 10] = true
+    BLUNT_SUBCLASSES[(ws and ws.Unarmed) or 13] = true
 end
 
 local CONSUMABLE_AURA_ALIASES = {
+    ["elixir of minor fortitude"] = { "health", "elixir of minor fortitude" },
     ["elixir of fortitude"] = { "health ii", "elixir of fortitude" },
-    ["elixir of superior defense"] = { "greater armor", "elixir of superior defense" },
-    ["elixir of greater defense"] = { "armor", "greater armor", "elixir of greater defense" },
+    ["elixir of major fortitude"] = { "elixir of major fortitude" },
+    ["elixir of minor defense"] = { "armor", "elixir of minor defense" },
     ["elixir of defense"] = { "armor", "elixir of defense" },
+    ["elixir of greater defense"] = { "greater armor", "elixir of greater defense" },
+    ["elixir of superior defense"] = { "greater armor", "elixir of superior defense" },
+    ["elixir of major defense"] = { "elixir of major defense" },
     ["elixir of shadow power"] = { "shadow power", "elixir of shadow power" },
+    ["elixir of major shadow power"] = { "elixir of major shadow power" },
     ["elixir of frost power"] = { "frost power", "elixir of frost power" },
-    ["elixir of greater firepower"] = { "greater firepower", "fire power", "elixir of greater firepower" },
+    ["elixir of major frost power"] = { "elixir of major frost power" },
     ["elixir of firepower"] = { "fire power", "elixir of firepower" },
+    ["elixir of greater firepower"] = { "greater firepower", "fire power", "elixir of greater firepower" },
+    ["elixir of major firepower"] = { "elixir of major firepower" },
+    ["arcane elixir"] = { "arcane elixir" },
+    ["greater arcane elixir"] = { "greater arcane elixir" },
+    ["elixir of wisdom"] = { "intellect", "elixir of wisdom" },
     ["elixir of greater intellect"] = { "greater intellect", "elixir of greater intellect" },
-    ["elixir of greater agility"] = { "greater agility", "agility", "elixir of greater agility" },
-    ["elixir of agility"] = { "agility", "elixir of agility" },
-    ["elixir of giants"] = { "strength", "elixir of giants" },
-    ["elixir of ogre's strength"] = { "strength", "elixir of ogre's strength" },
-    ["elixir of lion's strength"] = { "strength", "elixir of lion's strength" },
+    ["elixir of draenic wisdom"] = { "elixir of draenic wisdom" },
     ["elixir of the sages"] = { "elixir of the sages", "sages" },
+    ["elixir of minor agility"] = { "agility", "elixir of minor agility" },
+    ["elixir of lesser agility"] = { "agility", "elixir of lesser agility" },
+    ["elixir of agility"] = { "agility", "elixir of agility" },
+    ["elixir of greater agility"] = { "greater agility", "elixir of greater agility" },
+    ["elixir of the mongoose"] = { "elixir of the mongoose" },
+    ["elixir of major agility"] = { "elixir of major agility" },
+    ["elixir of minor strength"] = { "strength", "elixir of minor strength" },
+    ["elixir of lion's strength"] = { "strength", "elixir of lion's strength" },
+    ["elixir of ogre's strength"] = { "strength", "elixir of ogre's strength" },
+    ["elixir of giants"] = { "strength", "elixir of giants" },
+    ["elixir of major strength"] = { "elixir of major strength" },
     ["mighty troll's blood potion"] = { "regeneration", "mighty troll's blood potion" },
     ["major troll's blood potion"] = { "regeneration", "major troll's blood potion" },
     ["strong troll's blood potion"] = { "regeneration", "strong troll's blood potion" },
     ["weak troll's blood potion"] = { "regeneration", "weak troll's blood potion" },
+    ["mageblood potion"] = { "mageblood potion", "mana regeneration" },
+    ["scroll of protection"] = { "armor", "scroll of protection" },
+    ["scroll of strength"] = { "strength", "scroll of strength" },
+    ["scroll of agility"] = { "agility", "scroll of agility" },
+    ["scroll of intellect"] = { "intellect", "scroll of intellect" },
+    ["scroll of stamina"] = { "stamina", "scroll of stamina" },
+    ["scroll of spirit"] = { "spirit", "scroll of spirit" },
     ["flask of the titans"] = { "flask of the titans", "titans" },
     ["flask of supreme power"] = { "flask of supreme power", "supreme power" },
     ["flask of distilled wisdom"] = { "flask of distilled wisdom", "distilled wisdom" },
     ["flask of chromatic resistance"] = { "flask of chromatic resistance", "chromatic resistance" },
+}
+
+-- Strictly stronger auras that prevent applying a weaker consumable while active (even if <= overbuff min left)
+local CONSUMABLE_STRONGER_AURAS = {
+    ["elixir of minor fortitude"] = { "health ii", "elixir of fortitude", "elixir of major fortitude" },
+    ["elixir of fortitude"] = { "elixir of major fortitude" },
+    ["elixir of minor defense"] = { "greater armor", "elixir of greater defense", "elixir of superior defense", "elixir of major defense" },
+    ["elixir of defense"] = { "greater armor", "elixir of greater defense", "elixir of superior defense", "elixir of major defense" },
+    ["elixir of greater defense"] = { "elixir of superior defense", "elixir of major defense" },
+    ["elixir of superior defense"] = { "elixir of major defense" },
+    ["scroll of protection"] = { "greater armor", "elixir of greater defense", "elixir of superior defense", "elixir of major defense" },
+    ["elixir of firepower"] = { "greater firepower", "elixir of greater firepower", "elixir of major firepower" },
+    ["elixir of greater firepower"] = { "elixir of major firepower" },
+    ["arcane elixir"] = { "greater arcane elixir" },
+    ["elixir of shadow power"] = { "elixir of major shadow power" },
+    ["elixir of frost power"] = { "elixir of major frost power" },
+    ["elixir of wisdom"] = { "greater intellect", "elixir of greater intellect", "elixir of the sages", "elixir of draenic wisdom" },
+    ["elixir of greater intellect"] = { "elixir of draenic wisdom" },
+    ["elixir of minor agility"] = { "greater agility", "elixir of greater agility", "elixir of the mongoose", "elixir of major agility" },
+    ["elixir of lesser agility"] = { "greater agility", "elixir of greater agility", "elixir of the mongoose", "elixir of major agility" },
+    ["elixir of agility"] = { "greater agility", "elixir of greater agility", "elixir of the mongoose", "elixir of major agility" },
+    ["elixir of greater agility"] = { "elixir of the mongoose", "elixir of major agility" },
+    ["elixir of the mongoose"] = { "elixir of major agility" },
+    ["elixir of minor strength"] = { "elixir of ogre's strength", "elixir of giants", "elixir of major strength" },
+    ["elixir of lion's strength"] = { "elixir of ogre's strength", "elixir of giants", "elixir of major strength" },
+    ["elixir of ogre's strength"] = { "elixir of giants", "elixir of major strength" },
+    ["elixir of giants"] = { "elixir of major strength" },
+}
+
+-- Strictly stronger raid/group buff auras that block single-target refreshes while active
+local STRONGER_SPELL_AURAS = {
+    ["mark of the wild"]       = { "gift of the wild" },
+    ["power word: fortitude"]  = { "prayer of fortitude" },
+    ["divine spirit"]          = { "prayer of spirit" },
+    ["shadow protection"]      = { "prayer of shadow protection" },
+    ["arcane intellect"]       = { "arcane brilliance" },
+    ["blessing of might"]      = { "greater blessing of might" },
+    ["blessing of wisdom"]     = { "greater blessing of wisdom" },
+    ["blessing of kings"]      = { "greater blessing of kings" },
+    ["blessing of sanctuary"]  = { "greater blessing of sanctuary" },
+    ["blessing of light"]      = { "greater blessing of light" },
+    ["blessing of salvation"]  = { "greater blessing of salvation" },
 }
 
 local CLASS_BUFF_PRIORITIES = {
@@ -1340,11 +1504,38 @@ local prepConfirmBtn = nil
 local prepScanTooltip = nil
 local prepArmedUntil = 0
 local lastMissingWarnAt = 0
+local lastWarnAtByKey = {}
 local lastStoneOverwriteNoteAt = 0
 local lastStoneAppliedInfo = nil
+local blockedPrepActions = {}
+local pendingPrepAttempt = nil
 local prepDebugMode = false
 local lastPrepTrace = "none"
 local obPrepSummaryUpdaters = {}
+
+local function MakeWeaponActionKey(slot, kind, itemID)
+    return string.format("WEAPON:%d:%s:%d", tonumber(slot) or 0, tostring(kind or ""), tonumber(itemID) or 0)
+end
+
+local function MakeBagItemActionKey(kind, itemID)
+    return string.format("ITEM:%s:%d", tostring(kind or ""), tonumber(itemID) or 0)
+end
+
+local function MakeSpellActionKey(spellName)
+    return "SPELL:" .. tostring(spellName or ""):lower()
+end
+
+local function IsPrepKeyBlocked(actionKey)
+    if not actionKey then return false, nil end
+    local entry = blockedPrepActions[actionKey]
+    if not entry then return false, nil end
+    local now = (type(GetTime) == "function") and GetTime() or 0
+    if entry.expiresAt and now >= entry.expiresAt then
+        blockedPrepActions[actionKey] = nil
+        return false, nil
+    end
+    return true, entry
+end
 
 local function StripColorCodes(text)
     if type(text) ~= "string" then return "" end
@@ -1478,13 +1669,15 @@ local function IsBagItemOnCooldown(bag, slot)
     return false
 end
 
-local function FindPoisonInBags(selectionKey)
+local function FindPoisonInBags(selectionKey, skipFn)
     local desiredFam, targetRank = ParsePoisonSelection(selectionKey)
-    if not desiredFam then return nil end
+    if not desiredFam then return nil, false, nil end
 
     local playerLevel = YRG.SafeNumber(UnitLevel and UnitLevel("player"), 60)
     local maxBag = NUM_BAG_SLOTS or 4
     local best = nil
+    local sawBlocked = false
+    local minLevelBlocked = nil
 
     for bag = 0, maxBag do
         local numSlots = SafeGetContainerNumSlots(bag)
@@ -1503,35 +1696,41 @@ local function FindPoisonInBags(selectionKey)
                     knownName = itemName
                 end
 
-                if fam == desiredFam and rank and itemMinLevel <= playerLevel then
-                    if (not targetRank) or (rank == targetRank) then
-                        if (not best) or (rank > best.rank) then
-                            best = {
-                                bag = bag,
-                                slot = slot,
-                                itemID = itemID,
-                                name = knownName or POISON_FAMILIES[fam].label,
-                                rank = rank,
-                                family = fam,
-                            }
+                if fam == desiredFam and rank and ((not targetRank) or (rank == targetRank)) then
+                    if itemMinLevel > playerLevel then
+                        if not minLevelBlocked or itemMinLevel < minLevelBlocked then
+                            minLevelBlocked = itemMinLevel
                         end
+                    elseif skipFn and skipFn(itemID, knownName) then
+                        sawBlocked = true
+                    elseif (not best) or (rank > best.rank) then
+                        best = {
+                            bag = bag,
+                            slot = slot,
+                            itemID = itemID,
+                            name = knownName or POISON_FAMILIES[fam].label,
+                            rank = rank,
+                            family = fam,
+                        }
                     end
                 end
             end
         end
     end
 
-    return best
+    return best, sawBlocked, minLevelBlocked
 end
 
-local function FindBestStoneInBags(stoneKind)
+local function FindBestStoneInBags(stoneKind, skipFn)
     if stoneKind ~= "SHARP" and stoneKind ~= "BLUNT" then
-        return nil
+        return nil, false, nil
     end
 
     local playerLevel = YRG.SafeNumber(UnitLevel and UnitLevel("player"), 60)
     local maxBag = NUM_BAG_SLOTS or 4
     local best = nil
+    local sawBlocked = false
+    local minLevelBlocked = nil
 
     for bag = 0, maxBag do
         local numSlots = SafeGetContainerNumSlots(bag)
@@ -1559,8 +1758,14 @@ local function FindBestStoneInBags(stoneKind)
                     end
                 end
 
-                if kind == stoneKind and tier and itemMinLevel <= playerLevel then
-                    if (not best) or (tier > best.tier) then
+                if kind == stoneKind and tier then
+                    if itemMinLevel > playerLevel then
+                        if not minLevelBlocked or itemMinLevel < minLevelBlocked then
+                            minLevelBlocked = itemMinLevel
+                        end
+                    elseif skipFn and skipFn(itemID, displayName) then
+                        sawBlocked = true
+                    elseif (not best) or (tier > best.tier) then
                         best = {
                             bag = bag,
                             slot = slot,
@@ -1575,13 +1780,15 @@ local function FindBestStoneInBags(stoneKind)
         end
     end
 
-    return best
+    return best, sawBlocked, minLevelBlocked
 end
 
-local function FindBestOilInBags()
+local function FindBestOilInBags(skipFn)
     local playerLevel = YRG.SafeNumber(UnitLevel and UnitLevel("player"), 60)
     local maxBag = NUM_BAG_SLOTS or 4
     local best = nil
+    local sawBlocked = false
+    local minLevelBlocked = nil
 
     for bag = 0, maxBag do
         local numSlots = SafeGetContainerNumSlots(bag)
@@ -1606,8 +1813,14 @@ local function FindBestOilInBags()
                     end
                 end
 
-                if tier and itemMinLevel <= playerLevel then
-                    if (not best) or (tier > best.tier) then
+                if tier then
+                    if itemMinLevel > playerLevel then
+                        if not minLevelBlocked or itemMinLevel < minLevelBlocked then
+                            minLevelBlocked = itemMinLevel
+                        end
+                    elseif skipFn and skipFn(itemID, displayName) then
+                        sawBlocked = true
+                    elseif (not best) or (tier > best.tier) then
                         best = {
                             bag = bag,
                             slot = slot,
@@ -1622,16 +1835,19 @@ local function FindBestOilInBags()
         end
     end
 
-    return best
+    return best, sawBlocked, minLevelBlocked
 end
 
-local function FindNamedItemInBags(targetName)
+local function FindNamedItemInBags(targetName, skipFn)
     local clean = NormalizePrepItemName(targetName)
-    if not clean then return nil end
+    if not clean then return nil, false, false, nil end
     local wantLow = clean:lower()
     local playerLevel = YRG.SafeNumber(UnitLevel and UnitLevel("player"), 60)
     local maxBag = NUM_BAG_SLOTS or 4
     local partialMatch = nil
+    local sawCooldown = false
+    local sawBlocked = false
+    local minLevelBlocked = nil
 
     for bag = 0, maxBag do
         local numSlots = SafeGetContainerNumSlots(bag)
@@ -1639,31 +1855,43 @@ local function FindNamedItemInBags(targetName)
             local itemID, itemLink = SafeGetContainerItemDetails(bag, slot)
             if itemID then
                 local itemName, _, itemMinLevel = SafeGetItemStatsForPrep(itemID, itemLink)
-                if itemName and itemMinLevel <= playerLevel and not IsBagItemOnCooldown(bag, slot) then
+                if itemName then
                     local low = itemName:lower()
-                    if low == wantLow then
-                        return {
-                            bag = bag,
-                            slot = slot,
-                            itemID = itemID,
-                            link = itemLink,
-                            name = itemName,
-                        }
-                    elseif not partialMatch and low:find(wantLow, 1, true) then
-                        partialMatch = {
-                            bag = bag,
-                            slot = slot,
-                            itemID = itemID,
-                            link = itemLink,
-                            name = itemName,
-                        }
+                    local isExact = (low == wantLow)
+                    local isPartial = (not isExact) and (low:find(wantLow, 1, true) ~= nil)
+                    if isExact or isPartial then
+                        if itemMinLevel > playerLevel then
+                            if not minLevelBlocked or itemMinLevel < minLevelBlocked then
+                                minLevelBlocked = itemMinLevel
+                            end
+                        elseif skipFn and skipFn(itemID, itemName) then
+                            sawBlocked = true
+                        elseif IsBagItemOnCooldown(bag, slot) then
+                            sawCooldown = true
+                        elseif isExact then
+                            return {
+                                bag = bag,
+                                slot = slot,
+                                itemID = itemID,
+                                link = itemLink,
+                                name = itemName,
+                            }, sawCooldown, sawBlocked, minLevelBlocked
+                        elseif not partialMatch then
+                            partialMatch = {
+                                bag = bag,
+                                slot = slot,
+                                itemID = itemID,
+                                link = itemLink,
+                                name = itemName,
+                            }
+                        end
                     end
                 end
             end
         end
     end
 
-    return partialMatch
+    return partialMatch, sawCooldown, sawBlocked, minLevelBlocked
 end
 
 local function GetWeaponSlotKind(invSlot)
@@ -1707,10 +1935,11 @@ local function GetWeaponSlotKind(invSlot)
     end
     local stLow = YRG.SafeString(fullSubType or itemSubType, ""):lower()
     if stLow:find("dagger", 1, true) or stLow:find("sword", 1, true)
-        or stLow:find("axe", 1, true) or stLow:find("polearm", 1, true)
-        or stLow:find("fist", 1, true) then
+        or stLow:find("axe", 1, true) or stLow:find("polearm", 1, true) then
         return true, true, "SHARP"
-    elseif stLow:find("mace", 1, true) or (stLow:find("staff", 1, true) and not stLow:find("fishing", 1, true)) then
+    elseif stLow:find("mace", 1, true)
+        or stLow:find("fist", 1, true)
+        or (stLow:find("staff", 1, true) and not stLow:find("fishing", 1, true)) then
         return true, true, "BLUNT"
     end
 
@@ -1989,6 +2218,12 @@ EnsureRoguePrepButtons = function()
         btn:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -100, 100)
         btn:EnableMouse(false)
         btn:HookScript("PreClick", function(self, btnName, down)
+            if pendingPrepAttempt then
+                local now = (type(GetTime) == "function") and GetTime() or 0
+                pendingPrepAttempt.clicked = true
+                pendingPrepAttempt.clickedAt = now
+                pendingPrepAttempt.expiresAt = now + 1.5
+            end
             lastPrepTrace = lastPrepTrace .. string.format(" | Pre(%s,%s,t=%s,i=%s,s=%s,ts=%s)",
                 tostring(btnName), tostring(down),
                 tostring(self:GetAttribute("type1") or self:GetAttribute("type")),
@@ -2038,7 +2273,7 @@ HandleReplaceEnchantEvent = function()
     end
 end
 
-local function EnsureSingleMacro(macroName, body, forceReset, legacyBodies)
+local function EnsureSingleMacro(macroName, body, forceReset, legacyBodies, icon)
     local idx = GetMacroIndexByName(macroName)
     if idx and idx > 0 then
         local existingBody = (type(GetMacroBody) == "function") and GetMacroBody(idx) or nil
@@ -2047,7 +2282,7 @@ local function EnsureSingleMacro(macroName, body, forceReset, legacyBodies)
         end
         local needsMigration = (existingBody ~= nil and legacyBodies and legacyBodies[existingBody]) and true or false
         if (forceReset or needsMigration) and type(EditMacro) == "function" then
-            EditMacro(idx, macroName, GetOBPrepMacroIcon(), body)
+            EditMacro(idx, macroName, icon or GetOBPrepMacroIcon(), body)
             return true, needsMigration and "migrated" or "reset"
         end
         return true, "exists"
@@ -2106,6 +2341,39 @@ EnsureRoguePrepMacro = function(forceReset, verbose)
     return false, "failed"
 end
 
+local function GetSafeSpellName(spellIDOrName)
+    if not spellIDOrName then return nil end
+    local name
+    if C_Spell and type(C_Spell.GetSpellInfo) == "function" then
+        local okS, sInfo = pcall(C_Spell.GetSpellInfo, spellIDOrName)
+        if okS and type(sInfo) == "table" then name = sInfo.name end
+    elseif type(GetSpellInfo) == "function" then
+        local okS, sName = pcall(GetSpellInfo, spellIDOrName)
+        if okS then name = sName end
+    end
+    return YRG.SafeString(name, nil)
+end
+
+local function GetSafeSpellRankNumber(spellIDOrName, knownSubtext)
+    local subtext = YRG.SafeString(knownSubtext, nil)
+    if not subtext and spellIDOrName then
+        if C_Spell and type(C_Spell.GetSpellSubtext) == "function" then
+            local ok, st = pcall(C_Spell.GetSpellSubtext, spellIDOrName)
+            if ok then subtext = YRG.SafeString(st, nil) end
+        elseif type(GetSpellSubtext) == "function" then
+            local ok, st = pcall(GetSpellSubtext, spellIDOrName)
+            if ok then subtext = YRG.SafeString(st, nil) end
+        end
+    end
+    if subtext then
+        local r = tonumber(subtext:lower():match("rank%s*(%d+)"))
+        if r and r > 0 then
+            return r
+        end
+    end
+    return nil
+end
+
 local function ReadPlayerAuras()
     local auras = {}
     local now = (type(GetTime) == "function") and GetTime() or 0
@@ -2120,6 +2388,7 @@ local function ReadPlayerAuras()
             local spellId = YRG.SafeOptionalNumber(aura.spellId)
             local duration = YRG.SafeNumber(aura.duration, 0)
             local expirationTime = YRG.SafeNumber(aura.expirationTime, 0)
+            local sourceUnit = YRG.SafeString(aura.sourceUnit, nil)
             if name then
                 local minsLeft = (duration > 0 and expirationTime > 0) and math.max(0, (expirationTime - now) / 60) or nil
                 local maxDurMins = (duration > 0) and (duration / 60) or nil
@@ -2127,6 +2396,8 @@ local function ReadPlayerAuras()
                     name = name,
                     lowName = name:lower(),
                     spellId = spellId,
+                    rankNum = GetSafeSpellRankNumber(spellId),
+                    sourceUnit = sourceUnit,
                     minsLeft = minsLeft,
                     maxDurationMins = maxDurMins,
                 }
@@ -2134,12 +2405,13 @@ local function ReadPlayerAuras()
         end
     elseif type(UnitAura) == "function" then
         for i = 1, 60 do
-            local ok, name, _, _, _, duration, expirationTime, _, _, _, spellId = pcall(UnitAura, "player", i, "HELPFUL")
+            local ok, name, _, _, _, duration, expirationTime, sourceUnit, _, _, spellId = pcall(UnitAura, "player", i, "HELPFUL")
             if not ok then break end
             name = YRG.SafeString(name, nil)
             if not name then break end
             duration = YRG.SafeNumber(duration, 0)
             expirationTime = YRG.SafeNumber(expirationTime, 0)
+            sourceUnit = YRG.SafeString(sourceUnit, nil)
             spellId = YRG.SafeOptionalNumber(spellId)
             local minsLeft = (duration > 0 and expirationTime > 0) and math.max(0, (expirationTime - now) / 60) or nil
             local maxDurMins = (duration > 0) and (duration / 60) or nil
@@ -2147,6 +2419,8 @@ local function ReadPlayerAuras()
                 name = name,
                 lowName = name:lower(),
                 spellId = spellId,
+                rankNum = GetSafeSpellRankNumber(spellId),
+                sourceUnit = sourceUnit,
                 minsLeft = minsLeft,
                 maxDurationMins = maxDurMins,
             }
@@ -2162,19 +2436,13 @@ local function ReadPlayerAuras()
             local _, active, _, spellID = GetShapeshiftFormInfo(formIdx)
             spellID = YRG.SafeOptionalNumber(spellID)
             if active and spellID then
-                local spName
-                if C_Spell and type(C_Spell.GetSpellInfo) == "function" then
-                    local okS, sInfo = pcall(C_Spell.GetSpellInfo, spellID)
-                    if okS and type(sInfo) == "table" then spName = sInfo.name end
-                elseif type(GetSpellInfo) == "function" then
-                    spName = GetSpellInfo(spellID)
-                end
-                spName = YRG.SafeString(spName, nil)
+                local spName = GetSafeSpellName(spellID)
                 if spName then
                     auras[#auras + 1] = {
                         name = spName,
                         lowName = spName:lower(),
                         spellId = spellID,
+                        rankNum = GetSafeSpellRankNumber(spellID),
                         minsLeft = nil,
                         maxDurationMins = nil,
                     }
@@ -2184,6 +2452,31 @@ local function ReadPlayerAuras()
     end
 
     return auras
+end
+
+local function HasPlayerDebuff(lowDebuffName)
+    if type(lowDebuffName) ~= "string" or lowDebuffName == "" then return false end
+    if C_UnitAuras and type(C_UnitAuras.GetAuraDataByIndex) == "function" then
+        for i = 1, 40 do
+            local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "player", i, "HARMFUL")
+            if not ok or type(aura) ~= "table" then break end
+            local name = YRG.SafeString(aura.name, nil)
+            if name and name:lower() == lowDebuffName then
+                return true
+            end
+        end
+    elseif type(UnitAura) == "function" then
+        for i = 1, 40 do
+            local ok, name = pcall(UnitAura, "player", i, "HARMFUL")
+            if not ok then break end
+            name = YRG.SafeString(name, nil)
+            if not name then break end
+            if name:lower() == lowDebuffName then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 local function EffectiveOverbuffThreshold(overbuffMinutes, maxDurationMins)
@@ -2206,6 +2499,7 @@ local function IsAuraSatisfied(aura, overbuffMinutes)
 end
 
 local function FindMatchingAuraByNames(namesLowList, auras)
+    if type(namesLowList) ~= "table" then return nil end
     for _, aura in ipairs(auras) do
         for _, targetLow in ipairs(namesLowList) do
             if aura.lowName == targetLow then
@@ -2216,9 +2510,296 @@ local function FindMatchingAuraByNames(namesLowList, auras)
     return nil
 end
 
+local function SnapshotPlayerAuraNames(auras)
+    local snap = {}
+    for _, aura in ipairs(auras) do
+        snap[aura.lowName] = true
+    end
+    return snap
+end
+
+local function GetSlotEnchantLabel(state)
+    if not state or not state.equipped then return "NONE" end
+    if state.activePoison then return "P:" .. tostring(state.activePoison.label) end
+    if state.activeOil then return "O:" .. tostring(state.activeOil.label) end
+    if state.activeStone then return "S:" .. tostring(state.activeStone.label) end
+    if state.activeImbue then return "I:" .. tostring(state.activeImbue.label) end
+    return "NONE"
+end
+
+local function PruneBlockedPrepActions(auras, mhState, ohState)
+    local now = (type(GetTime) == "function") and GetTime() or 0
+    local activeSet = auras and SnapshotPlayerAuraNames(auras) or nil
+
+    for key, entry in pairs(blockedPrepActions) do
+        local remove = false
+        if entry.expiresAt and now >= entry.expiresAt then
+            remove = true
+        elseif entry.blockType == "MORE_POWERFUL" then
+            if activeSet and entry.auraSnap then
+                for auraLow in pairs(entry.auraSnap) do
+                    if not activeSet[auraLow] then
+                        remove = true
+                        break
+                    end
+                end
+            end
+            if not remove and entry.slot then
+                local st = (entry.slot == INV_SLOT_MAINHAND) and mhState or ((entry.slot == INV_SLOT_OFFHAND) and ohState or nil)
+                if st and GetSlotEnchantLabel(st) ~= entry.weaponLabel then
+                    remove = true
+                end
+            end
+        elseif entry.blockType == "UNUSABLE_TARGET" and entry.slot then
+            local curLink = GetInventoryItemLink and GetInventoryItemLink("player", entry.slot) or nil
+            if curLink ~= entry.equipLink then
+                remove = true
+            end
+        end
+
+        if remove then
+            blockedPrepActions[key] = nil
+        end
+    end
+end
+
+local function ClassifyPrepUIError(msg)
+    if type(msg) ~= "string" or msg == "" then return nil, nil, nil end
+    local cleanMsg = (msg:gsub("%.$", ""))
+    local low = msg:lower()
+
+    local auraBounced = YRG.SafeString(_G.SPELL_FAILED_AURA_BOUNCED, nil)
+    local errAuraBounced = YRG.SafeString(_G.ERR_AURA_BOUNCED, nil)
+    if (auraBounced and msg == auraBounced)
+        or (errAuraBounced and msg == errAuraBounced)
+        or low:find("more powerful spell", 1, true)
+        or low:find("more powerful buff", 1, true)
+        or low:find("stronger spell", 1, true)
+        or low:find("stronger buff", 1, true) then
+        return "MORE_POWERFUL", "a more powerful buff is already active", 300
+    end
+
+    -- Transient movement / GCD / mounted errors should not blacklist an action
+    if low:find("while moving", 1, true)
+        or low:find("another action is in progress", 1, true)
+        or low:find("spell is not ready yet", 1, true)
+        or low:find("cannot do that right now", 1, true)
+        or low:find("you are mounted", 1, true)
+        or low:find("can't do that while mounted", 1, true) then
+        return nil, nil, nil
+    end
+
+    if low:find("item is not ready", 1, true) or low:find("not ready yet", 1, true) then
+        return "COOLDOWN", "item is on cooldown", 5
+    end
+
+    if low:find("cannot be enchanted", 1, true)
+        or low:find("can't be enchanted", 1, true)
+        or low:find("too low level", 1, true)
+        or low:find("not high enough level", 1, true)
+        or low:find("item level", 1, true)
+        or low:find("wrong item", 1, true)
+        or low:find("can't use that item", 1, true)
+        or low:find("cannot use that", 1, true)
+        or low:find("invalid target", 1, true) then
+        return "UNUSABLE_TARGET", cleanMsg, 180
+    end
+
+    if low:find("reagent", 1, true) or low:find("requires ", 1, true) then
+        return "MISSING_REAGENT", cleanMsg, 60
+    end
+
+    if low:find("shapeshift", 1, true) or low:find("in beast form", 1, true) then
+        return "SHAPESHIFT", cleanMsg, 30
+    end
+
+    if low:find("not enough mana", 1, true)
+        or low:find("not enough rage", 1, true)
+        or low:find("not enough energy", 1, true) then
+        return "RESOURCES", cleanMsg, 5
+    end
+
+    if low:find("already active", 1, true)
+        or low:find("too full", 1, true)
+        or low:find("already full", 1, true) then
+        return "MORE_POWERFUL", cleanMsg, 120
+    end
+
+    return nil, nil, nil
+end
+
+local function GetPrepActionKey(action)
+    if not action then return nil end
+    if action.actionType == "WEAPON_ITEM" and action.item then
+        return MakeWeaponActionKey(action.slot, action.kind, action.item.itemID)
+    elseif action.actionType == "BAG_ITEM" and action.item then
+        return MakeBagItemActionKey(action.kind, action.item.itemID)
+    elseif action.actionType == "SPELL" and action.spell then
+        return MakeSpellActionKey(action.spell)
+    end
+    return nil
+end
+
+local function GetPrepActionLabel(action)
+    if not action then return "Unknown" end
+    if action.actionType == "WEAPON_ITEM" and action.item then
+        return string.format("%s (%s)", tostring(action.item.name), tostring(action.handLabel))
+    elseif action.actionType == "BAG_ITEM" and action.item then
+        return tostring(action.item.name)
+    elseif action.actionType == "SPELL" and action.spell then
+        return tostring(action.spell)
+    end
+    return "Unknown"
+end
+
+local function DoesSpellIDMatchAttempt(attempt, spellID)
+    if not attempt or not spellID then return false end
+    local idNum = YRG.SafeOptionalNumber(spellID)
+    if not idNum then return false end
+    local spName = GetSafeSpellName(idNum)
+    if attempt.actionType == "SPELL" and attempt.spell then
+        return spName ~= nil and spName:lower() == attempt.spell:lower()
+    elseif attempt.itemID then
+        local itemSpellName, itemSpellID
+        if C_Item and type(C_Item.GetItemSpell) == "function" then
+            itemSpellName, itemSpellID = C_Item.GetItemSpell(attempt.itemID)
+        elseif type(GetItemSpell) == "function" then
+            itemSpellName, itemSpellID = GetItemSpell(attempt.itemID)
+        end
+        itemSpellName = YRG.SafeString(itemSpellName, nil)
+        itemSpellID = YRG.SafeOptionalNumber(itemSpellID)
+        if itemSpellID and itemSpellID == idNum then
+            return true
+        end
+        if itemSpellName and spName and itemSpellName:lower() == spName:lower() then
+            return true
+        end
+    end
+    return false
+end
+
+HandlePrepUIError = function(arg1, arg2)
+    if not pendingPrepAttempt or not pendingPrepAttempt.clicked then return end
+    local now = (type(GetTime) == "function") and GetTime() or 0
+    if now > (pendingPrepAttempt.expiresAt or 0) then
+        pendingPrepAttempt = nil
+        return
+    end
+
+    local errType = (type(arg1) == "number" and not IsSecret(arg1)) and arg1 or nil
+    local rawMsg = (type(arg2) == "string" and arg2) or (type(arg1) == "string" and arg1) or nil
+    local msg = YRG.SafeString(rawMsg, nil)
+    if not msg and errType and type(GetGameMessageInfo) == "function" then
+        local okG, gMsg = pcall(GetGameMessageInfo, errType)
+        if okG then msg = YRG.SafeString(gMsg, nil) end
+    end
+
+    local blockType, reasonText, ttl = ClassifyPrepUIError(msg)
+    if not blockType then
+        return
+    end
+
+    local attempt = pendingPrepAttempt
+    pendingPrepAttempt = nil
+
+    local auras = ReadPlayerAuras()
+    local weaponLabel = nil
+    local equipLink = nil
+    if attempt.slot then
+        weaponLabel = GetSlotEnchantLabel(InspectWeaponEnchantState(attempt.slot))
+        equipLink = GetInventoryItemLink and GetInventoryItemLink("player", attempt.slot) or nil
+    end
+
+    blockedPrepActions[attempt.actionKey] = {
+        label = attempt.label,
+        blockType = blockType,
+        reason = reasonText,
+        expiresAt = now + (ttl or 60),
+        auraSnap = (blockType == "MORE_POWERFUL") and SnapshotPlayerAuraNames(auras) or nil,
+        slot = attempt.slot,
+        equipLink = equipLink,
+        weaponLabel = weaponLabel,
+    }
+    lastPrepTrace = lastPrepTrace .. string.format(" | Blocked(%s:%s)", tostring(attempt.label), tostring(blockType))
+
+    local warnKey = "ERR:" .. tostring(attempt.actionKey) .. ":" .. tostring(blockType)
+    if not lastWarnAtByKey[warnKey] or (now - lastWarnAtByKey[warnKey]) >= 3.0 then
+        lastWarnAtByKey[warnKey] = now
+        print(string.format("|cffffd100YRG OB Prep:|r Skipping %s (%s).", attempt.label, reasonText))
+    end
+end
+
+HandlePrepUnitSpellcast = function(event, spellID)
+    if not pendingPrepAttempt or not pendingPrepAttempt.clicked then return end
+    local now = (type(GetTime) == "function") and GetTime() or 0
+    if now > (pendingPrepAttempt.expiresAt or 0) then
+        pendingPrepAttempt = nil
+        return
+    end
+    if DoesSpellIDMatchAttempt(pendingPrepAttempt, spellID) then
+        if event == "UNIT_SPELLCAST_START" then
+            pendingPrepAttempt.expiresAt = now + 5.0
+        elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+            pendingPrepAttempt = nil
+        end
+    end
+end
+
+HandlePrepStateInvalidation = function(event)
+    if event == "DISABLE" then
+        pendingPrepAttempt = nil
+        blockedPrepActions = {}
+        lastWarnAtByKey = {}
+        return
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        pendingPrepAttempt = nil
+        return
+    elseif event == "BAG_UPDATE_DELAYED" then
+        for k, entry in pairs(blockedPrepActions) do
+            if entry.blockType == "MISSING_REAGENT" then
+                blockedPrepActions[k] = nil
+            end
+        end
+        return
+    elseif event == "UPDATE_SHAPESHIFT_FORM" then
+        for k, entry in pairs(blockedPrepActions) do
+            if entry.blockType == "SHAPESHIFT" then
+                blockedPrepActions[k] = nil
+            end
+        end
+        return
+    elseif event == "PLAYER_EQUIPMENT_CHANGED" or event == "UNIT_INVENTORY_CHANGED" then
+        for k, entry in pairs(blockedPrepActions) do
+            if entry.slot then
+                local curLink = GetInventoryItemLink and GetInventoryItemLink("player", entry.slot) or nil
+                if curLink ~= entry.equipLink then
+                    blockedPrepActions[k] = nil
+                end
+            end
+        end
+        return
+    elseif event == "UNIT_AURA" then
+        if next(blockedPrepActions) ~= nil then
+            PruneBlockedPrepActions(ReadPlayerAuras(), nil, nil)
+        end
+        return
+    end
+end
+
 local function ScanPlayerSpellBook()
     local knownByLow = {}
     local list = {}
+    local knownMaxRankByLow = {}
+
+    local function RecordRank(low, spellId, subName)
+        local r = GetSafeSpellRankNumber(spellId, subName)
+        if not r and spellId then
+            r = GetSafeSpellRankNumber(spellId)
+        end
+        if r and (not knownMaxRankByLow[low] or r > knownMaxRankByLow[low]) then
+            knownMaxRankByLow[low] = r
+        end
+    end
 
     if C_SpellBook and type(C_SpellBook.GetNumSpellBookSkillLines) == "function"
         and type(C_SpellBook.GetSpellBookSkillLineInfo) == "function"
@@ -2237,10 +2818,12 @@ local function ScanPlayerSpellBook()
                         local nm = YRG.SafeString(info.name, nil)
                         if nm then
                             local low = nm:lower()
+                            local sid = YRG.SafeOptionalNumber(info.spellID)
                             if not knownByLow[low] then
                                 knownByLow[low] = nm
-                                list[#list + 1] = { name = nm, low = low, spellId = YRG.SafeOptionalNumber(info.spellID) }
+                                list[#list + 1] = { name = nm, low = low, spellId = sid }
                             end
+                            RecordRank(low, sid, info.subName)
                         end
                     end
                 end
@@ -2256,13 +2839,22 @@ local function ScanPlayerSpellBook()
             for idx = offset + 1, offset + numEntries do
                 local stype, sid = GetSpellBookItemInfo and GetSpellBookItemInfo(idx, bookType)
                 if stype == "SPELL" then
-                    local nm = GetSpellBookItemName and YRG.SafeString(GetSpellBookItemName(idx, bookType), nil)
+                    local nm, subName
+                    if GetSpellBookItemName then
+                        local rawNm, rawSub = GetSpellBookItemName(idx, bookType)
+                        nm = YRG.SafeString(rawNm, nil)
+                        subName = YRG.SafeString(rawSub, nil)
+                    end
                     if nm then
                         local low = nm:lower()
                         local isPassive = type(IsPassiveSpell) == "function" and IsPassiveSpell(idx, bookType)
-                        if not isPassive and not knownByLow[low] then
-                            knownByLow[low] = nm
-                            list[#list + 1] = { name = nm, low = low, spellId = YRG.SafeOptionalNumber(sid) }
+                        if not isPassive then
+                            sid = YRG.SafeOptionalNumber(sid)
+                            if not knownByLow[low] then
+                                knownByLow[low] = nm
+                                list[#list + 1] = { name = nm, low = low, spellId = sid }
+                            end
+                            RecordRank(low, sid, subName)
                         end
                     end
                 end
@@ -2270,7 +2862,13 @@ local function ScanPlayerSpellBook()
         end
     end
 
-    return knownByLow, list
+    for low, actualName in pairs(knownByLow) do
+        if not knownMaxRankByLow[low] then
+            RecordRank(low, actualName, nil)
+        end
+    end
+
+    return knownByLow, list, knownMaxRankByLow
 end
 
 local function IsSpellKnownAndReady(spellName, knownByLow)
@@ -2281,16 +2879,19 @@ local function IsSpellKnownAndReady(spellName, knownByLow)
         return false
     end
 
+    local usable, noMana
     if C_Spell and type(C_Spell.IsSpellUsable) == "function" then
-        local ok, usable, noMana = pcall(C_Spell.IsSpellUsable, actualName)
-        if ok and (usable == false or noMana) then
-            return false, "resources"
-        end
+        local ok, u, nm = pcall(C_Spell.IsSpellUsable, actualName)
+        if ok then usable, noMana = u, nm end
     elseif type(IsUsableSpell) == "function" then
-        local ok, usable, noMana = pcall(IsUsableSpell, actualName)
-        if ok and (usable == false or noMana) then
-            return false, "resources"
-        end
+        local ok, u, nm = pcall(IsUsableSpell, actualName)
+        if ok then usable, noMana = u, nm end
+    end
+    if not IsSecret(noMana) and noMana then
+        return false, "resources"
+    end
+    if not IsSecret(usable) and usable == false then
+        return false, "unusable"
     end
 
     local start, duration = 0, 0
@@ -2418,8 +3019,33 @@ local function ShouldRefreshWeaponEnhancement(weaponState, wantsOil, wantsStone,
     return false
 end
 
-local function IsConsumableItemBuffActive(bagItem, auras, buffOverbuffMinutes)
-    local lowItem = bagItem.name:lower()
+local function LookupConsumableTables(lowItem)
+    local aliases = CONSUMABLE_AURA_ALIASES[lowItem]
+    local stronger = CONSUMABLE_STRONGER_AURAS[lowItem]
+    if (not aliases or not stronger) and lowItem:find("^scroll of ") then
+        local baseScroll = lowItem:gsub("%s+[ivx]+$", "")
+        aliases = aliases or CONSUMABLE_AURA_ALIASES[baseScroll]
+        stronger = stronger or CONSUMABLE_STRONGER_AURAS[baseScroll]
+    end
+    return aliases, stronger
+end
+
+local function IsConsumableBuffCovered(itemName, itemLink, itemID, auras, buffOverbuffMinutes)
+    if type(itemName) ~= "string" or itemName == "" then
+        return false, nil, nil
+    end
+    local lowItem = itemName:lower()
+    local aliases, stronger = LookupConsumableTables(lowItem)
+
+    -- Strictly stronger buff active (even if <= overbuff min left) blocks weaker consumable
+    if stronger then
+        local strongerAura = FindMatchingAuraByNames(stronger, auras)
+        if strongerAura then
+            local kind = IsAuraSatisfied(strongerAura, buffOverbuffMinutes) and "active" or "stronger"
+            return true, kind, strongerAura.name
+        end
+    end
+
     if lowItem:find("^flask of") then
         for _, aura in ipairs(auras) do
             if aura.lowName:find("^flask of")
@@ -2428,26 +3054,27 @@ local function IsConsumableItemBuffActive(bagItem, auras, buffOverbuffMinutes)
                 or aura.lowName == "distilled wisdom"
                 or aura.lowName == "chromatic resistance" then
                 if IsAuraSatisfied(aura, buffOverbuffMinutes) then
-                    return true
+                    return true, "active", aura.name
                 end
             end
         end
     end
 
     local itemSpellName, itemSpellID
-    if C_Item and type(C_Item.GetItemSpell) == "function" then
-        itemSpellName, itemSpellID = C_Item.GetItemSpell(bagItem.link or bagItem.itemID)
-    elseif type(GetItemSpell) == "function" then
-        itemSpellName, itemSpellID = GetItemSpell(bagItem.link or bagItem.itemID)
+    if itemLink or itemID then
+        if C_Item and type(C_Item.GetItemSpell) == "function" then
+            itemSpellName, itemSpellID = C_Item.GetItemSpell(itemLink or itemID)
+        elseif type(GetItemSpell) == "function" then
+            itemSpellName, itemSpellID = GetItemSpell(itemLink or itemID)
+        end
+        itemSpellName = YRG.SafeString(itemSpellName, nil)
+        itemSpellID = YRG.SafeOptionalNumber(itemSpellID)
     end
-    itemSpellName = YRG.SafeString(itemSpellName, nil)
-    itemSpellID = YRG.SafeOptionalNumber(itemSpellID)
 
     local candidateNames = { [lowItem] = true }
     if itemSpellName then
         candidateNames[itemSpellName:lower()] = true
     end
-    local aliases = CONSUMABLE_AURA_ALIASES[lowItem]
     if aliases then
         for _, alias in ipairs(aliases) do
             candidateNames[alias] = true
@@ -2457,22 +3084,58 @@ local function IsConsumableItemBuffActive(bagItem, auras, buffOverbuffMinutes)
     for _, aura in ipairs(auras) do
         if (itemSpellID and aura.spellId == itemSpellID) or candidateNames[aura.lowName] then
             if IsAuraSatisfied(aura, buffOverbuffMinutes) then
-                return true
+                return true, "active", aura.name
             end
         end
     end
-    return false
+    return false, nil, nil
+end
+
+local function IsConsumableItemBuffActive(bagItem, auras, buffOverbuffMinutes)
+    return IsConsumableBuffCovered(bagItem and bagItem.name, bagItem and bagItem.link, bagItem and bagItem.itemID, auras, buffOverbuffMinutes)
+end
+
+local function IsStrongerBuffBlockingSpell(spellLow, auras, knownMaxRankByLow)
+    if type(spellLow) ~= "string" or spellLow == "" then
+        return false, nil
+    end
+
+    local strongerNames = STRONGER_SPELL_AURAS[spellLow]
+    if strongerNames then
+        local strongerAura = FindMatchingAuraByNames(strongerNames, auras)
+        if strongerAura then
+            return true, string.format("a more powerful buff (%s) is already active", strongerAura.name)
+        end
+    end
+
+    local playerRank = knownMaxRankByLow and knownMaxRankByLow[spellLow]
+    if playerRank then
+        for _, aura in ipairs(auras) do
+            if aura.lowName == spellLow and aura.rankNum and aura.rankNum > playerRank then
+                return true, string.format("a higher rank %s (Rank %d) is already active", aura.name, aura.rankNum)
+            end
+        end
+    end
+
+    if spellLow == "power word: shield" and HasPlayerDebuff("weakened soul") then
+        return true, "Weakened Soul is active"
+    end
+
+    return false, nil
 end
 
 local function EvaluateNextOBPrepAction(db)
-    local weaponOverbuff = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db and db.obPrepWeaponOverbuffMinutes, 0) + 0.5)))
-    local buffOverbuff = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db and db.obPrepBuffOverbuffMinutes, 0) + 0.5)))
+    local weaponOverbuff = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db and db.obPrepWeaponOverbuffMinutes, 5) + 0.5)))
+    local buffOverbuff = math.max(0, math.min(30, math.floor(YRG.SafeNumber(db and db.obPrepBuffOverbuffMinutes, 5) + 0.5)))
     local cls = select(2, UnitClass("player"))
     local liveClass = (not IsSecret(cls) and cls) or playerClass
     local mhState = InspectWeaponEnchantState(INV_SLOT_MAINHAND)
     local ohState = InspectWeaponEnchantState(INV_SLOT_OFFHAND)
     local auras = ReadPlayerAuras()
     local warnings = {}
+    local skippedNotes = {}
+
+    PruneBlockedPrepActions(auras, mhState, ohState)
 
     local now = (type(GetTime) == "function") and GetTime() or 0
     if lastStoneAppliedInfo and (now - lastStoneAppliedInfo.at) < 12 then
@@ -2482,7 +3145,6 @@ local function EvaluateNextOBPrepAction(db)
                 lastStoneOverwriteNoteAt = now
                 print("|cffffd100YRG OB Prep:|r Item Enhancement replaced your active Poison on that weapon (this client supports one temporary weapon enchant per slot).")
             end
-            return nil, mhState, ohState, auras, warnings
         end
     end
 
@@ -2495,7 +3157,9 @@ local function EvaluateNextOBPrepAction(db)
         for _, h in ipairs(poisonHands) do
             local fam = ParsePoisonSelection(h.sel)
             if fam and h.state.equipped and h.state.canPoison then
-                local bagItem = FindPoisonInBags(h.sel)
+                local bagItem, sawBlocked, minLevelBlocked = FindPoisonInBags(h.sel, function(itemID)
+                    return IsPrepKeyBlocked(MakeWeaponActionKey(h.slot, "POISON", itemID))
+                end)
                 if ShouldRefreshPoison(h.state, h.sel, bagItem, weaponOverbuff) then
                     if bagItem then
                         return {
@@ -2504,39 +3168,87 @@ local function EvaluateNextOBPrepAction(db)
                             slot = h.slot,
                             handLabel = h.handLabel,
                             item = bagItem,
-                        }, mhState, ohState, auras, warnings
-                    else
+                        }, mhState, ohState, auras, warnings, skippedNotes
+                    elseif not sawBlocked then
                         local famLabel = POISON_FAMILIES[fam] and POISON_FAMILIES[fam].label or fam
-                        warnings[#warnings + 1] = string.format("Missing %s for %s in bags.", famLabel, h.handLabel)
+                        if minLevelBlocked then
+                            warnings[#warnings + 1] = string.format("%s for %s requires level %d.", famLabel, h.handLabel, minLevelBlocked)
+                        else
+                            warnings[#warnings + 1] = string.format("Missing %s for %s in bags.", famLabel, h.handLabel)
+                        end
                     end
                 end
             end
         end
     end
 
+    local cachedKnownByLow, cachedKnownList, cachedKnownMaxRankByLow
+    local function GetSpellBookCached()
+        if not cachedKnownByLow then
+            cachedKnownByLow, cachedKnownList, cachedKnownMaxRankByLow = ScanPlayerSpellBook()
+        end
+        return cachedKnownByLow, cachedKnownList, cachedKnownMaxRankByLow
+    end
+
     -- 2. STAGE 2: Weapon Item Enhancements (Wizard/Mana Oils supersede Stones if both checked; MH then OH)
     if db.obPrepUseWizardOils or db.obPrepUseStones then
-        local oilBagItem = db.obPrepUseWizardOils and FindBestOilInBags() or nil
+        local wantsOil = db.obPrepUseWizardOils and true or false
+        local wantsStone = db.obPrepUseStones and true or false
+        local shamanHasImbueSpell = false
+        if liveClass == "SHAMAN" and db.obPrepAutoSelfBuff ~= false then
+            local knownByLow = GetSpellBookCached()
+            for imbueLow in pairs(SHAMAN_IMBUE_SPELLS) do
+                if knownByLow[imbueLow] then
+                    shamanHasImbueSpell = true
+                    break
+                end
+            end
+        end
+
         local enhHands = {
-            { slot = INV_SLOT_MAINHAND, handLabel = "Main Hand", state = mhState },
-            { slot = INV_SLOT_OFFHAND,  handLabel = "Off Hand",  state = ohState },
+            { slot = INV_SLOT_MAINHAND, handLabel = "Main Hand", state = mhState, poisonSel = db.obPrepMainHand },
+            { slot = INV_SLOT_OFFHAND,  handLabel = "Off Hand",  state = ohState, poisonSel = db.obPrepOffHand },
         }
         for _, h in ipairs(enhHands) do
             if h.state.equipped and h.state.canPoison then
-                local useOilHere = (oilBagItem ~= nil)
-                local useStoneHere = (not useOilHere) and (db.obPrepUseStones and true or false)
-                if ShouldRefreshWeaponEnhancement(h.state, useOilHere, useStoneHere, weaponOverbuff) then
-                    if useOilHere then
-                        return {
-                            actionType = "WEAPON_ITEM",
-                            kind = "OIL",
-                            slot = h.slot,
-                            handLabel = h.handLabel,
-                            hadPoison = (h.state.activePoison ~= nil),
-                            item = oilBagItem,
-                        }, mhState, ohState, auras, warnings
-                    elseif useStoneHere and h.state.stoneKind then
-                        local stoneItem = FindBestStoneInBags(h.state.stoneKind)
+                local skipForRoguePoison = (liveClass == "ROGUE")
+                    and (ParsePoisonSelection(h.poisonSel) ~= nil)
+                    and (h.state.activePoison ~= nil)
+                local skipForShamanImbue = (liveClass == "SHAMAN")
+                    and (db.obPrepAutoSelfBuff ~= false)
+                    and (h.state.activeImbue ~= nil)
+
+                if not skipForRoguePoison and not skipForShamanImbue then
+                    local triedOilAndMissing = false
+                    if wantsOil and ShouldRefreshWeaponEnhancement(h.state, true, false, weaponOverbuff) then
+                        local oilItem, sawBlockedOil, minLevelOil = FindBestOilInBags(function(itemID)
+                            return IsPrepKeyBlocked(MakeWeaponActionKey(h.slot, "OIL", itemID))
+                        end)
+                        if oilItem then
+                            return {
+                                actionType = "WEAPON_ITEM",
+                                kind = "OIL",
+                                slot = h.slot,
+                                handLabel = h.handLabel,
+                                hadPoison = (h.state.activePoison ~= nil),
+                                item = oilItem,
+                            }, mhState, ohState, auras, warnings, skippedNotes
+                        else
+                            triedOilAndMissing = true
+                            if (not wantsStone or not h.state.stoneKind) and not sawBlockedOil then
+                                if minLevelOil then
+                                    warnings[#warnings + 1] = string.format("Wizard / Mana Oil for %s requires level %d.", h.handLabel, minLevelOil)
+                                else
+                                    warnings[#warnings + 1] = string.format("Missing usable Wizard / Mana Oil for %s in bags.", h.handLabel)
+                                end
+                            end
+                        end
+                    end
+
+                    if wantsStone and h.state.stoneKind and ShouldRefreshWeaponEnhancement(h.state, false, true, weaponOverbuff) then
+                        local stoneItem, sawBlockedStone, minLevelStone = FindBestStoneInBags(h.state.stoneKind, function(itemID)
+                            return IsPrepKeyBlocked(MakeWeaponActionKey(h.slot, "STONE", itemID))
+                        end)
                         if stoneItem then
                             return {
                                 actionType = "WEAPON_ITEM",
@@ -2545,10 +3257,16 @@ local function EvaluateNextOBPrepAction(db)
                                 handLabel = h.handLabel,
                                 hadPoison = (h.state.activePoison ~= nil),
                                 item = stoneItem,
-                            }, mhState, ohState, auras, warnings
-                        else
+                            }, mhState, ohState, auras, warnings, skippedNotes
+                        elseif not sawBlockedStone and not (liveClass == "SHAMAN" and shamanHasImbueSpell) then
                             local stoneLabel = (h.state.stoneKind == "BLUNT") and "Weightstone" or "Sharpening Stone"
-                            warnings[#warnings + 1] = string.format("Missing usable %s for %s in bags.", stoneLabel, h.handLabel)
+                            if triedOilAndMissing then
+                                warnings[#warnings + 1] = string.format("Missing usable %s or Oil for %s in bags.", stoneLabel, h.handLabel)
+                            elseif minLevelStone then
+                                warnings[#warnings + 1] = string.format("%s for %s requires level %d.", stoneLabel, h.handLabel, minLevelStone)
+                            else
+                                warnings[#warnings + 1] = string.format("Missing usable %s for %s in bags.", stoneLabel, h.handLabel)
+                            end
                         end
                     end
                 end
@@ -2560,7 +3278,7 @@ local function EvaluateNextOBPrepAction(db)
     if db.obPrepUseFoodBuff then
         local foodTerms = SplitCSV(db.obPrepFoodName)
         if #foodTerms > 0 then
-            local eatingAura = FindMatchingAuraByNames({ "food", "drink" }, auras)
+            local eatingAura = FindMatchingAuraByNames({ "food", "drink", "food & drink", "refreshment" }, auras)
             local wellFedAura = FindMatchingAuraByNames({ "well fed" }, auras)
             local foodReady = false
             if eatingAura then
@@ -2579,17 +3297,30 @@ local function EvaluateNextOBPrepAction(db)
 
             if not foodReady then
                 local foundFood = nil
+                local anyCooldown, anyBlocked, minLvlFood = false, false, nil
                 for _, foodTerm in ipairs(foodTerms) do
-                    foundFood = FindNamedItemInBags(foodTerm)
-                    if foundFood then break end
+                    local item, sawCD, sawBlk, minLvl = FindNamedItemInBags(foodTerm, function(itemID)
+                        return IsPrepKeyBlocked(MakeBagItemActionKey("FOOD", itemID))
+                    end)
+                    if item then
+                        foundFood = item
+                        break
+                    end
+                    if sawCD then anyCooldown = true end
+                    if sawBlk then anyBlocked = true end
+                    if minLvl and (not minLvlFood or minLvl < minLvlFood) then minLvlFood = minLvl end
                 end
                 if foundFood then
                     return {
                         actionType = "BAG_ITEM",
                         kind = "FOOD",
                         item = foundFood,
-                    }, mhState, ohState, auras, warnings
-                else
+                    }, mhState, ohState, auras, warnings, skippedNotes
+                elseif anyCooldown then
+                    warnings[#warnings + 1] = "Configured Food Buff is currently on cooldown."
+                elseif minLvlFood and not anyBlocked then
+                    warnings[#warnings + 1] = string.format("Configured Food Buff (%s) requires level %d.", table.concat(foodTerms, ", "), minLvlFood)
+                elseif not anyBlocked then
                     warnings[#warnings + 1] = "Missing configured Food Buff (" .. table.concat(foodTerms, ", ") .. ") in bags."
                 end
             end
@@ -2599,14 +3330,30 @@ local function EvaluateNextOBPrepAction(db)
     -- 4. STAGE 4: Potions / Elixirs
     if db.obPrepUseElixirs and type(db.obPrepElixirList) == "table" then
         for _, entryName in ipairs(db.obPrepElixirList) do
-            local bagItem = FindNamedItemInBags(entryName)
+            local bagItem, sawCD, sawBlocked, minLevelBlocked = FindNamedItemInBags(entryName, function(itemID)
+                return IsPrepKeyBlocked(MakeBagItemActionKey("ELIXIR", itemID))
+            end)
             if bagItem then
-                if not IsConsumableItemBuffActive(bagItem, auras, buffOverbuff) then
+                local covered, reasonKind, blockerName = IsConsumableItemBuffActive(bagItem, auras, buffOverbuff)
+                if not covered then
                     return {
                         actionType = "BAG_ITEM",
                         kind = "ELIXIR",
                         item = bagItem,
-                    }, mhState, ohState, auras, warnings
+                    }, mhState, ohState, auras, warnings, skippedNotes
+                elseif reasonKind == "stronger" then
+                    skippedNotes[#skippedNotes + 1] = string.format("Skipped %s (stronger %s is active).", bagItem.name, tostring(blockerName))
+                end
+            else
+                local alreadyCovered = IsConsumableBuffCovered(entryName, nil, nil, auras, buffOverbuff)
+                if not alreadyCovered and not sawBlocked and not sawCD then
+                    if minLevelBlocked then
+                        warnings[#warnings + 1] = string.format("%s in bags requires level %d.", tostring(entryName), minLevelBlocked)
+                    else
+                        warnings[#warnings + 1] = "Missing " .. tostring(entryName) .. " in bags."
+                    end
+                elseif not alreadyCovered and sawCD then
+                    warnings[#warnings + 1] = tostring(entryName) .. " is currently on cooldown."
                 end
             end
         end
@@ -2614,7 +3361,7 @@ local function EvaluateNextOBPrepAction(db)
 
     -- 5. STAGE 5: Self-Buffs (Override CSV or Level-Aware Class Priority)
     if db.obPrepAutoSelfBuff ~= false then
-        local knownByLow, knownList = ScanPlayerSpellBook()
+        local knownByLow, knownList, knownMaxRankByLow = GetSpellBookCached()
 
         if db.obPrepOverrideBuffs then
             local customTerms = SplitCSV(db.obPrepOverrideBuffsCSV)
@@ -2643,9 +3390,16 @@ local function EvaluateNextOBPrepAction(db)
                         end
                         local aura = FindMatchingAuraByNames(checkNames, auras)
                         satisfied = IsAuraSatisfied(aura, buffOverbuff)
+                        if not satisfied then
+                            local blockedByStronger, strongerReason = IsStrongerBuffBlockingSpell(low, auras, knownMaxRankByLow)
+                            if blockedByStronger then
+                                satisfied = true
+                                skippedNotes[#skippedNotes + 1] = string.format("Skipped %s (%s).", spellName, strongerReason)
+                            end
+                        end
                     end
 
-                    if not satisfied then
+                    if not satisfied and not IsPrepKeyBlocked(MakeSpellActionKey(spellName)) then
                         local ready, res = IsSpellKnownAndReady(spellName, knownByLow)
                         if ready then
                             return {
@@ -2653,9 +3407,11 @@ local function EvaluateNextOBPrepAction(db)
                                 kind = "BUFF",
                                 spell = res,
                                 unit = ResolveSpellTargetUnit(res),
-                            }, mhState, ohState, auras, warnings
+                            }, mhState, ohState, auras, warnings, skippedNotes
                         elseif res == "resources" then
                             warnings[#warnings + 1] = "Not enough Mana/Rage for " .. spellName .. "."
+                        elseif res == "unusable" then
+                            warnings[#warnings + 1] = "Cannot cast " .. spellName .. " right now (missing reagent or form condition)."
                         end
                     end
                 else
@@ -2680,14 +3436,16 @@ local function EvaluateNextOBPrepAction(db)
                             end
                             if needImbue then
                                 for _, candSpell in ipairs(grp.cast) do
-                                    local ready, res = IsSpellKnownAndReady(candSpell, knownByLow)
-                                    if ready then
-                                        return {
-                                            actionType = "SPELL",
-                                            kind = "BUFF",
-                                            spell = res,
-                                            unit = nil,
-                                        }, mhState, ohState, auras, warnings
+                                    if not IsPrepKeyBlocked(MakeSpellActionKey(candSpell)) then
+                                        local ready, res = IsSpellKnownAndReady(candSpell, knownByLow)
+                                        if ready then
+                                            return {
+                                                actionType = "SPELL",
+                                                kind = "BUFF",
+                                                spell = res,
+                                                unit = nil,
+                                            }, mhState, ohState, auras, warnings, skippedNotes
+                                        end
                                     end
                                 end
                             end
@@ -2711,16 +3469,23 @@ local function EvaluateNextOBPrepAction(db)
                                 end
                             end
                             if chosenSpell then
-                                local ready, res = IsSpellKnownAndReady(chosenSpell, knownByLow)
-                                if ready then
-                                    return {
-                                        actionType = "SPELL",
-                                        kind = "BUFF",
-                                        spell = res,
-                                        unit = grp.target or ResolveSpellTargetUnit(res),
-                                    }, mhState, ohState, auras, warnings
-                                elseif res == "resources" then
-                                    warnings[#warnings + 1] = "Not enough Mana/Rage for " .. chosenSpell .. "."
+                                local blockedByStronger, strongerReason = IsStrongerBuffBlockingSpell(chosenSpell:lower(), auras, knownMaxRankByLow)
+                                if blockedByStronger then
+                                    skippedNotes[#skippedNotes + 1] = string.format("Skipped %s (%s).", chosenSpell, strongerReason)
+                                elseif not IsPrepKeyBlocked(MakeSpellActionKey(chosenSpell)) then
+                                    local ready, res = IsSpellKnownAndReady(chosenSpell, knownByLow)
+                                    if ready then
+                                        return {
+                                            actionType = "SPELL",
+                                            kind = "BUFF",
+                                            spell = res,
+                                            unit = grp.target or ResolveSpellTargetUnit(res),
+                                        }, mhState, ohState, auras, warnings, skippedNotes
+                                    elseif res == "resources" then
+                                        warnings[#warnings + 1] = "Not enough Mana/Rage for " .. chosenSpell .. "."
+                                    elseif res == "unusable" then
+                                        warnings[#warnings + 1] = "Cannot cast " .. chosenSpell .. " right now (missing reagent or form condition)."
+                                    end
                                 end
                             end
                         end
@@ -2730,7 +3495,57 @@ local function EvaluateNextOBPrepAction(db)
         end
     end
 
-    return nil, mhState, ohState, auras, warnings
+    return nil, mhState, ohState, auras, warnings, skippedNotes
+end
+
+local function PrintOBPrepWarnings(warnings, skippedNotes, isMovingOn, now)
+    local toPrint = {}
+    local seen = {}
+    local throttleSec = isMovingOn and 15.0 or 2.5
+
+    if type(warnings) == "table" then
+        for _, w in ipairs(warnings) do
+            if type(w) == "string" and w ~= "" and not seen[w] then
+                seen[w] = true
+                if (not isMovingOn) or (not lastWarnAtByKey[w]) or ((now - lastWarnAtByKey[w]) >= throttleSec) then
+                    toPrint[#toPrint + 1] = w
+                end
+            end
+        end
+    end
+
+    if not isMovingOn and type(skippedNotes) == "table" then
+        for _, note in ipairs(skippedNotes) do
+            if type(note) == "string" and note ~= "" and not seen[note] then
+                seen[note] = true
+                if (not lastWarnAtByKey[note]) or ((now - lastWarnAtByKey[note]) >= 10.0) then
+                    toPrint[#toPrint + 1] = note
+                end
+            end
+        end
+    end
+
+    if #toPrint == 0 then return end
+
+    for _, msg in ipairs(toPrint) do
+        lastWarnAtByKey[msg] = now
+    end
+
+    if isMovingOn then
+        if #toPrint == 1 then
+            print("|cffffd100YRG OB Prep:|r " .. toPrint[1]:gsub("%.$", "") .. " (skipping).")
+        else
+            local parts = {}
+            for _, msg in ipairs(toPrint) do
+                parts[#parts + 1] = msg:gsub("%.$", "")
+            end
+            print("|cffffd100YRG OB Prep:|r Skipping: " .. table.concat(parts, "; ") .. ".")
+        end
+    else
+        for _, msg in ipairs(toPrint) do
+            print("|cffffd100YRG OB Prep:|r " .. msg)
+        end
+    end
 end
 
 local function RunOBPrepSlash(args)
@@ -2751,8 +3566,15 @@ local function RunOBPrepSlash(args)
         prepDebugMode = not prepDebugMode
         print("|cffffd100YRG OB Prep:|r Debug trace " .. (prepDebugMode and "|cff00ff00ON|r" or "|cffff6666OFF|r"))
         return
+    elseif cmd == "clear" or cmd == "reset" then
+        blockedPrepActions = {}
+        pendingPrepAttempt = nil
+        lastWarnAtByKey = {}
+        lastMissingWarnAt = 0
+        print("|cffffd100YRG OB Prep:|r Cleared runtime skip locks and warning timers.")
+        return
     elseif cmd == "status" then
-        local action, mhState, ohState, auras, warnings = EvaluateNextOBPrepAction(modDB)
+        local action, mhState, ohState, auras, warnings, skippedNotes = EvaluateNextOBPrepAction(modDB)
         local function FmtSlotState(st)
             if not st.equipped then return "Empty" end
             local parts = {}
@@ -2781,6 +3603,14 @@ local function RunOBPrepSlash(args)
         for _, w in ipairs(warnings) do
             print("|cffffd100YRG OB Prep:|r " .. w)
         end
+        if type(skippedNotes) == "table" then
+            for _, note in ipairs(skippedNotes) do
+                print("|cffffd100YRG OB Prep:|r " .. note)
+            end
+        end
+        for _, entry in pairs(blockedPrepActions) do
+            print(string.format("|cffffd100YRG OB Prep Skip:|r %s (%s)", tostring(entry.label), tostring(entry.reason)))
+        end
         return
     end
 
@@ -2802,16 +3632,19 @@ local function RunOBPrepSlash(args)
         return
     end
 
-    local action, _, _, _, warnings = EvaluateNextOBPrepAction(modDB)
+    local action, _, _, _, warnings, skippedNotes = EvaluateNextOBPrepAction(modDB)
     local now = (type(GetTime) == "function") and GetTime() or 0
     if not action then
-        if #warnings > 0 and (now - lastMissingWarnAt) >= 2.0 then
+        pendingPrepAttempt = nil
+        if (#warnings > 0 or (skippedNotes and #skippedNotes > 0)) and (now - lastMissingWarnAt) >= 2.5 then
             lastMissingWarnAt = now
-            for _, w in ipairs(warnings) do
-                print("|cffffd100YRG OB Prep:|r " .. w)
-            end
+            PrintOBPrepWarnings(warnings, skippedNotes, false, now)
         end
         return
+    end
+
+    if #warnings > 0 then
+        PrintOBPrepWarnings(warnings, nil, true, now)
     end
 
     if action.kind == "STONE" or action.kind == "OIL" then
@@ -2822,6 +3655,18 @@ local function RunOBPrepSlash(args)
 
     if prepActionBtn then
         prepArmedUntil = now + 2.0
+        pendingPrepAttempt = {
+            actionKey = GetPrepActionKey(action),
+            actionType = action.actionType,
+            kind = action.kind,
+            label = GetPrepActionLabel(action),
+            spell = action.spell,
+            itemID = action.item and action.item.itemID or nil,
+            slot = action.slot,
+            armedAt = now,
+            clicked = false,
+            expiresAt = now + 2.0,
+        }
         if action.actionType == "WEAPON_ITEM" then
             local bagSlotStr = string.format("%d %d", action.item.bag, action.item.slot)
             prepActionBtn:SetAttribute("type", "item")
@@ -2854,6 +3699,1253 @@ local function RunOBPrepSlash(args)
                 prepActionBtn:SetAttribute("unit1", action.unit)
             end
             lastPrepTrace = string.format("Armed SPELL %s (unit=%s)", tostring(action.spell), tostring(action.unit))
+        end
+    end
+end
+
+-- ============================================================================
+-- HUNTER PET AUTOFEEDER (/yrg petfeed & PetFrameHappiness Click)
+-- ============================================================================
+do
+    local FEED_PET_SPELL_ID = 6991
+    local FEED_PET_BUFF_ID = 1539
+    local PET_FEED_MACRO_NAME = "YRGPF"
+    local PET_FEED_MACRO_BODY = "/yrg petfeed\n/click YRGPetFeedButton LeftButton 1\n/click YRGPetFeedButton LeftButton 0"
+
+    local DIET_DISPLAY_NAMES = {
+        MEAT = "Meat",
+        FISH = "Fish",
+        BREAD = "Bread",
+        CHEESE = "Cheese",
+        FRUIT = "Fruit",
+        FUNGUS = "Fungus",
+    }
+
+    local PET_DIET_BY_FAMILY = {
+        ["bat"]          = { FRUIT = true, FUNGUS = true },
+        ["bear"]         = { MEAT = true, FISH = true, BREAD = true, CHEESE = true, FRUIT = true, FUNGUS = true },
+        ["boar"]         = { MEAT = true, FISH = true, BREAD = true, CHEESE = true, FRUIT = true, FUNGUS = true },
+        ["carrion bird"] = { MEAT = true, FISH = true },
+        ["cat"]          = { MEAT = true, FISH = true },
+        ["crab"]         = { FISH = true, BREAD = true, FRUIT = true, FUNGUS = true },
+        ["crocolisk"]    = { MEAT = true, FISH = true },
+        ["dragonhawk"]   = { MEAT = true, FISH = true, FRUIT = true },
+        ["gorilla"]      = { FRUIT = true, FUNGUS = true },
+        ["hyena"]        = { MEAT = true, FRUIT = true },
+        ["nether ray"]   = { MEAT = true, FISH = true },
+        ["owl"]          = { MEAT = true, FISH = true },
+        ["raptor"]       = { MEAT = true },
+        ["ravager"]      = { MEAT = true },
+        ["scorpid"]      = { MEAT = true },
+        ["serpent"]      = { MEAT = true, FISH = true },
+        ["spider"]       = { MEAT = true },
+        ["sporebat"]     = { FRUIT = true, FUNGUS = true },
+        ["tallstrider"]  = { FRUIT = true, FUNGUS = true, CHEESE = true },
+        ["turtle"]       = { FISH = true, FRUIT = true, FUNGUS = true },
+        ["warp stalker"] = { MEAT = true, FISH = true },
+        ["wind serpent"] = { FISH = true, CHEESE = true, BREAD = true },
+        ["wolf"]         = { MEAT = true },
+    }
+
+    -- Verified Classic/Vanilla & Conjured food items: { diet, crafted, level }
+    local PET_FOOD_ITEMS_BY_ID = {
+        -- Vendor & Raw Meats
+        [117]   = { diet = "MEAT",   crafted = false, level = 1 },  -- Tough Jerky
+        [769]   = { diet = "MEAT",   crafted = false, level = 1 },  -- Chunk of Boar Meat
+        [2672]  = { diet = "MEAT",   crafted = false, level = 1 },  -- Stringy Wolf Meat
+        [2287]  = { diet = "MEAT",   crafted = false, level = 5 },  -- Haunch of Meat
+        [3173]  = { diet = "MEAT",   crafted = false, level = 10 }, -- Bear Meat
+        [3770]  = { diet = "MEAT",   crafted = false, level = 15 }, -- Mutton Chop
+        [3730]  = { diet = "MEAT",   crafted = false, level = 20 }, -- Big Bear Meat
+        [3771]  = { diet = "MEAT",   crafted = false, level = 25 }, -- Wild Hog Shank
+        [12184] = { diet = "MEAT",   crafted = false, level = 25 }, -- Raptor Flesh
+        [12203] = { diet = "MEAT",   crafted = false, level = 30 }, -- Red Wolf Meat
+        [4599]  = { diet = "MEAT",   crafted = false, level = 35 }, -- Cured Ham Steak
+        [12208] = { diet = "MEAT",   crafted = false, level = 35 }, -- Tender Wolf Meat
+        [8952]  = { diet = "MEAT",   crafted = false, level = 45 }, -- Roasted Quail
+        -- Vendor & Raw Fish
+        [6291]  = { diet = "FISH",   crafted = false, level = 1 },  -- Raw Brilliant Smallfish
+        [6303]  = { diet = "FISH",   crafted = false, level = 1 },  -- Raw Slitherskin Mackerel
+        [787]   = { diet = "FISH",   crafted = false, level = 1 },  -- Slitherskin Mackerel
+        [4592]  = { diet = "FISH",   crafted = false, level = 5 },  -- Longjaw Mud Snapper
+        [6289]  = { diet = "FISH",   crafted = false, level = 5 },  -- Raw Longjaw Mud Snapper
+        [4593]  = { diet = "FISH",   crafted = false, level = 15 }, -- Bristle Whisker Catfish
+        [6308]  = { diet = "FISH",   crafted = false, level = 15 }, -- Raw Bristle Whisker Catfish
+        [4594]  = { diet = "FISH",   crafted = false, level = 25 }, -- Rockscale Cod
+        [6359]  = { diet = "FISH",   crafted = false, level = 25 }, -- Raw Rockscale Cod
+        [8957]  = { diet = "FISH",   crafted = false, level = 35 }, -- Spinefin Halibut
+        [8959]  = { diet = "FISH",   crafted = false, level = 35 }, -- Raw Spinefin Halibut
+        [13758] = { diet = "FISH",   crafted = false, level = 35 }, -- Raw Redgill
+        [4603]  = { diet = "FISH",   crafted = false, level = 40 }, -- Raw Spotted Yellowtail
+        [13760] = { diet = "FISH",   crafted = false, level = 45 }, -- Raw Sunscale Salmon
+        [21153] = { diet = "FISH",   crafted = false, level = 45 }, -- Raw Spotted Yellowtail / Striped
+        -- Vendor Cheeses
+        [2070]  = { diet = "CHEESE", crafted = false, level = 1 },  -- Darnassian Bleu
+        [414]   = { diet = "CHEESE", crafted = false, level = 5 },  -- Dalaran Sharp
+        [1707]  = { diet = "CHEESE", crafted = false, level = 15 }, -- Stormwind Brie
+        [3927]  = { diet = "CHEESE", crafted = false, level = 35 }, -- Fine Aged Cheddar
+        [8932]  = { diet = "CHEESE", crafted = false, level = 45 }, -- Alterac Swiss
+        -- Vendor & Conjured Breads
+        [4540]  = { diet = "BREAD",  crafted = false, level = 1 },  -- Tough Hunk of Bread
+        [5349]  = { diet = "BREAD",  crafted = false, level = 1 },  -- Conjured Muffin
+        [4541]  = { diet = "BREAD",  crafted = false, level = 5 },  -- Freshly Baked Bread
+        [1113]  = { diet = "BREAD",  crafted = false, level = 5 },  -- Conjured Bread
+        [4542]  = { diet = "BREAD",  crafted = false, level = 15 }, -- Moist Cornbread
+        [1114]  = { diet = "BREAD",  crafted = false, level = 15 }, -- Conjured Rye
+        [4544]  = { diet = "BREAD",  crafted = false, level = 25 }, -- Mulgore Spice Bread
+        [1487]  = { diet = "BREAD",  crafted = false, level = 25 }, -- Conjured Pumpernickel
+        [4601]  = { diet = "BREAD",  crafted = false, level = 35 }, -- Soft Banana Bread
+        [8075]  = { diet = "BREAD",  crafted = false, level = 35 }, -- Conjured Sourdough
+        [8950]  = { diet = "BREAD",  crafted = false, level = 45 }, -- Homemade Cherry Pie
+        [8076]  = { diet = "BREAD",  crafted = false, level = 45 }, -- Conjured Sweet Roll
+        [22895] = { diet = "BREAD",  crafted = false, level = 55 }, -- Conjured Cinnamon Roll
+        -- Vendor Fruits
+        [4536]  = { diet = "FRUIT",  crafted = false, level = 1 },  -- Shiny Red Apple
+        [4537]  = { diet = "FRUIT",  crafted = false, level = 5 },  -- Tel'Abim Banana
+        [4538]  = { diet = "FRUIT",  crafted = false, level = 15 }, -- Snapvine Watermelon
+        [4539]  = { diet = "FRUIT",  crafted = false, level = 25 }, -- Goldenbark Apple
+        [4602]  = { diet = "FRUIT",  crafted = false, level = 35 }, -- Moon Harvest Pumpkin
+        [8953]  = { diet = "FRUIT",  crafted = false, level = 45 }, -- Deep Fried Plantains
+        -- Vendor Fungi
+        [4604]  = { diet = "FUNGUS", crafted = false, level = 1 },  -- Forest Mushroom Cap
+        [4605]  = { diet = "FUNGUS", crafted = false, level = 5 },  -- Red-speckled Mushroom
+        [4606]  = { diet = "FUNGUS", crafted = false, level = 15 }, -- Spongy Morel
+        [4607]  = { diet = "FUNGUS", crafted = false, level = 25 }, -- Delicious Cave Mold
+        [4608]  = { diet = "FUNGUS", crafted = false, level = 35 }, -- Raw Black Truffle
+        [8948]  = { diet = "FUNGUS", crafted = false, level = 45 }, -- Dried King Bolete
+        -- Cooked / Crafted Foods
+        [2679]  = { diet = "MEAT",   crafted = true,  level = 1 },  -- Charred Wolf Meat
+        [2680]  = { diet = "MEAT",   crafted = true,  level = 1 },  -- Spiced Wolf Meat
+        [2681]  = { diet = "MEAT",   crafted = true,  level = 1 },  -- Roasted Boar Meat
+        [5472]  = { diet = "MEAT",   crafted = true,  level = 1 },  -- Kaldorei Spider Kabob
+        [3220]  = { diet = "MEAT",   crafted = true,  level = 5 },  -- Blood Sausage
+        [5474]  = { diet = "MEAT",   crafted = true,  level = 5 },  -- Roasted Kodo Meat
+        [5479]  = { diet = "MEAT",   crafted = true,  level = 10 }, -- Crispy Lizard Tail
+        [3662]  = { diet = "MEAT",   crafted = true,  level = 15 }, -- Crocolisk Steak
+        [3665]  = { diet = "MEAT",   crafted = true,  level = 15 }, -- Curiously Tasty Omelet
+        [3726]  = { diet = "MEAT",   crafted = true,  level = 25 }, -- Big Bear Steak
+        [3727]  = { diet = "MEAT",   crafted = true,  level = 25 }, -- Hot Lion Chops
+        [12209] = { diet = "MEAT",   crafted = true,  level = 30 }, -- Lean Wolf Steak
+        [12210] = { diet = "MEAT",   crafted = true,  level = 30 }, -- Roast Raptor
+        [12212] = { diet = "MEAT",   crafted = true,  level = 30 }, -- Jungle Stew
+        [12218] = { diet = "MEAT",   crafted = true,  level = 35 }, -- Monster Omelet
+        [18045] = { diet = "MEAT",   crafted = true,  level = 40 }, -- Tender Wolf Steak
+        [20452] = { diet = "MEAT",   crafted = true,  level = 55 }, -- Smoked Desert Dumplings
+        [21023] = { diet = "MEAT",   crafted = true,  level = 55 }, -- Dirge's Kickin' Chimaerok Chops
+        [13927] = { diet = "FISH",   crafted = true,  level = 45 }, -- Cooked Glossy Mightfish
+        [13928] = { diet = "FISH",   crafted = true,  level = 45 }, -- Grilled Squid
+        [13931] = { diet = "FISH",   crafted = true,  level = 35 }, -- Nightfin Soup
+        [21072] = { diet = "FISH",   crafted = true,  level = 10 }, -- Smoked Sagefish
+        [21217] = { diet = "FISH",   crafted = true,  level = 30 }, -- Sagefish Delight
+    }
+
+    -- Name lookup for additional Classic/TBC foods (raw drops, cooked dishes, vendor staples)
+    local PET_FOOD_BY_NAME = {
+        -- Raw meats & fish
+        ["lean wolf flank"]         = { diet = "MEAT",   crafted = false },
+        ["crag boar rib"]           = { diet = "MEAT",   crafted = false },
+        ["boar ribs"]               = { diet = "MEAT",   crafted = false },
+        ["coyote meat"]             = { diet = "MEAT",   crafted = false },
+        ["crisp spider meat"]       = { diet = "MEAT",   crafted = false },
+        ["white spider meat"]       = { diet = "MEAT",   crafted = false },
+        ["lion meat"]               = { diet = "MEAT",   crafted = false },
+        ["mystery meat"]            = { diet = "MEAT",   crafted = false },
+        ["tiger meat"]              = { diet = "MEAT",   crafted = false },
+        ["stag meat"]               = { diet = "MEAT",   crafted = false },
+        ["kodo meat"]               = { diet = "MEAT",   crafted = false },
+        ["heavy kodo meat"]         = { diet = "MEAT",   crafted = false },
+        ["tough condor meat"]       = { diet = "MEAT",   crafted = false },
+        ["buzzard wing"]            = { diet = "MEAT",   crafted = false },
+        ["strider meat"]            = { diet = "MEAT",   crafted = false },
+        ["goretusk snout"]          = { diet = "MEAT",   crafted = false },
+        ["goretusk liver"]          = { diet = "MEAT",   crafted = false },
+        ["meaty bat wing"]          = { diet = "MEAT",   crafted = false },
+        ["thunder lizard tail"]     = { diet = "MEAT",   crafted = false },
+        ["sandworm meat"]           = { diet = "MEAT",   crafted = false },
+        ["small egg"]               = { diet = "MEAT",   crafted = false },
+        ["giant egg"]               = { diet = "MEAT",   crafted = false },
+        ["raptor egg"]              = { diet = "MEAT",   crafted = false },
+        ["dig rat"]                 = { diet = "MEAT",   crafted = false },
+        ["clam meat"]               = { diet = "FISH",   crafted = false },
+        ["tangy clam meat"]         = { diet = "FISH",   crafted = false },
+        ["zesty clam meat"]         = { diet = "FISH",   crafted = false },
+        ["crawler meat"]            = { diet = "FISH",   crafted = false },
+        ["tender crab meat"]        = { diet = "FISH",   crafted = false },
+        ["crawler claw"]            = { diet = "FISH",   crafted = false },
+        ["soft frenzy flesh"]       = { diet = "FISH",   crafted = false },
+        ["murloc fin"]              = { diet = "FISH",   crafted = false },
+        ["raw rainbow fin albacore"] = { diet = "FISH",  crafted = false },
+        ["raw mithril head trout"]  = { diet = "FISH",   crafted = false },
+        ["raw loch frenzy"]         = { diet = "FISH",   crafted = false },
+        ["raw sagefish"]            = { diet = "FISH",   crafted = false },
+        ["raw greater sagefish"]    = { diet = "FISH",   crafted = false },
+        ["raw nightfin snapper"]    = { diet = "FISH",   crafted = false },
+        ["raw glossy mightfish"]    = { diet = "FISH",   crafted = false },
+        ["raw summer bass"]         = { diet = "FISH",   crafted = false },
+        ["raw whitescale salmon"]   = { diet = "FISH",   crafted = false },
+        ["darkclaw lobster"]        = { diet = "FISH",   crafted = false },
+        ["dwarven mild"]            = { diet = "CHEESE", crafted = false },
+        -- Cooked / Crafted recipes
+        ["herb baked egg"]          = { diet = "MEAT",   crafted = true },
+        ["coyote steak"]            = { diet = "MEAT",   crafted = true },
+        ["crab cake"]               = { diet = "FISH",   crafted = true },
+        ["cooked crab claw"]        = { diet = "FISH",   crafted = true },
+        ["dry pork ribs"]           = { diet = "MEAT",   crafted = true },
+        ["beer basted boar ribs"]   = { diet = "MEAT",   crafted = true },
+        ["succulent pork ribs"]     = { diet = "MEAT",   crafted = true },
+        ["goretusk liver pie"]      = { diet = "MEAT",   crafted = true },
+        ["westfall stew"]           = { diet = "MEAT",   crafted = true },
+        ["redridge goulash"]        = { diet = "MEAT",   crafted = true },
+        ["seasoned wolf kabob"]     = { diet = "MEAT",   crafted = true },
+        ["scorpid surprise"]        = { diet = "MEAT",   crafted = true },
+        ["strider stew"]            = { diet = "MEAT",   crafted = true },
+        ["lean venison"]            = { diet = "MEAT",   crafted = true },
+        ["murloc fin soup"]         = { diet = "FISH",   crafted = true },
+        ["crocolisk gumbo"]         = { diet = "MEAT",   crafted = true },
+        ["gooey spider cake"]       = { diet = "MEAT",   crafted = true },
+        ["barbecued buzzard wing"]  = { diet = "MEAT",   crafted = true },
+        ["soothing turtle bisque"]  = { diet = "FISH",   crafted = true },
+        ["carrion surprise"]        = { diet = "MEAT",   crafted = true },
+        ["mystery stew"]            = { diet = "MEAT",   crafted = true },
+        ["heavy kodo stew"]         = { diet = "MEAT",   crafted = true },
+        ["spiced chili crab"]       = { diet = "FISH",   crafted = true },
+        ["spider sausage"]          = { diet = "MEAT",   crafted = true },
+        ["heavy crocolisk stew"]    = { diet = "MEAT",   crafted = true },
+        ["dig rat stew"]            = { diet = "MEAT",   crafted = true },
+        ["crispy bat wing"]         = { diet = "MEAT",   crafted = true },
+        ["brilliant smallfish"]     = { diet = "FISH",   crafted = true },
+        ["loch frenzy delight"]     = { diet = "FISH",   crafted = true },
+        ["rainbow fin albacore"]    = { diet = "FISH",   crafted = true },
+        ["fillet of frenzy"]        = { diet = "FISH",   crafted = true },
+        ["mithril head trout"]      = { diet = "FISH",   crafted = true },
+        ["spotted yellowtail"]      = { diet = "FISH",   crafted = true },
+        ["hot smoked bass"]         = { diet = "FISH",   crafted = true },
+        ["filet of redgill"]        = { diet = "FISH",   crafted = true },
+        ["poached sunscale salmon"] = { diet = "FISH",   crafted = true },
+        ["lobster stew"]            = { diet = "FISH",   crafted = true },
+        ["mightfish steak"]         = { diet = "FISH",   crafted = true },
+        ["baked salmon"]            = { diet = "FISH",   crafted = true },
+        ["clam chowder"]            = { diet = "FISH",   crafted = true },
+        ["boiled clams"]            = { diet = "FISH",   crafted = true },
+        ["goblin deviled clams"]    = { diet = "FISH",   crafted = true },
+        ["undermine clam chowder"]  = { diet = "FISH",   crafted = true },
+        ["runn tum tuber surprise"] = { diet = "FUNGUS", crafted = true },
+        ["gingerbread cookie"]      = { diet = "BREAD",  crafted = true },
+    }
+
+    local petFeedBtn = nil
+    local petFeedHappinessBtn = nil
+    local hookedHappinessFrames = setmetatable({}, { __mode = "k" })
+    local runtimeBlockedFoods = {}
+    local pendingFeedAttempt = nil
+    local lastFeedMsgAt = 0
+    local petFeedDebug = false
+    local petFeederBlacklistUpdater = nil
+
+    local function GetFeedPetSpellName()
+        return GetSafeSpellName(FEED_PET_SPELL_ID) or "Feed Pet"
+    end
+
+    local function IsFeedPetKnownAndReady()
+        local spName = GetFeedPetSpellName()
+        local known = false
+        if C_SpellBook and type(C_SpellBook.IsSpellKnown) == "function" then
+            local ok, k = pcall(C_SpellBook.IsSpellKnown, FEED_PET_SPELL_ID)
+            if ok and not IsSecret(k) and k then known = true end
+        elseif type(IsSpellKnown) == "function" then
+            local ok, k = pcall(IsSpellKnown, FEED_PET_SPELL_ID)
+            if ok and not IsSecret(k) and k then known = true end
+        end
+        if not known then
+            local knownByLow = ScanPlayerSpellBook()
+            if knownByLow[spName:lower()] or knownByLow["feed pet"] then
+                known = true
+            end
+        end
+        if not known then
+            return false, "not_learned", spName
+        end
+
+        local usable, noMana
+        if C_Spell and type(C_Spell.IsSpellUsable) == "function" then
+            local ok, u, nm = pcall(C_Spell.IsSpellUsable, spName)
+            if ok then usable, noMana = u, nm end
+        elseif type(IsUsableSpell) == "function" then
+            local ok, u, nm = pcall(IsUsableSpell, spName)
+            if ok then usable, noMana = u, nm end
+        end
+        if not IsSecret(noMana) and noMana then
+            return false, "resources", spName
+        end
+        if not IsSecret(usable) and usable == false then
+            return false, "unusable", spName
+        end
+
+        local start, duration = 0, 0
+        if C_Spell and type(C_Spell.GetSpellCooldown) == "function" then
+            local ok, cd = pcall(C_Spell.GetSpellCooldown, spName)
+            if ok and type(cd) == "table" then
+                start = YRG.SafeNumber(cd.startTime, 0)
+                duration = YRG.SafeNumber(cd.duration, 0)
+            end
+        elseif type(GetSpellCooldown) == "function" then
+            local ok, st, dur = pcall(GetSpellCooldown, spName)
+            if ok then
+                start = YRG.SafeNumber(st, 0)
+                duration = YRG.SafeNumber(dur, 0)
+            end
+        end
+        if start > 0 and duration > 1.5 then
+            local now = (type(GetTime) == "function") and GetTime() or 0
+            if (start + duration - now) > 0.25 then
+                return false, "cooldown", spName
+            end
+        end
+
+        return true, spName, spName
+    end
+
+    local function HasPetFeedEffect()
+        if not (UnitExists and UnitExists("pet")) then return false end
+        local feedBuffName = (GetSafeSpellName(FEED_PET_BUFF_ID) or "feed pet effect"):lower()
+        if C_UnitAuras and type(C_UnitAuras.GetAuraDataByIndex) == "function" then
+            for i = 1, 40 do
+                local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "pet", i, "HELPFUL")
+                if not ok or type(aura) ~= "table" then break end
+                local sid = YRG.SafeOptionalNumber(aura.spellId)
+                local nm = YRG.SafeString(aura.name, nil)
+                if sid == FEED_PET_BUFF_ID or (nm and (nm:lower() == feedBuffName or nm:lower():find("feed pet", 1, true))) then
+                    return true
+                end
+            end
+        elseif type(UnitAura) == "function" then
+            for i = 1, 40 do
+                local ok, nm, _, _, _, _, _, _, _, _, sid = pcall(UnitAura, "pet", i, "HELPFUL")
+                if not ok then break end
+                nm = YRG.SafeString(nm, nil)
+                if not nm then break end
+                sid = YRG.SafeOptionalNumber(sid)
+                if sid == FEED_PET_BUFF_ID or nm:lower() == feedBuffName or nm:lower():find("feed pet", 1, true) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function GetPetDietSet()
+        local diets = {}
+        local ordered = {}
+
+        local function AddDiet(raw)
+            local s = YRG.SafeString(raw, nil)
+            if not s then return end
+            local up = s:upper():gsub("^%s+", ""):gsub("%s+$", "")
+            if up == "MUSHROOM" or up == "FUNGI" then up = "FUNGUS" end
+            if DIET_DISPLAY_NAMES[up] and not diets[up] then
+                diets[up] = true
+                ordered[#ordered + 1] = DIET_DISPLAY_NAMES[up]
+            end
+        end
+
+        if type(GetPetFoodTypes) == "function" then
+            local ok, a, b, c, d, e, f, g, h = pcall(GetPetFoodTypes)
+            if ok then
+                for _, val in ipairs({ a, b, c, d, e, f, g, h }) do
+                    AddDiet(val)
+                end
+            end
+        end
+
+        if #ordered == 0 and type(UnitCreatureFamily) == "function" then
+            local ok, fam = pcall(UnitCreatureFamily, "pet")
+            fam = ok and YRG.SafeString(fam, nil) or nil
+            if fam then
+                local fallback = PET_DIET_BY_FAMILY[fam:lower()]
+                if fallback then
+                    for key in pairs(fallback) do
+                        AddDiet(key)
+                    end
+                end
+            end
+        end
+
+        return diets, ordered
+    end
+
+    local function GetPetSignature()
+        local fam = (type(UnitCreatureFamily) == "function") and YRG.SafeString(UnitCreatureFamily("pet"), "Pet") or "Pet"
+        local lvl = YRG.SafeNumber(UnitLevel and UnitLevel("pet"), 1)
+        return tostring(fam) .. ":" .. tostring(lvl)
+    end
+
+    local function ReadBagTooltipLines(bag, slot)
+        local lines = {}
+        if C_TooltipInfo and type(C_TooltipInfo.GetBagItem) == "function" then
+            local ok, data = pcall(C_TooltipInfo.GetBagItem, bag, slot)
+            if ok and type(data) == "table" and type(data.lines) == "table" then
+                for _, line in ipairs(data.lines) do
+                    local txt = line and (line.leftText or line.text)
+                    if type(txt) == "string" and not IsSecret(txt) and txt ~= "" then
+                        lines[#lines + 1] = txt
+                    end
+                end
+            end
+        end
+        if #lines == 0 and CreateFrame and UIParent then
+            if not prepScanTooltip then
+                local ok, tip = pcall(CreateFrame, "GameTooltip", "YRGRoguePrepScanTooltip", UIParent, "GameTooltipTemplate")
+                if ok and tip then prepScanTooltip = tip end
+            end
+            if prepScanTooltip then
+                prepScanTooltip:Hide()
+                prepScanTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+                if prepScanTooltip.ClearLines then prepScanTooltip:ClearLines() end
+                local okSet = pcall(prepScanTooltip.SetBagItem, prepScanTooltip, bag, slot)
+                if okSet then
+                    local numLines = YRG.SafeNumber(prepScanTooltip.NumLines and prepScanTooltip:NumLines(), 0)
+                    local tipName = prepScanTooltip.GetName and prepScanTooltip:GetName() or "YRGRoguePrepScanTooltip"
+                    for i = 1, numLines do
+                        local fs = _G[tipName .. "TextLeft" .. i]
+                        local txt = fs and fs.GetText and fs:GetText()
+                        if type(txt) == "string" and not IsSecret(txt) and txt ~= "" then
+                            lines[#lines + 1] = txt
+                        end
+                    end
+                end
+                prepScanTooltip:Hide()
+            end
+        end
+        return lines
+    end
+
+    local function InspectBagFoodTooltip(bag, slot)
+        local lines = ReadBagTooltipLines(bag, slot)
+        local info = {
+            isQuest = false,
+            isBuffOrCrafted = false,
+            isDrinkOnly = false,
+            isEdibleFood = false,
+            isInedibleTrade = false,
+        }
+        for _, line in ipairs(lines) do
+            local low = StripColorCodes(line):lower()
+            if low:find("quest item", 1, true) or low:find("starts a quest", 1, true) then
+                info.isQuest = true
+            end
+            if low:find("well fed", 1, true)
+                or low:find("if you spend at least", 1, true)
+                or low:find("spend at least", 1, true) then
+                info.isBuffOrCrafted = true
+            end
+            if low:find("must remain seated while drinking", 1, true) then
+                info.isDrinkOnly = true
+            end
+            if low:find("must remain seated while eating", 1, true)
+                or (low:find("use:", 1, true) and low:find("restores", 1, true) and low:find("health", 1, true)) then
+                info.isEdibleFood = true
+            end
+            if low:find("increases", 1, true) and low:find("use:", 1, true) then
+                info.isBuffOrCrafted = true
+            end
+        end
+        if info.isEdibleFood then
+            info.isDrinkOnly = false
+        end
+        return info
+    end
+
+    local function InferDietFromItemName(lowName)
+        if type(lowName) ~= "string" or lowName == "" then return nil end
+        for _, bad in ipairs({
+            "recipe", "pattern", "formula", "schematic", "plans", "potion", "elixir", "flask",
+            "bandage", "scroll", "water", "milk", "juice", "tea", "wine", "ale", "beer", "rum",
+            "grog", "whiskey", "brandy", "nectar", "dew", "pelt", "hide", "leather", "silk",
+            "scale", "bone", "ichor", "blood", "venom", "sac", "tooth", "fang", "feather",
+            "oil", "spice", "flour", "salt", "thread", "blackmouth", "firefin", "stonescale", "deviate",
+        }) do
+            if lowName:find(bad, 1, true) and not lowName:find("beer basted", 1, true) then
+                return nil
+            end
+        end
+
+        if lowName:find("cheese", 1, true) or lowName:find("bleu", 1, true) or lowName:find("brie", 1, true)
+            or lowName:find("cheddar", 1, true) or lowName:find("swiss", 1, true) or lowName:find("gouda", 1, true)
+            or lowName:find("dwarven mild", 1, true) then
+            return "CHEESE"
+        elseif lowName:find("mushroom", 1, true) or lowName:find("fungus", 1, true) or lowName:find("morel", 1, true)
+            or lowName:find("truffle", 1, true) or lowName:find("bolete", 1, true) or lowName:find("cave mold", 1, true)
+            or lowName:find("toadstool", 1, true) then
+            return "FUNGUS"
+        elseif lowName:find("apple", 1, true) or lowName:find("banana", 1, true) or lowName:find("watermelon", 1, true)
+            or lowName:find("pumpkin", 1, true) or lowName:find("plantain", 1, true) or lowName:find("melon", 1, true)
+            or lowName:find("cherry", 1, true) or lowName:find("peach", 1, true) or lowName:find("pear", 1, true)
+            or lowName:find("berry", 1, true) or lowName:find("fruit", 1, true) or lowName:find("orange", 1, true)
+            or lowName:find("mango", 1, true) then
+            return "FRUIT"
+        elseif lowName:find("bread", 1, true) or lowName:find("muffin", 1, true) or lowName:find("rye", 1, true)
+            or lowName:find("pumpernickel", 1, true) or lowName:find("sourdough", 1, true) or lowName:find("sweet roll", 1, true)
+            or lowName:find("cinnamon roll", 1, true) or lowName:find("cornbread", 1, true) or lowName:find("croissant", 1, true)
+            or lowName:find("biscuit", 1, true) or lowName:find("cookie", 1, true) or lowName:find("loaf", 1, true)
+            or lowName:find("bagel", 1, true) or lowName:find("cake", 1, true) then
+            return "BREAD"
+        elseif lowName:find("fish", 1, true) or lowName:find("mackerel", 1, true) or lowName:find("snapper", 1, true)
+            or lowName:find("catfish", 1, true) or lowName:find("halibut", 1, true) or lowName:find("yellowtail", 1, true)
+            or lowName:find("salmon", 1, true) or lowName:find("trout", 1, true) or lowName:find("bass", 1, true)
+            or lowName:find("frenzy", 1, true) or lowName:find("albacore", 1, true) or lowName:find("redgill", 1, true)
+            or lowName:find("squid", 1, true) or lowName:find("clam", 1, true) or lowName:find("crab", 1, true)
+            or lowName:find("lobster", 1, true) or lowName:find("cod", 1, true) or lowName:find("crawdad", 1, true)
+            or lowName:find("mudfish", 1, true) or lowName:find("darter", 1, true) then
+            return "FISH"
+        elseif lowName:find("meat", 1, true) or lowName:find("jerky", 1, true) or lowName:find("haunch", 1, true)
+            or lowName:find("mutton", 1, true) or lowName:find("shank", 1, true) or lowName:find("ham", 1, true)
+            or lowName:find("steak", 1, true) or lowName:find("ribs", 1, true) or lowName:find("flank", 1, true)
+            or lowName:find("venison", 1, true) or lowName:find("pork", 1, true) or lowName:find("quail", 1, true)
+            or lowName:find("sausage", 1, true) or lowName:find("omelet", 1, true) or lowName:find("goulash", 1, true)
+            or lowName:find("chops", 1, true) or lowName:find("roast", 1, true) or lowName:find("kabob", 1, true)
+            or lowName:find("bacon", 1, true) or lowName:find("snout", 1, true) or lowName:find("liver", 1, true)
+            or lowName:find("bat wing", 1, true) or lowName:find("buzzard wing", 1, true) or lowName:find("lizard tail", 1, true)
+            or lowName:find("egg", 1, true) then
+            return "MEAT"
+        end
+        return nil
+    end
+
+    local function IsPetFoodBlacklisted(db, itemName)
+        if not db or type(db.petFeederBlacklist) ~= "table" or type(itemName) ~= "string" then
+            return false
+        end
+        local low = itemName:lower()
+        for _, entry in ipairs(db.petFeederBlacklist) do
+            if type(entry) == "string" and entry ~= "" then
+                local clean = NormalizePrepItemName(entry)
+                if clean and clean:lower() == low then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function GetFullBagItemStats(bag, slot, itemID, itemLink)
+        local stackCount = 1
+        local slotQuality = nil
+        if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+            local info = C_Container.GetContainerItemInfo(bag, slot)
+            if type(info) == "table" then
+                stackCount = YRG.SafeNumber(info.stackCount, 1)
+                slotQuality = YRG.SafeOptionalNumber(info.quality)
+            end
+        elseif type(GetContainerItemInfo) == "function" then
+            local _, count, _, q = GetContainerItemInfo(bag, slot)
+            stackCount = YRG.SafeNumber(count, 1)
+            slotQuality = YRG.SafeOptionalNumber(q)
+        end
+
+        local query = itemLink or itemID
+        local itemName, itemQuality, itemLevel, itemMinLevel, itemType, itemSubType, sellPrice, classID, subClassID
+        if query then
+            if C_Item and type(C_Item.GetItemInfo) == "function" then
+                itemName, _, itemQuality, itemLevel, itemMinLevel, itemType, itemSubType, _, _, _, sellPrice, classID, subClassID = C_Item.GetItemInfo(query)
+            elseif type(GetItemInfo) == "function" then
+                itemName, _, itemQuality, itemLevel, itemMinLevel, itemType, itemSubType, _, _, _, sellPrice, classID, subClassID = GetItemInfo(query)
+            end
+        end
+
+        return {
+            name = YRG.SafeString(itemName, nil),
+            quality = YRG.SafeOptionalNumber(itemQuality) or slotQuality or 1,
+            itemLevel = YRG.SafeNumber(itemLevel, 0),
+            itemMinLevel = YRG.SafeNumber(itemMinLevel, 0),
+            itemType = YRG.SafeString(itemType, ""),
+            itemSubType = YRG.SafeString(itemSubType, ""),
+            sellPrice = YRG.SafeNumber(sellPrice, 0),
+            classID = YRG.SafeOptionalNumber(classID),
+            subClassID = YRG.SafeOptionalNumber(subClassID),
+            stackCount = math.max(1, stackCount),
+        }
+    end
+
+    local function FindBestPetFood(db)
+        local dietSet, dietList = GetPetDietSet()
+        if #dietList == 0 then
+            return nil, dietList, { noDiet = true }
+        end
+
+        local petLevel = math.max(1, YRG.SafeNumber(UnitLevel and UnitLevel("pet"), 1))
+        local petSig = GetPetSignature()
+        local ignoreCrafted = (db == nil) or (db.petFeederIgnoreCrafted ~= false)
+        local minFoodLevel = math.max(1, petLevel - 30)
+        local maxBag = NUM_BAG_SLOTS or 4
+
+        local consumableClass = (Enum and Enum.ItemClass and Enum.ItemClass.Consumable) or 0
+        local tradeGoodsClass = (Enum and Enum.ItemClass and Enum.ItemClass.Tradegoods) or 7
+        local questClass = (Enum and Enum.ItemClass and Enum.ItemClass.Questitem) or 12
+
+        local candidates = {}
+        local skipStats = {
+            blacklisted = 0,
+            crafted = 0,
+            tooLowLevel = 0,
+            tooHighLevel = 0,
+            rejected = 0,
+        }
+
+        for bag = 0, maxBag do
+            local numSlots = SafeGetContainerNumSlots(bag)
+            for slot = 1, numSlots do
+                local itemID, itemLink = SafeGetContainerItemDetails(bag, slot)
+                if itemID and not IsBagItemOnCooldown(bag, slot) then
+                    local stats = GetFullBagItemStats(bag, slot, itemID, itemLink)
+                    local itemName = stats.name
+                    if itemName then
+                        local lowName = itemName:lower()
+                        local known = PET_FOOD_ITEMS_BY_ID[itemID] or PET_FOOD_BY_NAME[lowName]
+                        local diet, crafted, foodLevel
+
+                        if known then
+                            diet = known.diet
+                            crafted = known.crafted and true or false
+                            foodLevel = known.level or ((stats.itemMinLevel > 0) and stats.itemMinLevel or math.max(1, stats.itemLevel - 10))
+                            if not crafted and ignoreCrafted and stats.classID == consumableClass then
+                                local tipInfo = InspectBagFoodTooltip(bag, slot)
+                                if tipInfo.isQuest then
+                                    diet = nil
+                                elseif tipInfo.isBuffOrCrafted then
+                                    crafted = true
+                                end
+                            end
+                        elseif stats.classID ~= questClass and (stats.classID == consumableClass or stats.classID == tradeGoodsClass or stats.classID == nil) then
+                            local guessedDiet = InferDietFromItemName(lowName)
+                            if guessedDiet then
+                                local tipInfo = InspectBagFoodTooltip(bag, slot)
+                                if not tipInfo.isQuest and not tipInfo.isDrinkOnly then
+                                    local subLow = stats.itemSubType:lower()
+                                    local isFoodSubtype = subLow:find("food", 1, true) ~= nil
+                                    local isRawCooking = (stats.classID == tradeGoodsClass) and (guessedDiet == "MEAT" or guessedDiet == "FISH" or guessedDiet == "FUNGUS" or guessedDiet == "FRUIT")
+                                    if tipInfo.isEdibleFood or isFoodSubtype or isRawCooking then
+                                        diet = guessedDiet
+                                        crafted = tipInfo.isBuffOrCrafted and true or false
+                                        foodLevel = (stats.itemMinLevel > 0) and stats.itemMinLevel or math.max(1, stats.itemLevel - 10)
+                                    end
+                                end
+                            end
+                        end
+
+                        if diet and dietSet[diet] then
+                            local blockedEntry = runtimeBlockedFoods[itemID]
+                            if blockedEntry and blockedEntry.petSig == petSig then
+                                skipStats.rejected = skipStats.rejected + 1
+                            elseif IsPetFoodBlacklisted(db, itemName) then
+                                skipStats.blacklisted = skipStats.blacklisted + 1
+                            elseif ignoreCrafted and crafted then
+                                skipStats.crafted = skipStats.crafted + 1
+                            elseif stats.itemMinLevel > petLevel then
+                                skipStats.tooHighLevel = skipStats.tooHighLevel + 1
+                            elseif foodLevel < minFoodLevel then
+                                skipStats.tooLowLevel = skipStats.tooLowLevel + 1
+                            else
+                                candidates[#candidates + 1] = {
+                                    bag = bag,
+                                    slot = slot,
+                                    itemID = itemID,
+                                    link = itemLink,
+                                    name = itemName,
+                                    diet = diet,
+                                    crafted = crafted and 1 or 0,
+                                    quality = stats.quality,
+                                    foodLevel = foodLevel,
+                                    sellPrice = stats.sellPrice,
+                                    stackCount = stats.stackCount,
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if #candidates == 0 then
+            return nil, dietList, skipStats
+        end
+
+        table.sort(candidates, function(a, b)
+            if a.quality ~= b.quality then return a.quality < b.quality end
+            if a.crafted ~= b.crafted then return a.crafted < b.crafted end
+            if a.foodLevel ~= b.foodLevel then return a.foodLevel < b.foodLevel end
+            if a.sellPrice ~= b.sellPrice then return a.sellPrice < b.sellPrice end
+            if a.stackCount ~= b.stackCount then return a.stackCount < b.stackCount end
+            if a.bag ~= b.bag then return a.bag < b.bag end
+            return a.slot < b.slot
+        end)
+
+        return candidates[1], dietList, skipStats
+    end
+
+    local function FormatNoFoodMessage(petName, dietList, skipStats)
+        local dietStr = (#dietList > 0) and table.concat(dietList, ", ") or "Unknown diet"
+        if skipStats and skipStats.noDiet then
+            return string.format("|cffffd100YRG Pet Feeder:|r Could not detect %s's diet.", petName)
+        end
+        local reasons = {}
+        if skipStats then
+            if skipStats.crafted and skipStats.crafted > 0 then reasons[#reasons + 1] = "crafted/buff food ignored" end
+            if skipStats.blacklisted and skipStats.blacklisted > 0 then reasons[#reasons + 1] = "blacklisted" end
+            if skipStats.tooLowLevel and skipStats.tooLowLevel > 0 then reasons[#reasons + 1] = "food level too low" end
+            if skipStats.tooHighLevel and skipStats.tooHighLevel > 0 then reasons[#reasons + 1] = "pet level too low" end
+            if skipStats.rejected and skipStats.rejected > 0 then reasons[#reasons + 1] = "pet rejected" end
+        end
+        if #reasons > 0 then
+            return string.format("|cffffd100YRG Pet Feeder:|r No usable food found in bags for %s (%s) [%s].",
+                petName, dietStr, table.concat(reasons, ", "))
+        end
+        return string.format("|cffffd100YRG Pet Feeder:|r No food found in bags for %s (%s).", petName, dietStr)
+    end
+
+    local function PrintFeedMsg(msg)
+        local now = (type(GetTime) == "function") and GetTime() or 0
+        if (now - lastFeedMsgAt) >= 0.4 then
+            lastFeedMsgAt = now
+            print(msg)
+        end
+    end
+
+    local function ClearFeedButtonAttributes(btn)
+        if not btn or (InCombatLockdown and InCombatLockdown()) then return end
+        btn:SetAttribute("type", nil)
+        btn:SetAttribute("type1", nil)
+        btn:SetAttribute("macrotext", nil)
+        btn:SetAttribute("macrotext1", nil)
+    end
+
+    local function ConfirmFeedAttemptSuccess(attempt)
+        if not attempt or attempt.confirmed then return end
+        attempt.confirmed = true
+        pendingFeedAttempt = nil
+        local itemDisplay = attempt.itemLink or ("[" .. tostring(attempt.itemName) .. "]")
+        print(string.format("|cffffd100YRG Pet Feeder:|r Fed %s to %s.", itemDisplay, tostring(attempt.petName)))
+    end
+
+    local function PrepareFeedOnButton(btn, isDirectClick, modDB)
+        ClearFeedButtonAttributes(btn)
+
+        if InCombatLockdown and InCombatLockdown() then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Cannot feed your pet while in combat.")
+            return false
+        end
+        if UnitIsDeadOrGhost and UnitIsDeadOrGhost("player") then
+            return false
+        end
+        if not (UnitExists and UnitExists("pet")) then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r You don't have an active pet.")
+            return false
+        end
+        if UnitIsDead and UnitIsDead("pet") then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Cannot feed a dead pet.")
+            return false
+        end
+        if UnitAffectingCombat and UnitAffectingCombat("pet") then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Your pet is in combat.")
+            return false
+        end
+        if IsMounted and IsMounted() then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Dismount before feeding your pet.")
+            return false
+        end
+        if HasPlainCastInfo(UnitCastingInfo, "player") or HasPlainCastInfo(UnitChannelInfo, "player") then
+            return false
+        end
+
+        local ready, spellOrReason, feedPetSpell = IsFeedPetKnownAndReady()
+        if not ready then
+            if spellOrReason == "not_learned" then
+                PrintFeedMsg("|cffffd100YRG Pet Feeder:|r You haven't learned Feed Pet yet.")
+            elseif spellOrReason == "resources" then
+                PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Not enough Focus/Mana to feed your pet.")
+            elseif spellOrReason == "cooldown" then
+                PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Feed Pet is on cooldown.")
+            end
+            return false
+        end
+
+        if HasPetFeedEffect() then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Your pet is already eating.")
+            return false
+        end
+
+        local inRange = nil
+        if C_Spell and type(C_Spell.IsSpellInRange) == "function" then
+            local ok, r = pcall(C_Spell.IsSpellInRange, feedPetSpell, "pet")
+            if ok and not IsSecret(r) then inRange = r end
+        elseif type(IsSpellInRange) == "function" then
+            local ok, r = pcall(IsSpellInRange, feedPetSpell, "pet")
+            if ok and not IsSecret(r) then inRange = r end
+        end
+        if inRange == 0 or inRange == false then
+            PrintFeedMsg("|cffffd100YRG Pet Feeder:|r Your pet is too far away to feed.")
+            return false
+        end
+
+        local petName = YRG.SafeString(UnitName and UnitName("pet"), "your pet") or "your pet"
+        local food, dietList, skipStats = FindBestPetFood(modDB)
+        if not food then
+            PrintFeedMsg(FormatNoFoodMessage(petName, dietList, skipStats))
+            return false
+        end
+
+        local macroBody = string.format("/cast [pet,nodead,nocombat] %s\n/use %d %d", feedPetSpell, food.bag, food.slot)
+        btn:SetAttribute("type", "macro")
+        btn:SetAttribute("type1", "macro")
+        btn:SetAttribute("macrotext", macroBody)
+        btn:SetAttribute("macrotext1", macroBody)
+
+        local now = (type(GetTime) == "function") and GetTime() or 0
+        pendingFeedAttempt = {
+            itemID = food.itemID,
+            itemName = food.name,
+            itemLink = food.link,
+            petName = petName,
+            petSig = GetPetSignature(),
+            spellName = feedPetSpell,
+            bag = food.bag,
+            slot = food.slot,
+            armedAt = now,
+            clicked = isDirectClick and true or false,
+            clickedAt = isDirectClick and now or nil,
+            expiresAt = now + 2.0,
+            confirmed = false,
+        }
+
+        if petFeedDebug then
+            print(string.format("|cffffd100YRG Pet Feeder Debug:|r Armed %s (%s, q=%d, lvl=%d, bag=%d, slot=%d) for %s",
+                tostring(food.name), tostring(food.diet), food.quality, food.foodLevel, food.bag, food.slot, petName))
+        end
+
+        return true
+    end
+
+    local function FindPetHappinessFrame()
+        if _G.PetFrameHappiness then
+            return _G.PetFrameHappiness
+        end
+        if PetFrame then
+            if PetFrame.Happiness then return PetFrame.Happiness end
+            if PetFrame.PetFrameHappiness then return PetFrame.PetFrameHappiness end
+            if PetFrame.PetFrameContent then
+                if PetFrame.PetFrameContent.Happiness then return PetFrame.PetFrameContent.Happiness end
+                if PetFrame.PetFrameContent.PetFrameHappiness then return PetFrame.PetFrameContent.PetFrameHappiness end
+            end
+        end
+        if _G.PetFrameHappinessTexture and _G.PetFrameHappinessTexture.GetParent then
+            local p = _G.PetFrameHappinessTexture:GetParent()
+            if p and p ~= PetFrame then
+                return p
+            end
+        end
+        return nil
+    end
+
+    local function SyncPetHappinessOverlay()
+        if not petFeedHappinessBtn then return end
+        if InCombatLockdown and InCombatLockdown() then return end
+
+        local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+        local enabled = modDB and modDB.enabled and (modDB.petFeederEnabled ~= false)
+        local _, liveClass = UnitClass("player")
+        local isHunter = (not IsSecret(liveClass) and liveClass == "HUNTER") or (playerClass == "HUNTER")
+        local hf = FindPetHappinessFrame()
+
+        if not enabled or not isHunter or not hf or not (UnitExists and UnitExists("pet")) then
+            petFeedHappinessBtn:Hide()
+            return
+        end
+
+        if not hookedHappinessFrames[hf] and hf.HookScript then
+            hookedHappinessFrames[hf] = true
+            hf:HookScript("OnShow", function()
+                SyncPetHappinessOverlay()
+            end)
+            hf:HookScript("OnHide", function()
+                SyncPetHappinessOverlay()
+            end)
+        end
+
+        if not hf:IsVisible() then
+            petFeedHappinessBtn:Hide()
+            return
+        end
+
+        petFeedHappinessBtn:ClearAllPoints()
+        local w = YRG.SafeNumber(hf.GetWidth and hf:GetWidth(), 0)
+        local h = YRG.SafeNumber(hf.GetHeight and hf:GetHeight(), 0)
+        if w >= 14 and h >= 14 then
+            petFeedHappinessBtn:SetAllPoints(hf)
+        else
+            petFeedHappinessBtn:SetSize(math.max(20, w), math.max(20, h))
+            petFeedHappinessBtn:SetPoint("CENTER", hf, "CENTER", 0, 0)
+        end
+        petFeedHappinessBtn:SetFrameStrata(hf:GetFrameStrata() or "LOW")
+        petFeedHappinessBtn:SetFrameLevel((hf:GetFrameLevel() or 1) + 5)
+        SyncSecureButtonClickMode(petFeedHappinessBtn)
+        petFeedHappinessBtn:Show()
+    end
+
+    local function SchedulePostFeedFallback(attemptRef)
+        if not (C_Timer and type(C_Timer.After) == "function") then return end
+        C_Timer.After(0.25, function()
+            if pendingFeedAttempt == attemptRef and not attemptRef.confirmed then
+                if HasPetFeedEffect() then
+                    ConfirmFeedAttemptSuccess(attemptRef)
+                else
+                    pendingFeedAttempt = nil
+                end
+            end
+        end)
+    end
+
+    function PetFeeder.EnsureUI()
+        if not petFeedBtn and CreateFrame and UIParent then
+            local btn = CreateFrame("Button", "YRGPetFeedButton", UIParent, "SecureActionButtonTemplate")
+            btn:SetSize(1, 1)
+            btn:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -100, 100)
+            btn:EnableMouse(false)
+            btn:HookScript("PreClick", function()
+                if pendingFeedAttempt then
+                    local now = (type(GetTime) == "function") and GetTime() or 0
+                    pendingFeedAttempt.clicked = true
+                    pendingFeedAttempt.clickedAt = now
+                    pendingFeedAttempt.expiresAt = now + 1.5
+                end
+            end)
+            btn:HookScript("PostClick", function(self)
+                ClearFeedButtonAttributes(self)
+                if pendingFeedAttempt then
+                    SchedulePostFeedFallback(pendingFeedAttempt)
+                end
+            end)
+            petFeedBtn = btn
+        end
+        SyncSecureButtonClickMode(petFeedBtn)
+
+        if not petFeedHappinessBtn and CreateFrame and UIParent then
+            local hbtn = CreateFrame("Button", "YRGPetFeedHappinessButton", UIParent, "SecureActionButtonTemplate")
+            hbtn:SetSize(22, 22)
+            hbtn:EnableMouse(true)
+            hbtn:Hide()
+
+            hbtn:SetScript("OnEnter", function(self)
+                local hf = FindPetHappinessFrame()
+                if hf and hf.GetScript then
+                    local onEnter = hf:GetScript("OnEnter")
+                    if type(onEnter) == "function" then
+                        pcall(onEnter, hf)
+                    end
+                end
+                if GameTooltip and GameTooltip.IsShown and GameTooltip:IsShown() then
+                    GameTooltip:AddLine(" ")
+                    GameTooltip:AddLine("|cff00ff00Left-Click:|r Feed pet (YRG AutoFeeder)", 1, 1, 1)
+                    GameTooltip:Show()
+                end
+            end)
+            hbtn:SetScript("OnLeave", function()
+                local hf = FindPetHappinessFrame()
+                if hf and hf.GetScript then
+                    local onLeave = hf:GetScript("OnLeave")
+                    if type(onLeave) == "function" then
+                        pcall(onLeave, hf)
+                        return
+                    end
+                end
+                if GameTooltip and GameTooltip.Hide then
+                    GameTooltip:Hide()
+                end
+            end)
+            hbtn:HookScript("PreClick", function(self)
+                local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+                if not modDB or not modDB.enabled or modDB.petFeederEnabled == false then
+                    ClearFeedButtonAttributes(self)
+                    return
+                end
+                PrepareFeedOnButton(self, true, modDB)
+            end)
+            hbtn:HookScript("PostClick", function(self)
+                ClearFeedButtonAttributes(self)
+                if pendingFeedAttempt then
+                    SchedulePostFeedFallback(pendingFeedAttempt)
+                end
+            end)
+
+            petFeedHappinessBtn = hbtn
+        end
+        SyncSecureButtonClickMode(petFeedHappinessBtn)
+        SyncPetHappinessOverlay()
+    end
+
+    local function GetPetFeedMacroBody()
+        return string.format("#showtooltip %s\n%s", GetFeedPetSpellName(), PET_FEED_MACRO_BODY)
+    end
+
+    local function GetPetFeedMacroIcon()
+        if C_Spell and type(C_Spell.GetSpellTexture) == "function" then
+            local ok, tex = pcall(C_Spell.GetSpellTexture, FEED_PET_SPELL_ID)
+            if ok and not IsSecret(tex) and ((type(tex) == "number" and tex > 0) or (type(tex) == "string" and tex ~= "")) then
+                return tex
+            end
+        elseif type(GetSpellTexture) == "function" then
+            local ok, tex = pcall(GetSpellTexture, FEED_PET_SPELL_ID)
+            if ok and not IsSecret(tex) and ((type(tex) == "number" and tex > 0) or (type(tex) == "string" and tex ~= "")) then
+                return tex
+            end
+        end
+        local path = "Interface\\Icons\\Ability_Hunter_BeastTraining"
+        if type(GetFileIDFromPath) == "function" then
+            local ok, fileID = pcall(GetFileIDFromPath, path)
+            if ok and type(fileID) == "number" and fileID > 0 then
+                return fileID
+            end
+        end
+        return "Ability_Hunter_BeastTraining"
+    end
+
+    function PetFeeder.EnsureMacro(forceReset, verbose)
+        if InCombatLockdown and InCombatLockdown() then
+            if verbose then
+                print("|cffffd100YRG Pet Feeder:|r Cannot create or update the " .. PET_FEED_MACRO_NAME .. " macro during combat.")
+            end
+            return false, "combat"
+        end
+        if type(GetMacroIndexByName) ~= "function" or type(CreateMacro) ~= "function" then
+            return false, "unavailable"
+        end
+
+        local body = GetPetFeedMacroBody()
+        local icon = GetPetFeedMacroIcon()
+        local existed, state = EnsureSingleMacro(PET_FEED_MACRO_NAME, body, forceReset, nil, icon)
+        if existed then
+            if state == "exists" and type(GetMacroInfo) == "function" and type(EditMacro) == "function" then
+                local idx = GetMacroIndexByName(PET_FEED_MACRO_NAME)
+                if idx and idx > 0 then
+                    local _, curIcon, curBody = GetMacroInfo(idx)
+                    local poisonIcon = GetOBPrepMacroIcon()
+                    local curIconLow = (type(curIcon) == "string") and curIcon:lower() or ""
+                    if curIcon == poisonIcon
+                        or curIcon == 134400
+                        or curIconLow:find("trade_brewpoison", 1, true)
+                        or curIconLow:find("inv_misc_questionmark", 1, true) then
+                        EditMacro(idx, PET_FEED_MACRO_NAME, icon, curBody or body)
+                    end
+                end
+            end
+            if verbose and state == "reset" then
+                print("|cffffd100YRG Pet Feeder:|r Reset macro |cff00ff00" .. PET_FEED_MACRO_NAME .. "|r.")
+            end
+            return true, state
+        end
+
+        local numAccount, numChar = 0, 0
+        if type(GetNumMacros) == "function" then
+            numAccount, numChar = GetNumMacros()
+            numAccount = YRG.SafeNumber(numAccount, 0)
+            numChar = YRG.SafeNumber(numChar, 0)
+        end
+
+        local perChar = nil
+        if numChar < (MAX_CHARACTER_MACROS or 18) then
+            perChar = true
+        elseif numAccount < (MAX_ACCOUNT_MACROS or 120) then
+            perChar = false
+        else
+            if verbose then
+                print("|cffffd100YRG Pet Feeder:|r Macro slots are full; free a macro slot to generate " .. PET_FEED_MACRO_NAME .. ".")
+            end
+            return false, "full"
+        end
+
+        local createdIdx = CreateMacro(PET_FEED_MACRO_NAME, icon, body, perChar)
+        if createdIdx and createdIdx > 0 then
+            if verbose then
+                print("|cffffd100YRG Pet Feeder:|r Created macro |cff00ff00" .. PET_FEED_MACRO_NAME .. "|r calling /yrg petfeed.")
+            end
+            return true, "created"
+        end
+        return false, "failed"
+    end
+
+    function PetFeeder.RunSlash(args)
+        PetFeeder.EnsureUI()
+        ClearFeedButtonAttributes(petFeedBtn)
+
+        local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+        if not modDB or not modDB.enabled then
+            print("|cffffd100YRG Pet Feeder:|r ClassImprovementsModule is disabled in /yrg settings.")
+            return
+        end
+        if modDB.petFeederEnabled == false then
+            print("|cffffd100YRG Pet Feeder:|r Hunter Pet AutoFeeder is disabled in /yrg settings.")
+            return
+        end
+
+        local cmd = (type(args) == "string") and args:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
+        if cmd == "macro" then
+            PetFeeder.EnsureMacro(true, true)
+            return
+        elseif cmd == "debug" then
+            petFeedDebug = not petFeedDebug
+            print("|cffffd100YRG Pet Feeder:|r Debug " .. (petFeedDebug and "|cff00ff00ON|r" or "|cffff6666OFF|r"))
+            return
+        elseif cmd == "clear" or cmd == "reset" then
+            runtimeBlockedFoods = {}
+            pendingFeedAttempt = nil
+            print("|cffffd100YRG Pet Feeder:|r Cleared runtime rejected-food cache.")
+            return
+        elseif cmd == "status" then
+            local hasPet = UnitExists and UnitExists("pet")
+            if not hasPet then
+                print("|cffffd100YRG Pet Feeder:|r No active pet.")
+                return
+            end
+            local petName = YRG.SafeString(UnitName and UnitName("pet"), "Pet")
+            local petLvl = YRG.SafeNumber(UnitLevel and UnitLevel("pet"), 1)
+            local _, dietList = GetPetDietSet()
+            local happ = (type(GetPetHappiness) == "function") and YRG.SafeOptionalNumber(GetPetHappiness()) or nil
+            local happLabels = { [1] = "Unhappy", [2] = "Content", [3] = "Happy" }
+            local food, _, skipStats = FindBestPetFood(modDB)
+            local nextStr = food and string.format("%s (%s, lvl=%d, q=%d, bag=%d, slot=%d)", food.name, food.diet, food.foodLevel, food.quality, food.bag, food.slot) or "None"
+            print(string.format("|cffffd100YRG Pet Feeder:|r Pet=%s (Lvl %d, %s) | Diet=%s | IgnoreCrafted=%s | Next=%s",
+                tostring(petName), petLvl, tostring(happLabels[happ] or "?"), table.concat(dietList, ", "),
+                tostring(modDB.petFeederIgnoreCrafted ~= false), nextStr))
+            if not food then
+                print(FormatNoFoodMessage(petName, dietList, skipStats))
+            end
+            return
+        end
+
+        local _, liveClass = UnitClass("player")
+        local isHunter = (not IsSecret(liveClass) and liveClass == "HUNTER") or (playerClass == "HUNTER")
+        if isHunter then
+            PetFeeder.EnsureMacro(false, false)
+        end
+
+        local armed = PrepareFeedOnButton(petFeedBtn, false, modDB)
+        if armed and pendingFeedAttempt and C_Timer and type(C_Timer.After) == "function" then
+            local attemptRef = pendingFeedAttempt
+            C_Timer.After(0.05, function()
+                if pendingFeedAttempt == attemptRef and not attemptRef.clicked then
+                    pendingFeedAttempt = nil
+                    ClearFeedButtonAttributes(petFeedBtn)
+                    PrintFeedMsg(string.format("|cffffd100YRG Pet Feeder:|r Selected %s. Use the |cff00ff00%s|r macro (or add /click YRGPetFeedButton LeftButton 1 and LeftButton 0 below /yrg petfeed) so the client can cast Feed Pet.",
+                        tostring(attemptRef.itemLink or attemptRef.itemName), PET_FEED_MACRO_NAME))
+                end
+            end)
+        end
+    end
+
+    function PetFeeder.OnEvent(event, arg1, arg2, arg3)
+        if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
+            local _, liveClass = UnitClass("player")
+            local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+            if (not IsSecret(liveClass) and liveClass == "HUNTER") and modDB and modDB.enabled and modDB.petFeederEnabled ~= false then
+                PetFeeder.EnsureMacro(false, false)
+            end
+            SyncPetHappinessOverlay()
+            if C_Timer and type(C_Timer.After) == "function" then
+                C_Timer.After(0.15, SyncPetHappinessOverlay)
+            end
+        elseif event == "UPDATE_MACROS" then
+            local _, liveClass = UnitClass("player")
+            local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+            if (not IsSecret(liveClass) and liveClass == "HUNTER") and modDB and modDB.enabled and modDB.petFeederEnabled ~= false then
+                PetFeeder.EnsureMacro(false, false)
+            end
+        elseif event == "UNIT_PET" or event == "PET_UI_UPDATE" or event == "UNIT_HAPPINESS"
+            or event == "PLAYER_REGEN_ENABLED" or event == "EDIT_MODE_LAYOUTS_UPDATED" then
+            if event == "UNIT_PET" then
+                runtimeBlockedFoods = {}
+            end
+            SyncPetHappinessOverlay()
+            if event == "UNIT_PET" and C_Timer and type(C_Timer.After) == "function" then
+                C_Timer.After(0.1, SyncPetHappinessOverlay)
+            end
+        elseif event == "UNIT_LEVEL" or event == "PLAYER_LEVEL_UP" then
+            if event == "PLAYER_LEVEL_UP" or arg1 == "pet" then
+                runtimeBlockedFoods = {}
+            end
+        elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+            if pendingFeedAttempt and pendingFeedAttempt.clicked and not pendingFeedAttempt.confirmed then
+                local idNum = YRG.SafeOptionalNumber(arg3)
+                local spName = idNum and GetSafeSpellName(idNum) or nil
+                if idNum == FEED_PET_SPELL_ID
+                    or (spName and pendingFeedAttempt.spellName and spName:lower() == pendingFeedAttempt.spellName:lower())
+                    or (spName and spName:lower() == "feed pet") then
+                    ConfirmFeedAttemptSuccess(pendingFeedAttempt)
+                end
+            end
+        elseif event == "UI_ERROR_MESSAGE" then
+            if pendingFeedAttempt and pendingFeedAttempt.clicked and not pendingFeedAttempt.confirmed then
+                local now = (type(GetTime) == "function") and GetTime() or 0
+                if now > (pendingFeedAttempt.expiresAt or 0) then
+                    pendingFeedAttempt = nil
+                    return
+                end
+                local errType = (type(arg1) == "number" and not IsSecret(arg1)) and arg1 or nil
+                local rawMsg = (type(arg2) == "string" and arg2) or (type(arg1) == "string" and arg1) or nil
+                local msg = YRG.SafeString(rawMsg, nil)
+                if not msg and errType and type(GetGameMessageInfo) == "function" then
+                    local okG, gMsg = pcall(GetGameMessageInfo, errType)
+                    if okG then msg = YRG.SafeString(gMsg, nil) end
+                end
+                if msg then
+                    local low = msg:lower()
+                    if low:find("doesn't like that food", 1, true)
+                        or low:find("does not like that food", 1, true)
+                        or low:find("food's level is too low", 1, true)
+                        or low:find("food level is too low", 1, true)
+                        or low:find("isn't high enough level", 1, true)
+                        or low:find("too low level", 1, true) then
+                        local attempt = pendingFeedAttempt
+                        pendingFeedAttempt = nil
+                        runtimeBlockedFoods[attempt.itemID] = { petSig = attempt.petSig, reason = msg }
+                        PrintFeedMsg(string.format("|cffffd100YRG Pet Feeder:|r Skipping %s (%s).",
+                            tostring(attempt.itemLink or attempt.itemName), (msg:gsub("%.$", ""))))
+                    elseif low:find("combat", 1, true) or low:find("far away", 1, true)
+                        or low:find("mounted", 1, true) or low:find("already", 1, true) then
+                        pendingFeedAttempt = nil
+                    end
+                end
+            end
+        end
+    end
+
+    function PetFeeder.OnEnable()
+        PetFeeder.EnsureUI()
+        local _, liveClass = UnitClass("player")
+        local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+        if (not IsSecret(liveClass) and liveClass == "HUNTER") and modDB and modDB.enabled and modDB.petFeederEnabled ~= false then
+            PetFeeder.EnsureMacro(false, false)
+        end
+    end
+
+    function PetFeeder.OnDisable()
+        pendingFeedAttempt = nil
+        runtimeBlockedFoods = {}
+        ClearFeedButtonAttributes(petFeedBtn)
+        ClearFeedButtonAttributes(petFeedHappinessBtn)
+        if petFeedHappinessBtn and not (InCombatLockdown and InCombatLockdown()) then
+            petFeedHappinessBtn:Hide()
+        end
+    end
+
+    function PetFeeder.SyncOverlay()
+        SyncPetHappinessOverlay()
+    end
+
+    function PetFeeder.SetBlacklistUpdater(fn)
+        petFeederBlacklistUpdater = fn
+    end
+
+    function PetFeeder.RefreshBlacklistSummary()
+        if petFeederBlacklistUpdater then
+            petFeederBlacklistUpdater()
         end
     end
 end
@@ -3017,7 +5109,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
 
     ctx:AddHeader(
         "3. OB Prep (One-Button Prep)",
-        "All-class one-button prep via YRGOBP (/yrgobprep). Checks in order: Poisons (Rogue) -> Weapon Oils / Stones -> Food Buff -> Potions / Elixirs -> Class Self-Buffs (1 action per press)."
+        "All-class one-button prep via YRGOBP (/yrgobprep). Checks in order: Poisons (Rogue) -> Weapon Oils / Stones -> Food Buff -> Potions / Elixirs -> Class Self-Buffs (1 action per press). Automatically warns and skips missing items or buffs blocked by a more powerful active effect."
     )
 
     ctx:AddButton({
@@ -3042,17 +5134,17 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         key = "obPrepMainHand",
         name = "Main Hand Poison (Rogue)",
         tooltip = "Select the poison type or specific poison level to keep active on your Main Hand weapon (Rogues only).",
-        defaultValue = "NONE",
+        defaultValue = "INSTANT_BEST",
         options = POISON_DROPDOWN_OPTIONS,
         get = function()
             local mdb = GetDB()
             local val = mdb and mdb.obPrepMainHand
-            return (val and VALID_POISON_SELECTIONS[val]) and val or "NONE"
+            return (val and VALID_POISON_SELECTIONS[val]) and val or "INSTANT_BEST"
         end,
         set = function(val)
             local mdb = GetDB()
             if mdb then
-                mdb.obPrepMainHand = VALID_POISON_SELECTIONS[val] and val or "NONE"
+                mdb.obPrepMainHand = VALID_POISON_SELECTIONS[val] and val or "INSTANT_BEST"
             end
             EnsureRoguePrepMacro(false, false)
         end,
@@ -3062,17 +5154,17 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         key = "obPrepOffHand",
         name = "Off Hand Poison (Rogue)",
         tooltip = "Select the poison type or specific poison level to keep active on your Off Hand weapon (Rogues only).",
-        defaultValue = "NONE",
+        defaultValue = "INSTANT_BEST",
         options = POISON_DROPDOWN_OPTIONS,
         get = function()
             local mdb = GetDB()
             local val = mdb and mdb.obPrepOffHand
-            return (val and VALID_POISON_SELECTIONS[val]) and val or "NONE"
+            return (val and VALID_POISON_SELECTIONS[val]) and val or "INSTANT_BEST"
         end,
         set = function(val)
             local mdb = GetDB()
             if mdb then
-                mdb.obPrepOffHand = VALID_POISON_SELECTIONS[val] and val or "NONE"
+                mdb.obPrepOffHand = VALID_POISON_SELECTIONS[val] and val or "INSTANT_BEST"
             end
             EnsureRoguePrepMacro(false, false)
         end,
@@ -3081,8 +5173,8 @@ function ClassImprovements:BuildConfigUI(ctx, db)
     ctx:AddCheckbox({
         key = "obPrepUseStones",
         name = "Use Weapon Enhancement Stones (Sharpening / Weight)",
-        tooltip = "Applies the highest-rank Sharpening Stone (bladed/fist weapons) or Weightstone (maces/staves) found in your bags (only Sharpening Stones and Weightstones).",
-        defaultValue = false,
+        tooltip = "Applies the highest-rank Sharpening Stone (bladed weapons) or Weightstone (maces/staves/fist weapons) found in your bags (only Sharpening Stones and Weightstones).",
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.obPrepUseStones) and true or false
@@ -3121,7 +5213,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         min = 0,
         max = 30,
         step = 1,
-        defaultValue = 0,
+        defaultValue = 5,
         format = function(v)
             local n = math.floor((tonumber(v) or 0) + 0.5)
             if n <= 0 then return "0 min (Missing Only)" end
@@ -3132,7 +5224,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         end,
         get = function()
             local mdb = GetDB()
-            return math.max(0, math.min(30, math.floor(YRG.SafeNumber(mdb and mdb.obPrepWeaponOverbuffMinutes, 0) + 0.5)))
+            return math.max(0, math.min(30, math.floor(YRG.SafeNumber(mdb and mdb.obPrepWeaponOverbuffMinutes, 5) + 0.5)))
         end,
         set = function(val)
             local mdb = GetDB()
@@ -3146,7 +5238,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         key = "obPrepUseFoodBuff",
         name = "Use Food Buff",
         tooltip = "Eats your configured Food Buff when Well Fed (or Food) is missing or expiring.",
-        defaultValue = false,
+        defaultValue = true,
         notifies = { "YRG_ClassImprovementsModule_obPrepFoodSummary" },
         get = function()
             local mdb = GetDB()
@@ -3183,7 +5275,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         key = "obPrepUseElixirs",
         name = "Use Potions / Elixirs",
         tooltip = "Drinks missing or expiring Potions / Elixirs from your configured list in order.",
-        defaultValue = false,
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.obPrepUseElixirs) and true or false
@@ -3237,7 +5329,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         min = 0,
         max = 30,
         step = 1,
-        defaultValue = 0,
+        defaultValue = 5,
         format = function(v)
             local n = math.floor((tonumber(v) or 0) + 0.5)
             if n <= 0 then return "0 min (Missing Only)" end
@@ -3248,7 +5340,7 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         end,
         get = function()
             local mdb = GetDB()
-            return math.max(0, math.min(30, math.floor(YRG.SafeNumber(mdb and mdb.obPrepBuffOverbuffMinutes, 0) + 0.5)))
+            return math.max(0, math.min(30, math.floor(YRG.SafeNumber(mdb and mdb.obPrepBuffOverbuffMinutes, 5) + 0.5)))
         end,
         set = function(val)
             local mdb = GetDB()
@@ -3297,6 +5389,99 @@ function ClassImprovements:BuildConfigUI(ctx, db)
         if foodBtnInit and foodBtnInit.data then foodBtnInit.data.name = GetFoodSummaryLabel() end
         if elixirBtnInit and elixirBtnInit.data then elixirBtnInit.data.name = GetElixirSummaryLabel() end
         if overrideBtnInit and overrideBtnInit.data then overrideBtnInit.data.name = GetOverrideSummaryLabel() end
+    end
+
+    ctx:AddHeader(
+        "4. Hunter Pet AutoFeeder",
+        "Automatically picks the lowest-quality usable food matching your pet's diet and level. Trigger via the YRGPF macro (/yrg petfeed) on SteamDeck/Controller or by clicking the Pet Happiness face on PC."
+    )
+
+    ctx:AddCheckbox({
+        key = "petFeederEnabled",
+        name = "Enable Hunter Pet AutoFeeder",
+        tooltip = "Enables clicking the Pet Happiness frame (PC) and the /yrg petfeed macro (Controller/SteamDeck) to feed your Hunter pet automatically.",
+        defaultValue = true,
+        get = function()
+            local mdb = GetDB()
+            return mdb == nil or mdb.petFeederEnabled ~= false
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then
+                mdb.petFeederEnabled = val and true or false
+            end
+            if PetFeeder.SyncOverlay then
+                PetFeeder.SyncOverlay()
+            end
+            if val and PetFeeder.EnsureMacro then
+                local _, liveClass = UnitClass("player")
+                if not IsSecret(liveClass) and liveClass == "HUNTER" then
+                    PetFeeder.EnsureMacro(false, false)
+                end
+            end
+        end,
+    })
+
+    ctx:AddCheckbox({
+        key = "petFeederIgnoreCrafted",
+        name = "Ignore Crafted / Buff Foods",
+        tooltip = "Ignores player-cooked recipes and Well Fed buff foods so they aren't accidentally fed to your pet (keeps raw drops, vendor foods, and conjured bread unless blacklisted).",
+        defaultValue = true,
+        get = function()
+            local mdb = GetDB()
+            return mdb == nil or mdb.petFeederIgnoreCrafted ~= false
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then
+                mdb.petFeederIgnoreCrafted = val and true or false
+            end
+        end,
+    })
+
+    ctx:AddButton({
+        name = "Pet Feed Macro (YRGPF)",
+        buttonText = "Create / Reset Macro",
+        tooltip = "Creates (or resets) the YRGPF macro calling /yrg petfeed for Controller/SteamDeck hotbars.",
+        onClick = function()
+            if PetFeeder.EnsureMacro then
+                PetFeeder.EnsureMacro(true, true)
+            end
+        end,
+    })
+
+    ctx:AddButton({
+        name = "Pet Feeder Status",
+        buttonText = "Check Status",
+        tooltip = "Prints active pet diet, happiness, and the next food item selected by Hunter Pet AutoFeeder.",
+        onClick = function()
+            if PetFeeder.RunSlash then
+                PetFeeder.RunSlash("status")
+            end
+        end,
+    })
+
+    local function GetPetBlacklistSummaryLabel()
+        local mdb = GetDB()
+        local cnt = (mdb and type(mdb.petFeederBlacklist) == "table") and #mdb.petFeederBlacklist or 0
+        return string.format("Pet Food Blacklist (%d avoided)", cnt)
+    end
+
+    local petBlacklistBtnInit = ctx:AddButton({
+        name = GetPetBlacklistSummaryLabel(),
+        buttonText = "Manage Blacklist...",
+        tooltip = "Opens Hunter Pet AutoFeeder: Blacklist to enter, Shift-Click, or drag-and-drop foods to always avoid feeding.",
+        onClick = function()
+            YRG:OpenSettings("PetFeederBlacklist")
+        end,
+    })
+
+    if PetFeeder.SetBlacklistUpdater then
+        PetFeeder.SetBlacklistUpdater(function()
+            if petBlacklistBtnInit and petBlacklistBtnInit.data then
+                petBlacklistBtnInit.data.name = GetPetBlacklistSummaryLabel()
+            end
+        end)
     end
 end
 
@@ -3606,6 +5791,189 @@ function ClassImprovements:BuildExtraCategories(mainCategory, db)
     local obCat = Settings.RegisterCanvasLayoutSubcategory(mainCategory, panel, "OB Prep: Consumables & Buffs")
     Settings.RegisterAddOnCategory(obCat)
     YRG:RegisterExtraCategory("OBPrepConfig", obCat)
+
+    -- 2. HUNTER PET AUTOFEEDER: FOOD BLACKLIST SUBCATEGORY
+    local petPanel = CreateFrame("Frame", "YRGPetFeederBlacklistPanel", UIParent)
+    petPanel.name = "Hunter Pet AutoFeeder: Blacklist"
+    petPanel:Hide()
+
+    local petBuilt = false
+    local petRefreshFunc = nil
+
+    local function BuildPetBlacklistCanvas()
+        if petBuilt then return end
+        petBuilt = true
+
+        local title = petPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightHuge")
+        title:SetPoint("TOPLEFT", petPanel, "TOPLEFT", 18, -16)
+        title:SetText("Hunter Pet AutoFeeder: Food Blacklist")
+
+        local subtitle = petPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+        subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -6)
+        subtitle:SetPoint("TOPRIGHT", petPanel, "TOPRIGHT", -24, -44)
+        subtitle:SetJustifyH("LEFT")
+        subtitle:SetText("Foods added here will NEVER be fed to your pet. Supports typing item names, Shift-Clicking bag items, or dragging items into the box.")
+
+        local inputLabel = petPanel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+        inputLabel:SetPoint("TOPLEFT", petPanel, "TOPLEFT", 18, -78)
+        inputLabel:SetText("Add Food Item to Always Avoid:")
+
+        local blInput = CreateFrame("EditBox", "YRGPetFeederBlacklistInput", petPanel, "InputBoxTemplate")
+        blInput:SetSize(280, 24)
+        blInput:SetPoint("TOPLEFT", inputLabel, "BOTTOMLEFT", 4, -6)
+        blInput:SetAutoFocus(false)
+
+        local blAddBtn = CreateFrame("Button", nil, petPanel, "UIPanelButtonTemplate")
+        blAddBtn:SetSize(84, 24)
+        blAddBtn:SetPoint("LEFT", blInput, "RIGHT", 8, 0)
+        blAddBtn:SetText("Add Item")
+
+        local blClearAllBtn = CreateFrame("Button", nil, petPanel, "UIPanelButtonTemplate")
+        blClearAllBtn:SetSize(84, 24)
+        blClearAllBtn:SetPoint("LEFT", blAddBtn, "RIGHT", 6, 0)
+        blClearAllBtn:SetText("Clear All")
+
+        local listBox = CreateFrame("Frame", nil, petPanel, "BackdropTemplate")
+        listBox:SetPoint("TOPLEFT", blInput, "BOTTOMLEFT", -4, -12)
+        listBox:SetPoint("BOTTOMRIGHT", petPanel, "BOTTOMRIGHT", -34, 18)
+        if listBox.SetBackdrop then
+            listBox:SetBackdrop({
+                bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile = true, tileSize = 16, edgeSize = 12,
+                insets = { left = 3, right = 3, top = 3, bottom = 3 }
+            })
+            listBox:SetBackdropColor(0.05, 0.05, 0.06, 0.75)
+            listBox:SetBackdropBorderColor(0.45, 0.38, 0.24, 0.75)
+        end
+
+        local scrollFrame = CreateFrame("ScrollFrame", "YRGPetFeederBlacklistScroll", listBox, "UIPanelScrollFrameTemplate")
+        scrollFrame:SetPoint("TOPLEFT", listBox, "TOPLEFT", 6, -6)
+        scrollFrame:SetPoint("BOTTOMRIGHT", listBox, "BOTTOMRIGHT", -26, 6)
+
+        local scrollChild = CreateFrame("Frame", nil, scrollFrame)
+        scrollChild:SetSize(460, 200)
+        scrollFrame:SetScrollChild(scrollChild)
+
+        local rows = {}
+        petRefreshFunc = function()
+            local mdb = YRG:GetModuleDB("ClassImprovementsModule")
+            if not mdb then return end
+            if type(mdb.petFeederBlacklist) ~= "table" then mdb.petFeederBlacklist = {} end
+
+            for _, r in ipairs(rows) do
+                r:Hide()
+            end
+
+            local list = mdb.petFeederBlacklist
+            local rowH = 26
+            scrollChild:SetWidth(math.max(380, scrollFrame:GetWidth() or 420))
+            scrollChild:SetHeight(math.max(1, #list * rowH))
+
+            for idx, itemName in ipairs(list) do
+                local row = rows[idx]
+                if not row then
+                    row = CreateFrame("Frame", nil, scrollChild)
+                    row:SetHeight(rowH)
+                    local bg = row:CreateTexture(nil, "BACKGROUND")
+                    bg:SetAllPoints()
+                    row._bg = bg
+
+                    local txt = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+                    txt:SetPoint("LEFT", row, "LEFT", 8, 0)
+                    txt:SetPoint("RIGHT", row, "RIGHT", -80, 0)
+                    txt:SetJustifyH("LEFT")
+                    row._txt = txt
+
+                    local rmBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+                    rmBtn:SetSize(64, 20)
+                    rmBtn:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+                    rmBtn:SetText("Remove")
+                    row._rmBtn = rmBtn
+
+                    rows[idx] = row
+                end
+
+                row:ClearAllPoints()
+                row:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, -((idx - 1) * rowH))
+                row:SetPoint("TOPRIGHT", scrollChild, "TOPRIGHT", 0, -((idx - 1) * rowH))
+                row._bg:SetColorTexture(0.14, 0.14, 0.17, (idx % 2 == 0) and 0.45 or 0.22)
+                row._txt:SetText(string.format("%d. %s", idx, tostring(itemName)))
+
+                row._rmBtn:SetScript("OnClick", function()
+                    table.remove(list, idx)
+                    petRefreshFunc()
+                end)
+
+                row:Show()
+            end
+
+            if PetFeeder.RefreshBlacklistSummary then
+                PetFeeder.RefreshBlacklistSummary()
+            end
+        end
+
+        local function AddBlacklistFromInput(nameOverride)
+            local clean = NormalizePrepItemName(nameOverride or blInput:GetText() or "")
+            if not clean then return end
+            local mdb = YRG:GetModuleDB("ClassImprovementsModule")
+            if mdb then
+                if type(mdb.petFeederBlacklist) ~= "table" then mdb.petFeederBlacklist = {} end
+                local exists = false
+                local lowClean = clean:lower()
+                for _, existing in ipairs(mdb.petFeederBlacklist) do
+                    if type(existing) == "string" and existing:lower() == lowClean then
+                        exists = true
+                        break
+                    end
+                end
+                if not exists then
+                    table.insert(mdb.petFeederBlacklist, clean)
+                end
+            end
+            blInput:SetText("")
+            blInput:ClearFocus()
+            petRefreshFunc()
+        end
+
+        blAddBtn:SetScript("OnClick", function() AddBlacklistFromInput() end)
+        blInput:SetScript("OnEnterPressed", function() AddBlacklistFromInput() end)
+        blClearAllBtn:SetScript("OnClick", function()
+            local mdb = YRG:GetModuleDB("ClassImprovementsModule")
+            if mdb then mdb.petFeederBlacklist = {} end
+            petRefreshFunc()
+        end)
+        blInput:SetScript("OnReceiveDrag", function()
+            local infoType, itemID, itemLink = GetCursorInfo()
+            if infoType == "item" then
+                local name = NormalizePrepItemName(itemLink) or select(1, SafeGetItemStatsForPrep(itemID, itemLink))
+                if name then
+                    ClearCursor()
+                    AddBlacklistFromInput(name)
+                end
+            end
+        end)
+
+        if type(ChatEdit_InsertLink) == "function" then
+            hooksecurefunc("ChatEdit_InsertLink", function(text)
+                if not text then return end
+                local name = NormalizePrepItemName(text)
+                if not name then return end
+                if blInput:IsVisible() and blInput:HasFocus() then
+                    blInput:SetText(name)
+                end
+            end)
+        end
+    end
+
+    petPanel:SetScript("OnShow", function()
+        BuildPetBlacklistCanvas()
+        if petRefreshFunc then petRefreshFunc() end
+    end)
+
+    local petCat = Settings.RegisterCanvasLayoutSubcategory(mainCategory, petPanel, "Hunter Pet AutoFeeder: Blacklist")
+    Settings.RegisterAddOnCategory(petCat)
+    YRG:RegisterExtraCategory("PetFeederBlacklist", petCat)
 end
 
 SLASH_YRGOBPREP1 = "/yrgobprep"
@@ -3616,6 +5984,21 @@ end
 SLASH_YRGROGUEPREP1 = "/yrgrogueprep"
 SlashCmdList["YRGROGUEPREP"] = function(msg)
     RunOBPrepSlash(msg)
+end
+
+if type(YRG.RegisterSlashSubcommand) == "function" then
+    YRG:RegisterSlashSubcommand("petfeed", function(msg)
+        if PetFeeder.RunSlash then
+            PetFeeder.RunSlash(msg)
+        end
+    end)
+end
+
+SLASH_YRGPETFEED1 = "/yrgpetfeed"
+SlashCmdList["YRGPETFEED"] = function(msg)
+    if PetFeeder.RunSlash then
+        PetFeeder.RunSlash(msg)
+    end
 end
 
 SLASH_YRGCAST1 = "/yrgcast"

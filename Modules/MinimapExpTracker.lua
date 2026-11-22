@@ -68,15 +68,15 @@ local ExpTracker = {
         colorScheme = "blue",
         showRestedBar = true,
         hideAtMaxLevel = false,
-        hideDefaultExpBar = false,
+        hideDefaultExpBar = true,
         alwaysShowLocalTime = true,
         hideAddonButtons = true,
         centerMinimapHeader = true,
-        matchPlacardWidth = false,
+        matchPlacardWidth = true,
 
         -- Bottom-Fixed EXP Percentage Placard
-        showDecimals = false,
-        expTextSize = 14,
+        showDecimals = true,
+        expTextSize = 16,
     }
 }
 
@@ -1019,7 +1019,7 @@ local function GetTargetPlacardScreenWidth(db)
     end
     local infoDB = YRG:GetModuleDB("DynamicInfoPlacard")
     local mapScale = SafeRegionScale(Minimap, 1)
-    local fallbackW = YRG.SafeNumber(infoDB and infoDB.infoPlacardWidth, YRG.SafeNumber(db and db.infoPlacardWidth, 200))
+    local fallbackW = YRG.SafeNumber(infoDB and infoDB.infoPlacardWidth, YRG.SafeNumber(db and db.infoPlacardWidth, 254))
     if mapScale > 0 and fallbackW > 0 then
         return fallbackW * mapScale, mapScale
     end
@@ -1267,6 +1267,112 @@ local function ApplyMinimapHeaderCenter(db)
     headerCenteringGuard = false
 end
 
+local WELL_RESTED_SPELL_ID = 1225478
+local LEGACY_TREE_SYSTEM_ID = 45
+local RESTED_BASE_CAP_RATIO = 1.5           -- 150% of current level
+local RESTED_BASE_RATE_PER_HOUR = 0.05 / 8  -- 5% of a level per 8 hours while resting (0.625%/hr)
+local WELL_RESTED_PER_RANK_BONUS = 0.04     -- +4% max cap & recovery rate per Legacy rank
+
+local function IsMatchingWellRestedName(rawName)
+    local clean = YRG.SafeString(rawName, nil)
+    if not clean then return false end
+    local low = clean:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    return low == "well rested" or low == "well-rested"
+end
+
+local function IsWellRestedDefinition(defInfo)
+    if type(defInfo) ~= "table" then return false end
+    local defSpellID = YRG.SafeOptionalNumber(defInfo.spellID)
+    if defSpellID == WELL_RESTED_SPELL_ID then
+        return true
+    end
+    if IsMatchingWellRestedName(defInfo.overrideName) then
+        return true
+    end
+    if defSpellID then
+        local spellName = nil
+        if C_Spell and type(C_Spell.GetSpellName) == "function" then
+            local okName, sName = pcall(C_Spell.GetSpellName, defSpellID)
+            spellName = okName and sName or nil
+        elseif type(GetSpellInfo) == "function" then
+            local okName, sName = pcall(GetSpellInfo, defSpellID)
+            spellName = okName and sName or nil
+        end
+        if IsMatchingWellRestedName(spellName) then
+            return true
+        end
+    end
+    return false
+end
+
+local function GetWellRestedLegacyRanks()
+    if not C_Traits or type(C_Traits.GetConfigIDBySystemID) ~= "function" then
+        return 0
+    end
+    local okCfg, configID = pcall(C_Traits.GetConfigIDBySystemID, LEGACY_TREE_SYSTEM_ID)
+    configID = okCfg and YRG.SafeOptionalNumber(configID) or nil
+    if not configID then
+        return 0
+    end
+
+    local okInfo, configInfo = pcall(C_Traits.GetConfigInfo, configID)
+    if not okInfo or type(configInfo) ~= "table" or type(configInfo.treeIDs) ~= "table" then
+        return 0
+    end
+
+    for _, treeID in ipairs(configInfo.treeIDs) do
+        local okNodes, nodes = pcall(C_Traits.GetTreeNodes, treeID)
+        if okNodes and type(nodes) == "table" then
+            for _, nodeID in ipairs(nodes) do
+                local okNode, nodeInfo = pcall(C_Traits.GetNodeInfo, configID, nodeID)
+                if okNode and type(nodeInfo) == "table" then
+                    local entryList = (type(nodeInfo.entryIDs) == "table" and #nodeInfo.entryIDs > 0) and nodeInfo.entryIDs or nil
+                    if not entryList and type(nodeInfo.activeEntry) == "table" and nodeInfo.activeEntry.entryID then
+                        entryList = { nodeInfo.activeEntry.entryID }
+                    end
+                    if entryList then
+                        for _, entryID in ipairs(entryList) do
+                            local okEntry, entryInfo = pcall(C_Traits.GetEntryInfo, configID, entryID)
+                            if okEntry and type(entryInfo) == "table" and entryInfo.definitionID then
+                                local okDef, defInfo = pcall(C_Traits.GetDefinitionInfo, entryInfo.definitionID)
+                                if okDef and IsWellRestedDefinition(defInfo) then
+                                    local rank = YRG.SafeOptionalNumber(nodeInfo.currentRank)
+                                    if rank == nil then
+                                        rank = YRG.SafeOptionalNumber(nodeInfo.activeRank) or YRG.SafeOptionalNumber(nodeInfo.ranksPurchased) or 0
+                                    end
+                                    return math.max(0, rank)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return 0
+end
+
+local function FormatRestedDuration(seconds)
+    if seconds == nil or seconds <= 0 then
+        return "Full"
+    end
+    if seconds < 60 then
+        return string.format("%ds", math.max(1, math.ceil(seconds)))
+    end
+    local totalMins = math.max(1, math.floor((seconds / 60) + 0.5))
+    local days = math.floor(totalMins / 1440)
+    local remMins = totalMins % 1440
+    local hours = math.floor(remMins / 60)
+    local mins = remMins % 60
+    if days > 0 then
+        return string.format("%dd %dh", days, hours)
+    elseif hours > 0 then
+        return string.format("%dh %dm", hours, mins)
+    end
+    return string.format("%dm", mins)
+end
+
 local function ShowExpTooltip(ownerFrame)
     local curXP = YRG.SafeNumber(UnitXP("player"), 0)
     local maxXP = math.max(YRG.SafeNumber(UnitXPMax("player"), 1), 1)
@@ -1275,12 +1381,34 @@ local function ShowExpTooltip(ownerFrame)
     local pct = (curXP / maxXP) * 100
     local restedPct = (restedXP / maxXP) * 100
 
+    local level = YRG.SafeNumber(UnitLevel("player"), 1)
+    local maxLevel = (GetMaxPlayerLevel and YRG.SafeNumber(GetMaxPlayerLevel(), 60)) or 60
+    local wellRestedRanks = GetWellRestedLegacyRanks()
+    local wellRestedMult = 1 + (WELL_RESTED_PER_RANK_BONUS * wellRestedRanks)
+    local maxRestedCapPct = (RESTED_BASE_CAP_RATIO * 100) * wellRestedMult
+    local maxRestedXP = maxXP * RESTED_BASE_CAP_RATIO * wellRestedMult
+    local remRestedXP = math.max(0, maxRestedXP - restedXP)
+    local remRestedPct = math.max(0, maxRestedCapPct - restedPct)
+    local restedXPPerSec = (maxXP * RESTED_BASE_RATE_PER_HOUR * wellRestedMult) / 3600
+    local estSecondsToFull = (restedXPPerSec > 0) and (remRestedXP / restedXPPerSec) or 0
+
     GameTooltip:SetOwner(ownerFrame, "ANCHOR_BOTTOM")
     GameTooltip:SetText("YRG Minimap EXP Tracker", 1.0, 0.82, 0.0)
     GameTooltip:AddDoubleLine("Current XP:", string.format("%d / %d (%.1f%%)", curXP, maxXP, pct), 0.9, 0.9, 0.9, 1, 1, 1)
     GameTooltip:AddDoubleLine("Remaining XP:", tostring(remXP), 0.9, 0.9, 0.9, 1, 0.82, 0)
     if restedXP > 0 then
         GameTooltip:AddDoubleLine("Rested Bonus:", string.format("%d (%.1f%%)", restedXP, restedPct), 0.4, 0.75, 1.0, 0.4, 0.75, 1.0)
+    else
+        GameTooltip:AddDoubleLine("Rested Bonus:", "None (0%)", 0.4, 0.75, 1.0, 0.65, 0.65, 0.65)
+    end
+    if level < maxLevel or restedXP > 0 then
+        local restedLabel = wellRestedRanks > 0
+            and string.format("Est. Time to Full (Well Rested %d):", wellRestedRanks)
+            or "Est. Time to Full:"
+        local restedRight = remRestedXP <= 0
+            and "Full (0.0% remaining)"
+            or string.format("%s (%.1f%% remaining)", FormatRestedDuration(estSecondsToFull), remRestedPct)
+        GameTooltip:AddDoubleLine(restedLabel, restedRight, 0.78, 0.45, 1.0, 0.78, 0.45, 1.0)
     end
 
     if type(MUI.AppendKillPaceTooltipLines) == "function" then
@@ -1325,6 +1453,51 @@ function MUI.GetExpAnchorInfo()
     }
 end
 
+local STRATA_RANK = {
+    BACKGROUND = 1,
+    LOW = 2,
+    MEDIUM = 3,
+    HIGH = 4,
+    DIALOG = 5,
+    FULLSCREEN = 6,
+    FULLSCREEN_DIALOG = 7,
+    TOOLTIP = 8,
+}
+
+local function GetMinimapOverlayBaseLayer()
+    local bestStrata = "LOW"
+    local bestRank = 0
+    local maxLvl = 1
+    for _, ref in ipairs({
+        Minimap or false,
+        MinimapCluster or false,
+        (MinimapCluster and MinimapCluster.BorderTop) or false,
+        (MinimapCluster and MinimapCluster.ZoneTextButton) or false,
+    }) do
+        if ref then
+            local st = ref.GetFrameStrata and ref:GetFrameStrata()
+            local rk = st and STRATA_RANK[st] or 0
+            if rk > bestRank then
+                bestRank = rk
+                bestStrata = st
+            end
+            local lvl = ref.GetFrameLevel and YRG.SafeNumber(ref:GetFrameLevel(), 0) or 0
+            if lvl > maxLvl then
+                maxLvl = lvl
+            end
+        end
+    end
+    return bestStrata, maxLvl
+end
+MUI.GetMinimapOverlayBaseLayer = GetMinimapOverlayBaseLayer
+
+local function ApplyExpHitBoxLayering(hitFrame)
+    if not hitFrame then return end
+    local bestStrata, maxLvl = GetMinimapOverlayBaseLayer()
+    hitFrame:SetFrameStrata(bestStrata)
+    hitFrame:SetFrameLevel(maxLvl + 2)
+end
+
 function ExpTracker:EnsureFrames()
     if self.container then return end
 
@@ -1361,7 +1534,7 @@ function ExpTracker:EnsureFrames()
     ringBorder:SetTexture(TEX_RING)
     self.ringBorder = ringBorder
 
-    -- Bottom-Fixed EXP Percentage Placard (Minimap Header 9-Slice)
+    -- Bottom-Fixed EXP Percentage Placard tucked cleanly between Minimap & EXP Ring (BACKGROUND strata)
     local expFrame = CreateFrame("Frame", "YRGMinimapExpPlacard", borderFrame, "BackdropTemplate")
     expFrame:SetFrameLevel(borderFrame:GetFrameLevel() + 4)
     expFrame:EnableMouse(true)
@@ -1370,6 +1543,18 @@ function ExpTracker:EnsureFrames()
     expFrame:SetScript("OnMouseUp", OnExpPlacardMouseUp)
     self.expFrame = expFrame
     MUI.expFrame = expFrame
+
+    -- Invisible interactive hitbox over the exposed badge area below Minimap so hover/clicks
+    -- trigger tooltips cleanly without pulling the visual EXP badge above Minimap borders.
+    local expHitFrame = CreateFrame("Frame", "YRGMinimapExpHitBox", expFrame)
+    ApplyExpHitBoxLayering(expHitFrame)
+    expHitFrame:EnableMouse(true)
+    if type(expHitFrame.SetMouseMotionEnabled) == "function" then expHitFrame:SetMouseMotionEnabled(true) end
+    if type(expHitFrame.SetMouseClickEnabled) == "function" then expHitFrame:SetMouseClickEnabled(true) end
+    expHitFrame:SetScript("OnEnter", function() ShowExpTooltip(expFrame) end)
+    expHitFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    expHitFrame:SetScript("OnMouseUp", function(_, btn) OnExpPlacardMouseUp(expFrame, btn) end)
+    self.expHitFrame = expHitFrame
 
     local pctText = expFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     pctText:SetPoint("CENTER", expFrame, "CENTER", 0, 0)
@@ -1614,6 +1799,9 @@ function MUI.SyncHeaderAndEditMode()
     local db = YRG:GetModuleDB("MinimapExpTracker")
     ApplyMinimapHeaderWidth(db)
     ApplyMinimapHeaderCenter(db)
+    if ExpTracker.expHitFrame then
+        ApplyExpHitBoxLayering(ExpTracker.expHitFrame)
+    end
     UpdateEditModeMinimapSelection()
 end
 
@@ -1632,11 +1820,12 @@ function ExpTracker:LayoutPlacardsImpl()
     ApplyLocalTimeSetting(db)
 
     local mapWidth = Minimap:GetWidth() or 140
+    local mapHeight = Minimap:GetHeight() or mapWidth
     local baseRingSize = mapWidth * (512 / 368)
     local ringBottomRimY = baseRingSize * (56 / 512)
 
     -- Bottom-Fixed EXP Percentage Placard (always visible when ring is active)
-    local expTSize = db.expTextSize or 14
+    local expTSize = db.expTextSize or 16
     local expTopPad = CalculateDynamicExpTopPadding(expTSize)
     self.pctText:SetFont(STANDARD_TEXT_FONT, expTSize, "OUTLINE")
 
@@ -1651,6 +1840,17 @@ function ExpTracker:LayoutPlacardsImpl()
     self.pctText:ClearAllPoints()
     self.pctText:SetPoint("TOP", self.expFrame, "TOP", 0, -(5 + expTopPad))
     self.expFrame:Show()
+
+    if self.expHitFrame then
+        ApplyExpHitBoxLayering(self.expHitFrame)
+        local expCenterRelMapBottom = ringBottomRimY - ((baseRingSize - mapHeight) * 0.5)
+        local visibleH = math.min(expH, math.max(12, -(expCenterRelMapBottom - (expH * 0.5))))
+        self.expHitFrame:ClearAllPoints()
+        self.expHitFrame:SetPoint("BOTTOMLEFT", self.expFrame, "BOTTOMLEFT", 0, 0)
+        self.expHitFrame:SetPoint("BOTTOMRIGHT", self.expFrame, "BOTTOMRIGHT", 0, 0)
+        self.expHitFrame:SetHeight(visibleH)
+        self.expHitFrame:Show()
+    end
 end
 
 function ExpTracker:LayoutPlacards()
@@ -1997,7 +2197,7 @@ function ExpTracker:BuildConfigUI(ctx, db)
         key = "hideDefaultExpBar",
         name = "Hide Default Blizzard EXP Bar",
         tooltip = "Hides the standard MainMenuExpBar while the Minimap EXP Tracker is enabled.",
-        defaultValue = false,
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.hideDefaultExpBar) and true or false
@@ -2156,7 +2356,7 @@ function ExpTracker:BuildConfigUI(ctx, db)
         key = "showDecimals",
         name = "Show Decimal Percentage (e.g. 40.5%)",
         tooltip = "Toggles between whole percentages (40%) and one decimal place (40.5%).",
-        defaultValue = false,
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.showDecimals) and true or false
@@ -2172,11 +2372,11 @@ function ExpTracker:BuildConfigUI(ctx, db)
         key = "expTextSize",
         name = "EXP Badge Font Size",
         tooltip = "Font size in points for the bottom-fixed EXP percentage badge.",
-        min = 8, max = 20, step = 1, defaultValue = 14,
+        min = 8, max = 20, step = 1, defaultValue = 16,
         format = function(v) return string.format("%d px", v) end,
         get = function()
             local mdb = GetDB()
-            return (mdb and mdb.expTextSize) or 14
+            return (mdb and mdb.expTextSize) or 16
         end,
         set = function(val)
             local mdb = GetDB()

@@ -43,7 +43,7 @@ end
 
 local BetterBags = {
     name = "BetterBagsModule",
-    description = "Bag automation (Auto-Sort, Auto-Repair, Auto-Sell Greys), Controller Mode separate bag strip, and Non-Controller Reagent Bag merge.",
+    description = "Bag automation (Auto-Sort, Auto-Open Clams, Auto-Repair, Auto-Sell Greys), Controller Mode separate bag strip, and Non-Controller Reagent Bag merge.",
     defaultEnabled = true,
     defaults = {
         enabled = true,
@@ -53,10 +53,11 @@ local BetterBags = {
         bagPinAlignment = "RIGHT", -- "LEFT", "CENTER", "RIGHT"
         includeReagentBagInCombined = true,
         reagentBagTintPurple = true,
-        autoSortOnOpen = false,
-        autoRepair = false,
-        autoRepairMaxSilver = 0, -- 0 = Unlimited, stored in silver (1..1000 = 1s..10g)
-        autoSellGreys = false,
+        autoSortOnOpen = true,
+        autoOpenClams = true,
+        autoRepair = true,
+        autoRepairMaxSilver = 25, -- 0 = Unlimited, stored in silver (1..1000 = 1s..10g)
+        autoSellGreys = true,
         sellExclusionList = CopyTable(DEFAULT_EXCLUSIONS),
     }
 }
@@ -1167,6 +1168,227 @@ local function HandleMerchantShow()
     end
 end
 
+-- =========================================================================
+-- AUTO-OPEN CLAMS ON LOOT
+-- =========================================================================
+local CLAM_ITEM_IDS = {
+    [5523]  = true, -- Small Barnacled Clam
+    [5524]  = true, -- Thick-shelled Clam
+    [7973]  = true, -- Big-mouth Clam
+    [15874] = true, -- Soft-shelled Clam
+    [24476] = true, -- Jaggal Clam
+}
+
+local clamOpenTimer = nil
+local isLootingWindowOpen = false
+local isOpeningClamNow = false
+local clamBlockedByClient = false
+local clamLastAttempt = nil
+local clamFullBagWarnAt = 0
+
+local function HasPlainCastActive()
+    if type(UnitCastingInfo) == "function" then
+        local ok, sp = pcall(UnitCastingInfo, "player")
+        if ok and not YRG.IsSecret(sp) and sp ~= nil then
+            return true
+        end
+    end
+    if type(UnitChannelInfo) == "function" then
+        local ok, sp = pcall(UnitChannelInfo, "player")
+        if ok and not YRG.IsSecret(sp) and sp ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+local function IsClamOpeningBlockedByUI()
+    if InCombatLockdown and InCombatLockdown() then return true end
+    if UnitIsDeadOrGhost and UnitIsDeadOrGhost("player") then return true end
+    if HasPlainCastActive() then return true end
+    if CursorHasItem and CursorHasItem() then return true end
+    if isLootingWindowOpen or (LootFrame and LootFrame:IsShown()) then return true end
+    for _, frame in ipairs({
+        MerchantFrame,
+        BankFrame,
+        MailFrame,
+        SendMailFrame,
+        TradeFrame,
+        AuctionFrame,
+        AuctionHouseFrame,
+        GuildBankFrame,
+    }) do
+        if frame and type(frame.IsShown) == "function" and frame:IsShown() then
+            return true
+        end
+    end
+    return false
+end
+
+local function GetGeneralFreeBagSlots()
+    local total = 0
+    local startBag = BACKPACK_CONTAINER or 0
+    local endBag = NUM_BAG_SLOTS or 4
+    for bag = startBag, endBag do
+        local free, family = 0, 0
+        if C_Container and type(C_Container.GetContainerNumFreeSlots) == "function" then
+            free, family = C_Container.GetContainerNumFreeSlots(bag)
+        elseif type(GetContainerNumFreeSlots) == "function" then
+            free, family = GetContainerNumFreeSlots(bag)
+        end
+        free = YRG.SafeNumber(free, 0)
+        family = YRG.SafeNumber(family, 0)
+        if family == 0 and free > 0 then
+            total = total + free
+        end
+    end
+    return total
+end
+
+local function IsClamContainerItem(itemID, itemLink, hasLoot, isLocked)
+    if not itemID or isLocked then
+        return false
+    end
+    if CLAM_ITEM_IDS[itemID] then
+        return true
+    end
+    if not hasLoot then
+        return false
+    end
+    local itemName, _, _, _, _, _, _, _, _, _, _, classID = SafeGetItemInfo(itemLink or itemID)
+    itemName = YRG.SafeString(itemName, nil) or NormalizeItemName(itemLink)
+    if not itemName then
+        return false
+    end
+    local questClass = (Enum and Enum.ItemClass and Enum.ItemClass.Questitem) or 12
+    classID = YRG.SafeOptionalNumber(classID)
+    if classID ~= nil and classID == questClass then
+        return false
+    end
+    local low = itemName:lower()
+    if not low:find("clam", 1, true) then
+        return false
+    end
+    for _, nonContainer in ipairs({ "meat", "chowder", "bait", "cake", "juice", "soup", "boiled", "deviled", "stew", "pearl" }) do
+        if low:find(nonContainer, 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
+local ScheduleClamOpen
+
+local function TryAutoOpenClams()
+    if clamBlockedByClient then return end
+    local db = YRG:GetModuleDB("BetterBagsModule")
+    if not db or not db.enabled or db.autoOpenClams == false then
+        return
+    end
+    if IsClamOpeningBlockedByUI() then
+        return
+    end
+
+    local now = (type(GetTime) == "function") and GetTime() or 0
+    local freeGeneral = GetGeneralFreeBagSlots()
+    local startBag = BACKPACK_CONTAINER or 0
+    local endBag = NUM_BAG_SLOTS or 4
+    local sawClamWithoutSpace = false
+
+    for bag = startBag, endBag do
+        local numSlots = (C_Container and C_Container.GetContainerNumSlots and C_Container.GetContainerNumSlots(bag))
+            or (GetContainerNumSlots and GetContainerNumSlots(bag)) or 0
+        numSlots = YRG.SafeNumber(numSlots, 0)
+        for slot = 1, numSlots do
+            local itemID, itemLink, stackCount, isLocked, hasLoot
+            if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+                local info = C_Container.GetContainerItemInfo(bag, slot)
+                if type(info) == "table" then
+                    itemID = YRG.SafeOptionalNumber(info.itemID)
+                    itemLink = info.hyperlink
+                    stackCount = YRG.SafeNumber(info.stackCount, 1)
+                    isLocked = info.isLocked and true or false
+                    hasLoot = info.hasLoot and true or false
+                end
+            elseif type(GetContainerItemInfo) == "function" then
+                local _, count, locked, _, _, lootable, link, _, _, id = GetContainerItemInfo(bag, slot)
+                itemID = YRG.SafeOptionalNumber(id)
+                itemLink = link
+                stackCount = YRG.SafeNumber(count, 1)
+                isLocked = locked and true or false
+                hasLoot = lootable and true or false
+            end
+
+            if IsClamContainerItem(itemID, itemLink, hasLoot, isLocked) then
+                local neededFree = (stackCount > 1) and 2 or 1
+                if freeGeneral < neededFree then
+                    sawClamWithoutSpace = true
+                else
+                    local retryBlocked = false
+                    if clamLastAttempt
+                        and clamLastAttempt.bag == bag
+                        and clamLastAttempt.slot == slot
+                        and clamLastAttempt.itemID == itemID
+                        and (now - clamLastAttempt.at) < 10
+                        and clamLastAttempt.count >= 2 then
+                        retryBlocked = true
+                    end
+
+                    if not retryBlocked then
+                        if clamLastAttempt and clamLastAttempt.bag == bag and clamLastAttempt.slot == slot and clamLastAttempt.itemID == itemID and (now - clamLastAttempt.at) < 10 then
+                            clamLastAttempt.count = clamLastAttempt.count + 1
+                            clamLastAttempt.at = now
+                        else
+                            clamLastAttempt = { bag = bag, slot = slot, itemID = itemID, at = now, count = 1 }
+                        end
+
+                        isOpeningClamNow = true
+                        if C_Container and type(C_Container.UseContainerItem) == "function" then
+                            pcall(C_Container.UseContainerItem, bag, slot)
+                        elseif type(UseContainerItem) == "function" then
+                            pcall(UseContainerItem, bag, slot)
+                        end
+                        isOpeningClamNow = false
+
+                        if not clamBlockedByClient then
+                            ScheduleClamOpen(0.28)
+                        end
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    if sawClamWithoutSpace and (now - clamFullBagWarnAt) >= 15 then
+        clamFullBagWarnAt = now
+        if DEFAULT_CHAT_FRAME then
+            DEFAULT_CHAT_FRAME:AddMessage("|cffffd100YRG BetterBags:|r Need at least 1 free bag slot to auto-open clams.")
+        end
+    end
+end
+
+ScheduleClamOpen = function(delaySec)
+    if clamBlockedByClient then return end
+    local db = YRG:GetModuleDB("BetterBagsModule")
+    if not db or not db.enabled or db.autoOpenClams == false then
+        return
+    end
+    if clamOpenTimer and type(clamOpenTimer.Cancel) == "function" then
+        clamOpenTimer:Cancel()
+    end
+    if C_Timer and type(C_Timer.NewTimer) == "function" then
+        clamOpenTimer = C_Timer.NewTimer(delaySec or 0.15, function()
+            clamOpenTimer = nil
+            TryAutoOpenClams()
+        end)
+    elseif C_Timer and type(C_Timer.After) == "function" then
+        C_Timer.After(delaySec or 0.15, TryAutoOpenClams)
+    else
+        TryAutoOpenClams()
+    end
+end
+
 local InstallControllerStripHooks
 
 local function RefreshBlizzardBagLayout()
@@ -1326,10 +1548,13 @@ function BetterBags:OnInitialize(db)
     self.eventFrame = CreateFrame("Frame")
     self.eventFrame:RegisterEvent("ADDON_LOADED")
     self.eventFrame:RegisterEvent("PLAYER_LOGIN")
+    self.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
     self.eventFrame:RegisterEvent("GAME_PAD_ACTIVE_CHANGED")
     self.eventFrame:RegisterEvent("MERCHANT_SHOW")
     self.eventFrame:RegisterEvent("MERCHANT_CLOSED")
+    self.eventFrame:RegisterEvent("LOOT_OPENED")
+    self.eventFrame:RegisterEvent("LOOT_CLOSED")
     self.eventFrame:RegisterEvent("BAG_OPEN")
     self.eventFrame:RegisterEvent("BAG_UPDATE")
     self.eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
@@ -1338,26 +1563,55 @@ function BetterBags:OnInitialize(db)
     self.eventFrame:RegisterEvent("BAG_NEW_ITEMS_UPDATED")
     self.eventFrame:RegisterEvent("INVENTORY_SEARCH_UPDATE")
     self.eventFrame:RegisterEvent("BAG_CONTAINER_UPDATE")
-    self.eventFrame:SetScript("OnEvent", function(_, event, arg1)
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "ADDON_ACTION_BLOCKED")
+    self.eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2)
         InstallAutomationHooks()
         InstallControllerStripHooks()
         if event == "MERCHANT_SHOW" then
             HandleMerchantShow()
         elseif event == "MERCHANT_CLOSED" then
             StopSellTicker()
+        elseif event == "LOOT_OPENED" then
+            isLootingWindowOpen = true
+        elseif event == "LOOT_CLOSED" then
+            isLootingWindowOpen = false
+            ScheduleClamOpen(0.15)
         elseif event == "BAG_OPEN" then
             TriggerAutoSortIfEnabled()
+            ScheduleClamOpen(0.20)
         elseif event == "BAG_UPDATE" or event == "ITEM_LOCK_CHANGED" then
+            if event == "BAG_UPDATE" then
+                clamLastAttempt = nil
+            end
             if arg1 == nil or arg1 == GetReagentBagID() then
                 UpdateAllReagentSlotButtons()
             end
         elseif event == "BAG_UPDATE_DELAYED" or event == "BAG_UPDATE_COOLDOWN"
             or event == "BAG_NEW_ITEMS_UPDATED" or event == "INVENTORY_SEARCH_UPDATE" then
             UpdateAllReagentSlotButtons()
+            if event == "BAG_UPDATE_DELAYED" then
+                ScheduleClamOpen(0.15)
+            end
         elseif event == "BAG_CONTAINER_UPDATE" then
             ApplyAndScheduleUnifiedBagLayout()
-        elseif event == "PLAYER_LOGIN" or event == "GAME_PAD_ACTIVE_CHANGED" or (event == "PLAYER_REGEN_ENABLED" and pending) then
+        elseif event == "PLAYER_REGEN_ENABLED" then
+            if pending then
+                ApplyAndScheduleUnifiedBagLayout()
+            end
+            ScheduleClamOpen(0.15)
+        elseif event == "PLAYER_ENTERING_WORLD" then
+            ScheduleClamOpen(0.25)
+        elseif event == "PLAYER_LOGIN" or event == "GAME_PAD_ACTIVE_CHANGED" then
             ApplyAndScheduleUnifiedBagLayout()
+        elseif event == "ADDON_ACTION_BLOCKED" then
+            if isOpeningClamNow then
+                isOpeningClamNow = false
+                clamBlockedByClient = true
+                if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+                    local blockedFn = (type(arg2) == "string" and arg2 ~= "") and (" (" .. arg2 .. ")") or ""
+                    DEFAULT_CHAT_FRAME:AddMessage("|cffffd100YRG:|r Auto-open clams was blocked by the client" .. blockedFn .. " and paused for this session.")
+                end
+            end
         end
         self:UpdateStatusText()
     end)
@@ -1369,10 +1623,18 @@ function BetterBags:OnEnable(db)
     InstallAutomationHooks()
     InstallControllerStripHooks()
     RefreshBlizzardBagLayout()
+    ScheduleClamOpen(0.25)
     self:UpdateStatusText()
 end
 
 function BetterBags:OnDisable(db)
+    if clamOpenTimer then
+        clamOpenTimer:Cancel()
+        clamOpenTimer = nil
+    end
+    isLootingWindowOpen = false
+    isOpeningClamNow = false
+    clamLastAttempt = nil
     HideDividerOverlay()
     ResetControllerBagButtonScales()
     RestoreCombinedBagsFromMerge(ContainerFrameCombinedBags)
@@ -1547,7 +1809,7 @@ function BetterBags:BuildConfigUI(ctx, db)
         key = "autoSortOnOpen",
         name = "Auto-Sort Bags on Open",
         tooltip = "Automatically sorts your inventory bags whenever you open them in either Keyboard/Mouse or Controller Mode.",
-        defaultValue = false,
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.autoSortOnOpen) and true or false
@@ -1559,10 +1821,30 @@ function BetterBags:BuildConfigUI(ctx, db)
     })
 
     ctx:AddCheckbox({
+        key = "autoOpenClams",
+        name = "Auto-Open Clams on Loot",
+        tooltip = "Automatically opens looted clam containers (such as Small Barnacled Clam, Thick-shelled Clam, Big-mouth Clam, Soft-shelled Clam, and Jaggal Clam) out of combat when general bag space is available.",
+        defaultValue = true,
+        get = function()
+            local mdb = GetDB()
+            return (mdb and mdb.autoOpenClams ~= false) and true or false
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then
+                mdb.autoOpenClams = val
+            end
+            if val then
+                ScheduleClamOpen(0.10)
+            end
+        end,
+    })
+
+    ctx:AddCheckbox({
         key = "autoRepair",
         name = "Auto-Repair Gear at Vendor NPC",
         tooltip = "Automatically repairs all equipped and inventory gear when visiting a repair-capable NPC in any mode.",
-        defaultValue = false,
+        defaultValue = true,
         notifies = { "YRG_BetterBagsModule_autoRepairMaxSilver" },
         get = function()
             local mdb = GetDB()
@@ -1578,7 +1860,7 @@ function BetterBags:BuildConfigUI(ctx, db)
         key = "autoRepairMaxSilver",
         name = "Auto-Repair Cost Limit",
         tooltip = "Maximum repair cost allowed for automatic repairs (0 = Unlimited, 1s to 10g).",
-        min = 0, max = 1000, step = 1, defaultValue = 0,
+        min = 0, max = 1000, step = 1, defaultValue = 25,
         format = FormatRepairLimit,
         canModify = function()
             local mdb = GetDB()
@@ -1586,7 +1868,8 @@ function BetterBags:BuildConfigUI(ctx, db)
         end,
         get = function()
             local mdb = GetDB()
-            return math.max(0, math.min(1000, math.floor(tonumber(mdb and mdb.autoRepairMaxSilver) or 0)))
+            local val = (mdb and tonumber(mdb.autoRepairMaxSilver)) or 25
+            return math.max(0, math.min(1000, math.floor(val)))
         end,
         set = function(val)
             local mdb = GetDB()
@@ -1603,7 +1886,7 @@ function BetterBags:BuildConfigUI(ctx, db)
         key = "autoSellGreys",
         name = "Auto-Sell Grey (Poor) Items at Vendor NPC",
         tooltip = "Automatically sells poor-quality items in your bags except items listed on the Grey Exclusion List subpage.",
-        defaultValue = false,
+        defaultValue = true,
         get = function()
             local mdb = GetDB()
             return (mdb and mdb.autoSellGreys) and true or false
