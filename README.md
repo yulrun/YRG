@@ -41,7 +41,7 @@ Configured directly on the main `/yrg` settings page (`Core.lua`):
 Each module can be toggled independently on the main `YRG` panel and has its own dedicated subpage under `/yrg`:
 
 ### 1. BetterBagsModule (`Modules/BetterBagsModule.lua`)
-- **Controller Mode Separate Bag Strip:** Optionally removes inline bag headers and docks bag buttons into a clean strip above items (`LEFT`, `CENTER`, or `RIGHT` alignment, adjustable row spacing, and optional divider line) for smooth D-pad navigation.
+- **Controller Mode Separate Bag Strip:** Optionally removes inline bag headers and docks bag buttons into a clean strip above items (`LEFT`, `CENTER`, or `RIGHT` alignment, adjustable row spacing, and optional divider line). Features **Dual-Zone D-Pad Navigation** with configurable **Left / Right Edge Behavior** (`Stop at Edges`, `Wrap Within Row`, or `Wrap Across Rows`) plus an optional **Bag-Button Sizing Fix** toggle (default Off) for Steamdeck `1280x800` scaling.
 - **Non-Controller Reagent Bag Merge:** Optionally merges your Reagent Bag slots directly into the bottom of Blizzard's Combined Bags window below a subtle dark separator line, with a soft purple tint on empty reagent slots while preserving native item-quality borders on items.
 - **Bag Automation & Vendor Utilities (All Modes):**
   - **Auto-Sort Bags on Open**

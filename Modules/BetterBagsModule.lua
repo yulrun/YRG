@@ -51,6 +51,9 @@ local BetterBags = {
         rowGap = 8,
         showDivider = true,
         bagPinAlignment = "RIGHT", -- "LEFT", "CENTER", "RIGHT"
+        dualZoneControllerNav = true,
+        navEdgeBehavior = "STOP", -- "STOP", "WRAP_ROW", "WRAP_FLOW"
+        shrinkBagButtonsToFit = false,
         includeReagentBagInCombined = true,
         reagentBagTintPurple = true,
         autoSortOnOpen = true,
@@ -109,6 +112,62 @@ end
 
 local nativeBagBaseY = setmetatable({}, { __mode = "k" })
 local ApplyUnifiedBagLayout
+
+local NAV_EDGE_OPTIONS = {
+    { value = "STOP", label = "Stop at Edges (Default)", tooltip = "Left and Right D-pad movement stops cleanly at row and bag-strip edges." },
+    { value = "WRAP_ROW", label = "Wrap Within Row", tooltip = "Pressing Left or Right past a row or bag-strip edge wraps around to the opposite side of that same row." },
+    { value = "WRAP_FLOW", label = "Wrap Across Rows (Items) / Strip", tooltip = "In the item grid, pressing Left or Right past a row edge moves to the adjacent row; in the bag strip, wraps around." },
+}
+
+local dualZoneData = {
+    columns = 0,
+    itemRows = 0,
+    bagRows = 0,
+    itemGrid = {},
+    bagGrid = {},
+    btnMap = {},
+}
+local dualZoneBindingOwner = nil
+local dualZoneNavSink = nil
+local dualZoneSyncFrame = nil
+local dualZoneBindingsArmed = false
+local dualZoneProbeFailed = false
+local settingDualZoneBindingsNow = false
+local dualZoneBlockedByClient = false
+local dualZoneLastMoveAt = {}
+
+local function SafeNavCall(fn, ...)
+    if type(fn) ~= "function" then return nil end
+    local ok, res = pcall(fn, ...)
+    if ok then return res end
+    return nil
+end
+
+local function ClearDualZoneData()
+    dualZoneData.columns = 0
+    dualZoneData.itemRows = 0
+    dualZoneData.bagRows = 0
+    dualZoneData.itemGrid = {}
+    dualZoneData.bagGrid = {}
+    dualZoneData.btnMap = {}
+end
+
+local function ClearDualZoneBindings()
+    if dualZoneSyncFrame and type(dualZoneSyncFrame.Hide) == "function" then
+        dualZoneSyncFrame:Hide()
+    end
+    if dualZoneBindingsArmed and dualZoneBindingOwner and type(ClearOverrideBindings) == "function" then
+        if not (InCombatLockdown and InCombatLockdown()) then
+            pcall(ClearOverrideBindings, dualZoneBindingOwner)
+            dualZoneBindingsArmed = false
+        end
+    end
+end
+
+local function ResetDualZoneNavState()
+    ClearDualZoneData()
+    ClearDualZoneBindings()
+end
 
 local function HideDividerOverlay()
     if dividerFrame then
@@ -171,6 +230,418 @@ local function ResetControllerBagButtonScales()
     end
 end
 
+local function EnsureDualZoneFrames()
+    if not dualZoneBindingOwner then
+        dualZoneBindingOwner = CreateFrame("Frame", "YRGBetterBagsBindingOwner", UIParent)
+        dualZoneBindingOwner:Show()
+    end
+    if not dualZoneNavSink then
+        dualZoneNavSink = CreateFrame("Button", "YRGBetterBagsNavSink", dualZoneBindingOwner)
+        dualZoneNavSink:RegisterForClicks("AnyDown", "AnyUp")
+        dualZoneNavSink:SetSize(1, 1)
+        dualZoneNavSink:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -100, 100)
+        dualZoneNavSink:EnableMouse(false)
+        if dualZoneNavSink.SetMouseClickEnabled then dualZoneNavSink:SetMouseClickEnabled(false) end
+        if dualZoneNavSink.SetMouseMotionEnabled then dualZoneNavSink:SetMouseMotionEnabled(false) end
+        dualZoneNavSink:Show()
+    end
+    if not dualZoneSyncFrame then
+        dualZoneSyncFrame = CreateFrame("Frame")
+        dualZoneSyncFrame:Hide()
+    end
+end
+
+local SyncDualZoneBindings
+
+local cachedSnMethodName = nil
+local cachedSnPanelMethodName = nil
+
+local function TryFocusSmartNavButton(targetBtn, prevBtn)
+    if not targetBtn then return false end
+    local sn = _G.SmartNavigation
+    if not sn then return false end
+
+    local function IsFocusedNow()
+        return SafeNavCall(sn.GetCurrentButton, sn) == targetBtn
+    end
+    if IsFocusedNow() then return true end
+
+    if cachedSnMethodName and type(sn[cachedSnMethodName]) == "function" then
+        pcall(sn[cachedSnMethodName], sn, targetBtn)
+        if IsFocusedNow() then return true end
+    end
+
+    local panel = SafeNavCall(sn.GetActivePanel, sn) or sn.activePanel or sn.currentPanel
+    if panel and cachedSnPanelMethodName and type(panel[cachedSnPanelMethodName]) == "function" then
+        pcall(panel[cachedSnPanelMethodName], panel, targetBtn)
+        if IsFocusedNow() then return true end
+    end
+
+    local tried = {}
+    for _, methodName in ipairs({
+        "SetCurrentButton", "FocusButton", "SelectButton",
+        "SetFocusedButton", "SetSelectedButton", "SetFocusButton",
+        "SetFocus", "FocusFrame", "Focus", "Select",
+        "ActivateButton", "MoveToButton", "NavigateToButton",
+        "JumpToButton", "SetButton", "UpdateCurrentButton", "MoveCursorTo",
+    }) do
+        tried[methodName] = true
+        if type(sn[methodName]) == "function" then
+            pcall(sn[methodName], sn, targetBtn)
+            if IsFocusedNow() then
+                cachedSnMethodName = methodName
+                return true
+            end
+        end
+    end
+
+    local function ProbeDynamicButtonSetters(tbl)
+        if type(tbl) ~= "table" then return false end
+        for k, fn in pairs(tbl) do
+            if type(k) == "string" and type(fn) == "function" and not tried[k] then
+                local low = k:lower()
+                if low:find("button", 1, true)
+                    and (low:find("set", 1, true) or low:find("focus", 1, true) or low:find("select", 1, true) or low:find("move", 1, true))
+                    and not low:find("get", 1, true)
+                    and not low:find("clear", 1, true)
+                    and not low:find("reset", 1, true)
+                    and not low:find("add", 1, true)
+                    and not low:find("remove", 1, true)
+                    and not low:find("init", 1, true)
+                    and not low:find("hook", 1, true)
+                    and not low:find("unfocus", 1, true) then
+                    tried[k] = true
+                    pcall(fn, sn, targetBtn)
+                    if IsFocusedNow() then
+                        cachedSnMethodName = k
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+
+    if ProbeDynamicButtonSetters(sn) then return true end
+    local mtSn = getmetatable(sn)
+    if type(mtSn) == "table" and ProbeDynamicButtonSetters(mtSn.__index) then return true end
+
+    if type(panel) == "table" then
+        for _, methodName in ipairs({ "SetCurrentButton", "SelectButton", "FocusButton", "Select", "Focus" }) do
+            if type(panel[methodName]) == "function" then
+                pcall(panel[methodName], panel, targetBtn)
+                if IsFocusedNow() then
+                    cachedSnPanelMethodName = methodName
+                    return true
+                end
+            end
+        end
+    end
+
+    if type(targetBtn.FocusEnter) == "function" then
+        pcall(targetBtn.FocusEnter, targetBtn)
+        if IsFocusedNow() then
+            if prevBtn and prevBtn ~= targetBtn and type(prevBtn.FocusExit) == "function" then
+                pcall(prevBtn.FocusExit, prevBtn)
+            end
+            return true
+        end
+    end
+
+    return false
+end
+
+local function RowMinMaxCols(rowTbl, maxCols)
+    if not rowTbl then return nil, nil end
+    local minC, maxC
+    for c = 1, maxCols do
+        if rowTbl[c] then
+            if not minC then minC = c end
+            maxC = c
+        end
+    end
+    return minC, maxC
+end
+
+local function FindClosestBagInRow(bagRowTbl, targetCol)
+    if not bagRowTbl or #bagRowTbl == 0 then return nil end
+    local bestEntry, bestDist
+    for _, entry in ipairs(bagRowTbl) do
+        local d = math.abs(entry.colPos - targetCol)
+        if not bestDist or d < bestDist then
+            bestDist = d
+            bestEntry = entry
+        end
+    end
+    return bestEntry and bestEntry.button or nil
+end
+
+local function ComputeDualZoneTarget(info, dirKey, edgeMode)
+    if not info then return nil end
+    edgeMode = edgeMode or "STOP"
+    local cols = dualZoneData.columns or 0
+    local itemRows = dualZoneData.itemRows or 0
+    local bagRows = dualZoneData.bagRows or 0
+    local itemGrid = dualZoneData.itemGrid
+    local bagGrid = dualZoneData.bagGrid
+    if cols < 1 then return nil end
+
+    if info.zone == "ITEMS" then
+        local r, c = info.row, info.col
+        local rowTbl = itemGrid[r]
+        if not rowTbl then return nil end
+
+        if dirKey == "PADDLEFT" then
+            for tc = c - 1, 1, -1 do
+                if rowTbl[tc] then return rowTbl[tc] end
+            end
+            local _, maxC = RowMinMaxCols(rowTbl, cols)
+            if edgeMode == "WRAP_ROW" then
+                return (maxC and maxC ~= c) and rowTbl[maxC] or nil
+            elseif edgeMode == "WRAP_FLOW" then
+                for tr = r + 1, itemRows - 1 do
+                    local _, rMax = RowMinMaxCols(itemGrid[tr], cols)
+                    if rMax then return itemGrid[tr][rMax] end
+                end
+                local _, bMax = RowMinMaxCols(itemGrid[0], cols)
+                if bMax and itemGrid[0][bMax] ~= rowTbl[c] then return itemGrid[0][bMax] end
+            end
+            return nil
+        elseif dirKey == "PADDRIGHT" then
+            for tc = c + 1, cols do
+                if rowTbl[tc] then return rowTbl[tc] end
+            end
+            local minC, _ = RowMinMaxCols(rowTbl, cols)
+            if edgeMode == "WRAP_ROW" then
+                return (minC and minC ~= c) and rowTbl[minC] or nil
+            elseif edgeMode == "WRAP_FLOW" then
+                for tr = r - 1, 0, -1 do
+                    local rMin, _ = RowMinMaxCols(itemGrid[tr], cols)
+                    if rMin then return itemGrid[tr][rMin] end
+                end
+                for tr = itemRows - 1, 0, -1 do
+                    local tMin, _ = RowMinMaxCols(itemGrid[tr], cols)
+                    if tMin and itemGrid[tr][tMin] ~= rowTbl[c] then return itemGrid[tr][tMin] end
+                end
+            end
+            return nil
+        elseif dirKey == "PADDDOWN" then
+            for tr = r - 1, 0, -1 do
+                if itemGrid[tr] and itemGrid[tr][c] then
+                    return itemGrid[tr][c]
+                end
+            end
+            return nil
+        elseif dirKey == "PADDUP" then
+            for tr = r + 1, itemRows - 1 do
+                if itemGrid[tr] and itemGrid[tr][c] then
+                    return itemGrid[tr][c]
+                end
+            end
+            -- Topmost item in column c -> enter Zone 2 (Bag Strip) at same or closest column
+            if bagRows > 0 and bagGrid[bagRows - 1] then
+                return FindClosestBagInRow(bagGrid[bagRows - 1], c)
+            end
+            return nil
+        end
+    elseif info.zone == "BAGS" then
+        local br, idx, colPos = info.row, info.idx, info.colPos
+        local bagRowTbl = bagGrid[br]
+        if not bagRowTbl or #bagRowTbl == 0 then return nil end
+
+        if dirKey == "PADDLEFT" then
+            if idx > 1 then
+                return bagRowTbl[idx - 1].button
+            end
+            if (edgeMode == "WRAP_ROW" or edgeMode == "WRAP_FLOW") and #bagRowTbl > 1 then
+                return bagRowTbl[#bagRowTbl].button
+            end
+            return nil
+        elseif dirKey == "PADDRIGHT" then
+            if idx < #bagRowTbl then
+                return bagRowTbl[idx + 1].button
+            end
+            if (edgeMode == "WRAP_ROW" or edgeMode == "WRAP_FLOW") and #bagRowTbl > 1 then
+                return bagRowTbl[1].button
+            end
+            return nil
+        elseif dirKey == "PADDUP" then
+            if br > 0 and bagGrid[br - 1] then
+                return FindClosestBagInRow(bagGrid[br - 1], colPos)
+            end
+            return nil
+        elseif dirKey == "PADDDOWN" then
+            if br < bagRows - 1 and bagGrid[br + 1] then
+                return FindClosestBagInRow(bagGrid[br + 1], colPos)
+            end
+            -- Drop directly onto the topmost populated item in this column
+            local targetCol = math.max(1, math.min(cols, math.floor(colPos + 0.5)))
+            for tr = itemRows - 1, 0, -1 do
+                if itemGrid[tr] and itemGrid[tr][targetCol] then
+                    return itemGrid[tr][targetCol]
+                end
+            end
+            -- Fallback if column has no items (e.g. partial tiny bag): nearest column in highest row
+            for tr = itemRows - 1, 0, -1 do
+                local bestBtn, bestDist
+                if itemGrid[tr] then
+                    for tc = 1, cols do
+                        if itemGrid[tr][tc] then
+                            local d = math.abs(tc - targetCol)
+                            if not bestDist or d < bestDist then
+                                bestDist = d
+                                bestBtn = itemGrid[tr][tc]
+                            end
+                        end
+                    end
+                end
+                if bestBtn then return bestBtn end
+            end
+            return nil
+        end
+    end
+
+    return nil
+end
+
+local function CollectKeysMatching(tbl, pattern, out, seen)
+    if type(tbl) ~= "table" then return end
+    for k, _ in pairs(tbl) do
+        if type(k) == "string" and not seen[k] and k:lower():find(pattern) then
+            seen[k] = true
+            out[#out + 1] = k
+        end
+    end
+end
+
+local function CaptureSmartNavProbe()
+    local sn = _G.SmartNavigation
+    if not sn then return { "SmartNavigation=nil" } end
+    local keys, seen = {}, {}
+    CollectKeysMatching(sn, "", keys, seen)
+    local mt = getmetatable(sn)
+    if type(mt) == "table" and type(mt.__index) == "table" then
+        CollectKeysMatching(mt.__index, "", keys, seen)
+    end
+    local panel = SafeNavCall(sn.GetActivePanel, sn) or sn.activePanel or sn.currentPanel
+    local pKeys, pSeen = {}, {}
+    if type(panel) == "table" then
+        CollectKeysMatching(panel, "", pKeys, pSeen)
+        local pmt = getmetatable(panel)
+        if type(pmt) == "table" and type(pmt.__index) == "table" then
+            CollectKeysMatching(pmt.__index, "", pKeys, pSeen)
+        end
+    end
+    return {
+        "SmartNavKeys=[" .. table.concat(keys, ",") .. "]",
+        "PanelKeys=[" .. table.concat(pKeys, ",") .. "]",
+    }
+end
+
+SyncDualZoneBindings = function()
+    if InCombatLockdown and InCombatLockdown() then
+        return
+    end
+
+    local db = YRG:GetModuleDB("BetterBagsModule")
+    local f = ContainerFrameCombinedBags
+    local sn = _G.SmartNavigation
+    local searchFocused = BagItemSearchBox and type(BagItemSearchBox.HasFocus) == "function" and BagItemSearchBox:HasFocus()
+
+    local activeOk = db and db.enabled
+        and db.controllerBagStrip ~= false
+        and db.dualZoneControllerNav ~= false
+        and not dualZoneProbeFailed
+        and not dualZoneBlockedByClient
+        and IsControllerUIActive()
+        and f and f:IsShown()
+        and not searchFocused
+        and sn and SafeNavCall(sn.IsShown, sn)
+        and SafeNavCall(sn.GetActiveFrame, sn) == f
+        and dualZoneData.columns > 0
+
+    local curBtn = activeOk and SafeNavCall(sn.GetCurrentButton, sn) or nil
+    local inManagedZones = activeOk and curBtn ~= nil and dualZoneData.btnMap[curBtn] ~= nil
+
+    if inManagedZones then
+        EnsureDualZoneFrames()
+        if not dualZoneBindingsArmed and dualZoneBindingOwner and dualZoneNavSink then
+            settingDualZoneBindingsNow = true
+            pcall(ClearOverrideBindings, dualZoneBindingOwner)
+            for _, key in ipairs({ "PADDUP", "PADDDOWN", "PADDLEFT", "PADDRIGHT" }) do
+                pcall(SetOverrideBindingClick, dualZoneBindingOwner, true, key, dualZoneNavSink:GetName(), key)
+            end
+            settingDualZoneBindingsNow = false
+            if not dualZoneBlockedByClient then
+                dualZoneBindingsArmed = true
+            else
+                ClearDualZoneBindings()
+            end
+        end
+    else
+        if dualZoneBindingsArmed and dualZoneBindingOwner and type(ClearOverrideBindings) == "function" then
+            pcall(ClearOverrideBindings, dualZoneBindingOwner)
+            dualZoneBindingsArmed = false
+        end
+    end
+end
+
+local function InitDualZoneHandlers()
+    EnsureDualZoneFrames()
+    if not dualZoneNavSink._yrgInit then
+        dualZoneNavSink._yrgInit = true
+        dualZoneNavSink:SetScript("OnClick", function(_, key, down)
+            if down == false then
+                dualZoneLastMoveAt[key] = nil
+                return
+            end
+            if InCombatLockdown and InCombatLockdown() then
+                return
+            end
+            local now = (type(GetTime) == "function") and GetTime() or 0
+            if dualZoneLastMoveAt[key] and (now - dualZoneLastMoveAt[key]) < 0.08 then
+                return
+            end
+            dualZoneLastMoveAt[key] = now
+
+            local db = YRG:GetModuleDB("BetterBagsModule")
+            if not db or not db.enabled or db.controllerBagStrip == false or db.dualZoneControllerNav == false then
+                ClearDualZoneBindings()
+                return
+            end
+            local sn = _G.SmartNavigation
+            local curBtn = sn and SafeNavCall(sn.GetCurrentButton, sn)
+            local info = curBtn and dualZoneData.btnMap[curBtn]
+            if not info then
+                SyncDualZoneBindings()
+                return
+            end
+
+            local targetBtn = ComputeDualZoneTarget(info, key, db.navEdgeBehavior or "STOP")
+            if not targetBtn or targetBtn == curBtn then
+                return
+            end
+
+            if not TryFocusSmartNavButton(targetBtn, curBtn) then
+                dualZoneProbeFailed = true
+                db._lastDualZoneProbe = CaptureSmartNavProbe()
+                ClearDualZoneBindings()
+                print("|cffffd100YRG BetterBags:|r SmartNavigation did not expose a direct focus setter; reverted to native D-pad navigation. Run /yrgbagdebug watch to capture SmartNavigation details.")
+            end
+        end)
+    end
+    if not dualZoneSyncFrame._yrgInit then
+        dualZoneSyncFrame._yrgInit = true
+        dualZoneSyncFrame:SetScript("OnUpdate", function()
+            if not (ContainerFrameCombinedBags and ContainerFrameCombinedBags:IsShown()) then
+                ClearDualZoneBindings()
+                return
+            end
+            SyncDualZoneBindings()
+        end)
+    end
+end
+
 -- =========================================================================
 -- CONTROLLER MODE EXCLUSIVE: Separate Bag Strip & Pinning
 -- =========================================================================
@@ -185,6 +656,7 @@ local function ApplyControllerBagStripLayout()
     local db = YRG:GetModuleDB("BetterBagsModule")
     if not db or not db.enabled or db.controllerBagStrip == false then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         ResetControllerBagButtonScales()
         return
     end
@@ -192,38 +664,45 @@ local function ApplyControllerBagStripLayout()
     local frame, bar = ContainerFrameCombinedBags, GamepadBagBar
     if not frame or not bar or not frame:IsShown() then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         return
     end
     if not IsControllerUIActive() then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         ResetControllerBagButtonScales()
         return
     end
     if IsFrameProtectedOrForbidden(frame) or IsFrameProtectedOrForbidden(bar) then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         return
     end
 
     local columns = frame:GetColumns()
     if not frame.itemButtonPool or type(frame.itemButtonPool.GetTemplate) ~= "function" then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         return
     end
     local template = C_XMLUtil and C_XMLUtil.GetTemplateInfo and C_XMLUtil.GetTemplateInfo(frame.itemButtonPool:GetTemplate())
     if not template or not template.width or not template.height then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         return
     end
 
     local anchor = frame.MoneyFrame
     if not anchor or IsFrameProtectedOrForbidden(anchor) or columns < 1 then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         return
     end
 
     local bags = CollectControllerBagButtons(bar, false)
     if not bags or #bags == 0 then
         HideDividerOverlay()
+        ResetDualZoneNavState()
         return
     end
 
@@ -234,6 +713,7 @@ local function ApplyControllerBagStripLayout()
     for _, button in frame:EnumerateValidItems() do
         if IsFrameProtectedOrForbidden(button) then
             HideDividerOverlay()
+            ResetDualZoneNavState()
             return
         end
         if type(button.IsShown) ~= "function" or button:IsShown() then
@@ -244,6 +724,7 @@ local function ApplyControllerBagStripLayout()
                     or relativePoint ~= "TOPRIGHT"
                     or type(x) ~= "number" or type(y) ~= "number" then
                     HideDividerOverlay()
+                    ResetDualZoneNavState()
                     return
                 end
                 if not maxX or x > maxX then maxX = x end
@@ -310,15 +791,23 @@ local function ApplyControllerBagStripLayout()
     local height = frame:CalculateHeight()
         + (itemRows + bagRows - frame:GetRows()) * stepY + gap
 
+    local newItemGrid, newBagGrid, newBtnMap = {}, {}, {}
+
     applying = true
     for i, entry in ipairs(items) do
         local index = i - 1
-        local tx = baseX - (index % columns) * stepX
-        local ty = baseY + math.floor(index / columns) * stepY
+        local row = math.floor(index / columns)
+        local colFromRight = index % columns
+        local col = columns - colFromRight
+        local tx = baseX - colFromRight * stepX
+        local ty = baseY + row * stepY
         if math.abs(entry.x - tx) >= 0.4 or math.abs(entry.y - ty) >= 0.4 then
             entry.button:ClearAllPoints()
             entry.button:SetPoint("BOTTOMRIGHT", anchor, "TOPRIGHT", tx, ty)
         end
+        if not newItemGrid[row] then newItemGrid[row] = {} end
+        newItemGrid[row][col] = entry.button
+        newBtnMap[entry.button] = { zone = "ITEMS", row = row, col = col }
     end
 
     local frameStrata = (frame.GetFrameStrata and frame:GetFrameStrata()) or "MEDIUM"
@@ -333,6 +822,7 @@ local function ApplyControllerBagStripLayout()
         end
     end
 
+    local shrinkBagsToFit = (db.shrinkBagButtonsToFit == true)
     local ancScale = math.max(YRG.SafeNumber(anchor.GetEffectiveScale and anchor:GetEffectiveScale(), 1), 0.01)
     local totalBags = #bags
     for i, button in ipairs(bags) do
@@ -355,17 +845,25 @@ local function ApplyControllerBagStripLayout()
             colFromRight = columns - 1 - colInRow
         end
 
-        -- Match each bag button's screen-space scale to the container (essential when 1280x800 auto-scales
-        -- ContainerFrameCombinedBags smaller than GamepadBagBar so bag rects do not overlap neighbors or items).
-        local rawBtnW = YRG.SafeNumber(button.GetWidth and button:GetWidth(), itemW)
-        local fitScale = (rawBtnW > 0 and rawBtnW > (stepX - 2)) and ((stepX - 2) / rawBtnW) or 1
-        local btnParent = button.GetParent and button:GetParent()
-        local btnParentScale = math.max(YRG.SafeNumber(btnParent and btnParent.GetEffectiveScale and btnParent:GetEffectiveScale(), 1), 0.01)
-        local targetSelfScale = (ancScale * fitScale) / btnParentScale
-        if type(button.SetScale) == "function" then
-            local curSelfScale = YRG.SafeNumber(button.GetScale and button:GetScale(), 1)
-            if math.abs(curSelfScale - targetSelfScale) >= 0.005 then
-                button:SetScale(targetSelfScale)
+        -- Optional Steamdeck / 1280x800 sizing fix (off by default to keep native button scales on PC)
+        if shrinkBagsToFit then
+            local rawBtnW = YRG.SafeNumber(button.GetWidth and button:GetWidth(), itemW)
+            local fitScale = (rawBtnW > 0 and rawBtnW > (stepX - 2)) and ((stepX - 2) / rawBtnW) or 1
+            local btnParent = button.GetParent and button:GetParent()
+            local btnParentScale = math.max(YRG.SafeNumber(btnParent and btnParent.GetEffectiveScale and btnParent:GetEffectiveScale(), 1), 0.01)
+            local targetSelfScale = (ancScale * fitScale) / btnParentScale
+            if type(button.SetScale) == "function" then
+                local curSelfScale = YRG.SafeNumber(button.GetScale and button:GetScale(), 1)
+                if math.abs(curSelfScale - targetSelfScale) >= 0.005 then
+                    button:SetScale(targetSelfScale)
+                end
+            end
+        else
+            if type(button.SetScale) == "function" then
+                local curSelfScale = YRG.SafeNumber(button.GetScale and button:GetScale(), 1)
+                if math.abs(curSelfScale - 1) >= 0.005 then
+                    button:SetScale(1)
+                end
             end
         end
 
@@ -385,7 +883,28 @@ local function ApplyControllerBagStripLayout()
             button:ClearAllPoints()
             button:SetPoint("CENTER", anchor, "TOPRIGHT", bx, by)
         end
+
+        if not newBagGrid[rowIdx] then newBagGrid[rowIdx] = {} end
+        local colPos = columns - colFromRight
+        table.insert(newBagGrid[rowIdx], { button = button, colPos = colPos })
     end
+
+    for br = 0, bagRows - 1 do
+        local bagRowTbl = newBagGrid[br]
+        if bagRowTbl then
+            table.sort(bagRowTbl, function(a, b) return a.colPos < b.colPos end)
+            for k, entry in ipairs(bagRowTbl) do
+                newBtnMap[entry.button] = { zone = "BAGS", row = br, idx = k, colPos = entry.colPos }
+            end
+        end
+    end
+
+    dualZoneData.columns = columns
+    dualZoneData.itemRows = itemRows
+    dualZoneData.bagRows = bagRows
+    dualZoneData.itemGrid = newItemGrid
+    dualZoneData.bagGrid = newBagGrid
+    dualZoneData.btnMap = newBtnMap
 
     local curH = YRG.SafeNumber(frame.GetHeight and frame:GetHeight(), 0)
     if math.abs(curH - height) >= 0.4 then
@@ -413,6 +932,14 @@ local function ApplyControllerBagStripLayout()
     dividerFrame:SetShown(db.showDivider ~= false and itemRows > 0)
 
     applying = false
+
+    if db.dualZoneControllerNav ~= false then
+        InitDualZoneHandlers()
+        dualZoneSyncFrame:Show()
+        SyncDualZoneBindings()
+    else
+        ClearDualZoneBindings()
+    end
 
     if BetterBags._statusText then
         BetterBags:UpdateStatusText()
@@ -926,6 +1453,7 @@ ApplyUnifiedBagLayout = function()
         ApplyControllerBagStripLayout()
     else
         HideDividerOverlay()
+        ResetDualZoneNavState()
         ResetControllerBagButtonScales()
         ApplyNonControllerReagentMerge()
     end
@@ -1482,6 +2010,7 @@ InstallControllerStripHooks = function()
         ContainerFrameCombinedBags:HookScript("OnHide", function()
             HideDividerOverlay()
             HideReagentOverlays()
+            ResetDualZoneNavState()
         end)
         controllerStripHooked = true
     end
@@ -1544,12 +2073,16 @@ function BetterBags:OnInitialize(db)
     end
     db.autoRepairMaxGold = nil
     db.autoRepairMaxSilver = math.max(0, math.min(1000, math.floor(tonumber(db.autoRepairMaxSilver) or 0)))
+    if db.navEdgeBehavior ~= "STOP" and db.navEdgeBehavior ~= "WRAP_ROW" and db.navEdgeBehavior ~= "WRAP_FLOW" then
+        db.navEdgeBehavior = "STOP"
+    end
 
     self.eventFrame = CreateFrame("Frame")
     self.eventFrame:RegisterEvent("ADDON_LOADED")
     self.eventFrame:RegisterEvent("PLAYER_LOGIN")
     self.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    self.eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
     self.eventFrame:RegisterEvent("GAME_PAD_ACTIVE_CHANGED")
     self.eventFrame:RegisterEvent("MERCHANT_SHOW")
     self.eventFrame:RegisterEvent("MERCHANT_CLOSED")
@@ -1594,10 +2127,13 @@ function BetterBags:OnInitialize(db)
             end
         elseif event == "BAG_CONTAINER_UPDATE" then
             ApplyAndScheduleUnifiedBagLayout()
+        elseif event == "PLAYER_REGEN_DISABLED" then
+            ClearDualZoneBindings()
         elseif event == "PLAYER_REGEN_ENABLED" then
             if pending then
                 ApplyAndScheduleUnifiedBagLayout()
             end
+            SyncDualZoneBindings()
             ScheduleClamOpen(0.15)
         elseif event == "PLAYER_ENTERING_WORLD" then
             ScheduleClamOpen(0.25)
@@ -1611,6 +2147,10 @@ function BetterBags:OnInitialize(db)
                     local blockedFn = (type(arg2) == "string" and arg2 ~= "") and (" (" .. arg2 .. ")") or ""
                     DEFAULT_CHAT_FRAME:AddMessage("|cffffd100YRG:|r Auto-open clams was blocked by the client" .. blockedFn .. " and paused for this session.")
                 end
+            elseif settingDualZoneBindingsNow then
+                settingDualZoneBindingsNow = false
+                dualZoneBlockedByClient = true
+                ClearDualZoneBindings()
             end
         end
         self:UpdateStatusText()
@@ -1636,6 +2176,7 @@ function BetterBags:OnDisable(db)
     isOpeningClamNow = false
     clamLastAttempt = nil
     HideDividerOverlay()
+    ResetDualZoneNavState()
     ResetControllerBagButtonScales()
     RestoreCombinedBagsFromMerge(ContainerFrameCombinedBags)
     self:UpdateStatusText()
@@ -1649,6 +2190,11 @@ function BetterBags:BuildConfigUI(ctx, db)
     local function IsControllerStripEnabled()
         local mdb = GetDB()
         return mdb == nil or mdb.controllerBagStrip ~= false
+    end
+
+    local function IsDualZoneNavEnabled()
+        local mdb = GetDB()
+        return mdb == nil or mdb.dualZoneControllerNav ~= false
     end
 
     -- =========================================================================
@@ -1673,6 +2219,9 @@ function BetterBags:BuildConfigUI(ctx, db)
         "YRG_BetterBagsModule_showDivider",
         "YRG_BetterBagsModule_bagPinAlignment",
         "YRG_BetterBagsModule_rowGap",
+        "YRG_BetterBagsModule_dualZoneControllerNav",
+        "YRG_BetterBagsModule_navEdgeBehavior",
+        "YRG_BetterBagsModule_shrinkBagButtonsToFit",
     }
     ctx:AddCheckbox({
         key = "controllerBagStrip",
@@ -1749,6 +2298,66 @@ function BetterBags:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.rowGap = val end
+            ApplyControllerBagStripLayout()
+        end,
+    })
+
+    ctx:AddCheckbox({
+        key = "dualZoneControllerNav",
+        name = "Dual-Zone D-Pad Navigation (Controller)",
+        tooltip = "Keeps Controller D-pad navigation cleanly separated into the Item Grid zone and the Top Bag Strip zone. Pressing Up on the top item row enters the Bag Strip above; pressing Down from a bag slot drops directly onto the topmost item of that column.",
+        defaultValue = true,
+        canModify = IsControllerStripEnabled,
+        notifies = { "YRG_BetterBagsModule_navEdgeBehavior" },
+        get = function()
+            return IsDualZoneNavEnabled()
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then mdb.dualZoneControllerNav = val end
+            dualZoneProbeFailed = false
+            ApplyControllerBagStripLayout()
+        end,
+    })
+
+    ctx:AddDropdown({
+        key = "navEdgeBehavior",
+        name = "Controller Left / Right Edge Behavior",
+        tooltip = "Controls what happens when pressing D-pad Left or Right past the edge of an item row or the bag strip.",
+        defaultValue = "STOP",
+        canModify = function()
+            return IsControllerStripEnabled() and IsDualZoneNavEnabled()
+        end,
+        options = NAV_EDGE_OPTIONS,
+        get = function()
+            local mdb = GetDB()
+            local val = mdb and mdb.navEdgeBehavior
+            if val == "WRAP_ROW" or val == "WRAP_FLOW" then
+                return val
+            end
+            return "STOP"
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then
+                mdb.navEdgeBehavior = (val == "WRAP_ROW" or val == "WRAP_FLOW") and val or "STOP"
+            end
+        end,
+    })
+
+    ctx:AddCheckbox({
+        key = "shrinkBagButtonsToFit",
+        name = "Scale Bag Buttons to Fit Column Width (Steamdeck Fix)",
+        tooltip = "Optional Steamdeck / 1280x800 sizing fix: scales down GamepadBagBar buttons to match your bag grid width and fit cleanly inside each column cell. Leave Off (default) to keep Blizzard's native bag button scale.",
+        defaultValue = false,
+        canModify = IsControllerStripEnabled,
+        get = function()
+            local mdb = GetDB()
+            return (mdb and mdb.shrinkBagButtonsToFit == true) and true or false
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then mdb.shrinkBagButtonsToFit = val and true or false end
             ApplyControllerBagStripLayout()
         end,
     })
@@ -2182,16 +2791,6 @@ SlashCmdList.SEPARATEBAGSTRIP = function()
     print("|cffffd100YRG BetterBagsModule:|r " .. BetterBags:GetStatusMessage())
 end
 
-local function CollectKeysMatching(tbl, pattern, out, seen)
-    if type(tbl) ~= "table" then return end
-    for k, _ in pairs(tbl) do
-        if type(k) == "string" and not seen[k] and k:lower():find(pattern) then
-            seen[k] = true
-            out[#out + 1] = k
-        end
-    end
-end
-
 local function FmtPt(frame)
     if not frame or type(frame.GetPoint) ~= "function" then return "n/a" end
     local pt, relTo, relPt, x, y = frame:GetPoint(1)
@@ -2199,185 +2798,376 @@ local function FmtPt(frame)
     return string.format("%s->%s.%s(%.1f,%.1f)", tostring(pt), tostring(rn), tostring(relPt), tonumber(x) or 0, tonumber(y) or 0)
 end
 
-SLASH_YRGBAGDEBUG1 = "/yrgbagdebug"
-SlashCmdList.YRGBAGDEBUG = function()
-    local f, b = ContainerFrameCombinedBags, GamepadBagBar
-    local db = YRG:GetModuleDB("BetterBagsModule")
-    local lines = {}
-    local function Emit(s)
-        lines[#lines + 1] = s
-        print("|cffffd100[BagDbg]|r " .. s)
+do
+    local watchFrame = nil
+    local watchDeadline = 0
+    local capturedOpenSnapshot = false
+    local lastWatchedBtn = nil
+    local lastDpadHeld = nil
+    local movedDuringHold = false
+    local navTrace = {}
+
+    local function SafeCall(fn, ...)
+        if type(fn) ~= "function" then return nil end
+        local ok, res = pcall(fn, ...)
+        if ok then return res end
+        return nil
     end
 
-    if not f then
-        Emit("ContainerFrameCombinedBags=nil")
-        return
+    local function SafeFrameName(obj)
+        if not obj then return "nil" end
+        if type(obj) ~= "table" then return tostring(obj) end
+        local nm = YRG.SafeString(SafeCall(obj.GetName, obj), nil)
+        if nm then return nm end
+        local dn = YRG.SafeString(SafeCall(obj.GetDebugName, obj), nil)
+        if dn then return dn end
+        return tostring(obj)
     end
 
-    local cols = (f.GetColumns and f:GetColumns()) or -1
-    local rows = (f.GetRows and f:GetRows()) or -1
-    local calcH = (f.CalculateHeight and f:CalculateHeight()) or -1
-    local curH = (f.GetHeight and f:GetHeight()) or -1
-    local fScale = (f.GetEffectiveScale and f:GetEffectiveScale()) or 1
-    local fSelfScale = (f.GetScale and f:GetScale()) or 1
-    local fStrata = (f.GetFrameStrata and f:GetFrameStrata()) or "?"
-    local fLvl = (f.GetFrameLevel and f:GetFrameLevel()) or -1
-    local bShown = b and b.IsShown and b:IsShown() or false
-    local bMouse = b and b.IsMouseEnabled and b:IsMouseEnabled() or false
-    local bScale = b and b.GetEffectiveScale and b:GetEffectiveScale() or -1
-    local bStrata = (b and b.GetFrameStrata and b:GetFrameStrata()) or "?"
-    local bLvl = (b and b.GetFrameLevel and b:GetFrameLevel()) or -1
-    local uiScale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or -1
-    local physW, physH = 0, 0
-    if type(GetPhysicalScreenSize) == "function" then
-        physW, physH = GetPhysicalScreenSize()
+    local function DescribeBtn(btn)
+        if not btn or type(btn) ~= "table" then return tostring(btn) end
+        local nm = SafeFrameName(btn)
+        local bagID = SafeCall(btn.GetBagID, btn)
+        local slotID = SafeCall(btn.GetID, btn)
+        local okC, cx, cy = pcall(function() return btn.GetCenter and btn:GetCenter() end)
+        local okR, rl, rb, rw, rh = pcall(function() return btn.GetRect and btn:GetRect() end)
+        local s = SafeCall(btn.GetScale, btn)
+        local eff = SafeCall(btn.GetEffectiveScale, btn)
+        local parentNm = SafeFrameName(SafeCall(btn.GetParent, btn))
+        local rectStr = (okR and rl) and string.format("%.0f..%.0f,%.0f..%.0f", rl, rl + (rw or 0), rb, rb + (rh or 0)) or "n/a"
+        return string.format("%s(p=%s,bag=%s,id=%s,s=%.2f,eff=%.2f,ctr=%.1f,%.1f,rect=%s)",
+            nm, parentNm, tostring(bagID), tostring(slotID),
+            YRG.SafeNumber(s, 1), YRG.SafeNumber(eff, -1),
+            YRG.SafeNumber(okC and cx, -1), YRG.SafeNumber(okC and cy, -1), rectStr)
     end
-    local combCVar = GetCVar and GetCVar("combinedBags")
-    Emit(string.format("F:sh=%s strip=%s gp=%s pin=%s gap=%s cols=%d rows=%d calcH=%.0f curH=%.0f fSc=%.2f(s=%.2f) fZ=%s:%d Bar:sh=%s m=%s sc=%.2f bZ=%s:%d",
-        tostring(f:IsShown()), tostring(db and db.controllerBagStrip), tostring(IsControllerUIActive()),
-        tostring(db and db.bagPinAlignment), tostring(db and db.rowGap),
-        cols, rows, calcH, curH, fScale, fSelfScale, tostring(fStrata), fLvl,
-        tostring(bShown), tostring(bMouse), bScale, tostring(bStrata), bLvl))
-    Emit(string.format("Env: phys=%dx%d uiSc=%.2f combinedBags=%s",
-        tonumber(physW) or 0, tonumber(physH) or 0, uiScale, tostring(combCVar)))
 
-    local fKeys, bKeys, fSeen, bSeen = {}, {}, {}, {}
-    local pats = { "pad", "nav", "cursor", "focus", "grid", "inline", "bag", "reagent", "item", "slot", "pool", "calc", "row", "col", "height", "layout" }
-    local mtF = getmetatable(f)
-    for _, pat in ipairs(pats) do
-        CollectKeysMatching(f, pat, fKeys, fSeen)
-        if type(mtF) == "table" and type(mtF.__index) == "table" then
-            CollectKeysMatching(mtF.__index, pat, fKeys, fSeen)
+    local function SummarizeValue(v, depth)
+        local tv = type(v)
+        if tv ~= "table" then
+            if tv == "function" then return "fn" end
+            return tostring(v)
         end
+        if type(v.GetObjectType) == "function" then
+            return "<" .. SafeFrameName(v) .. ">"
+        end
+        local parts = {}
+        local n = 0
+        for k, sub in pairs(v) do
+            n = n + 1
+            if n <= 10 then
+                local subStr
+                if depth and depth > 1 and type(sub) == "table" and type(sub.GetObjectType) ~= "function" then
+                    local subCount = 0
+                    for _ in pairs(sub) do subCount = subCount + 1 end
+                    subStr = "{#" .. subCount .. "}"
+                else
+                    subStr = SummarizeValue(sub, 1)
+                end
+                parts[#parts + 1] = tostring(k) .. "=" .. subStr
+            end
+        end
+        if n > 10 then
+            parts[#parts + 1] = "...(+" .. (n - 10) .. ")"
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
     end
-    if b then
-        local mtB = getmetatable(b)
-        for _, pat in ipairs({ "pad", "nav", "cursor", "focus", "bag" }) do
-            CollectKeysMatching(b, pat, bKeys, bSeen)
-            if type(mtB) == "table" and type(mtB.__index) == "table" then
-                CollectKeysMatching(mtB.__index, pat, bKeys, bSeen)
+
+    local function CollectMatchingFieldValues(tbl, pattern, out)
+        if type(tbl) ~= "table" then return end
+        for k, v in pairs(tbl) do
+            if type(k) == "string" and (pattern == "" or k:lower():find(pattern)) and type(v) ~= "function" and k ~= "0" then
+                out[#out + 1] = k .. "=" .. SummarizeValue(v, 2)
             end
         end
     end
-    Emit("KeysF=[" .. table.concat(fKeys, ",") .. "]")
-    Emit("KeysB=[" .. table.concat(bKeys, ",") .. "]")
 
-    local scNames = { "OnGamePadButtonDown", "OnKeyDown", "OnUpdate" }
-    local fSc, bSc = {}, {}
-    for _, sn in ipairs(scNames) do
-        if f.GetScript and f:GetScript(sn) then fSc[#fSc + 1] = sn end
-        if b and b.GetScript and b:GetScript(sn) then bSc[#bSc + 1] = sn end
-    end
-    Emit("ScriptsF=[" .. table.concat(fSc, ",") .. "] ScriptsB=[" .. table.concat(bSc, ",") .. "]")
-
-    local itemSet, itemList = {}, {}
-    if type(f.EnumerateValidItems) == "function" then
-        for _, btn in f:EnumerateValidItems() do
-            itemSet[btn] = true
-            if type(btn.IsShown) ~= "function" or btn:IsShown() then
-                itemList[#itemList + 1] = btn
+    local function CaptureBagDebug(saveKey, quiet)
+        local f, b = ContainerFrameCombinedBags, GamepadBagBar
+        local db = YRG:GetModuleDB("BetterBagsModule")
+        local lines = {}
+        local function Emit(s)
+            lines[#lines + 1] = s
+            if not quiet then
+                print("|cffffd100[BagDbg]|r " .. s)
             end
         end
-    end
-    local extraKids = {}
-    for _, child in ipairs({ f:GetChildren() }) do
-        if not itemSet[child] and type(child.IsShown) == "function" and child:IsShown() then
-            local nm = (child.GetName and child:GetName())
-                or (type(child.GetDebugName) == "function" and child:GetDebugName())
-                or "anon"
-            local me = (child.IsMouseEnabled and child:IsMouseEnabled()) and "M" or "-"
-            local cx, cy = child:GetCenter()
-            extraKids[#extraKids + 1] = string.format("%s(%s:%.0f,%.0f)", nm, me, tonumber(cx) or -1, tonumber(cy) or -1)
+
+        if not f then
+            Emit("ContainerFrameCombinedBags=nil")
+            return
         end
-    end
-    if b then
-        for _, child in ipairs({ b:GetChildren() }) do
-            if type(child.IsShown) == "function" and child:IsShown() then
-                local nm = (child.GetName and child:GetName())
-                    or (type(child.GetDebugName) == "function" and child:GetDebugName())
-                    or "bChild"
+
+        local cols = (f.GetColumns and f:GetColumns()) or -1
+        local rows = (f.GetRows and f:GetRows()) or -1
+        local calcH = (f.CalculateHeight and f:CalculateHeight()) or -1
+        local curH = (f.GetHeight and f:GetHeight()) or -1
+        local fScale = (f.GetEffectiveScale and f:GetEffectiveScale()) or 1
+        local fSelfScale = (f.GetScale and f:GetScale()) or 1
+        local fStrata = (f.GetFrameStrata and f:GetFrameStrata()) or "?"
+        local fLvl = (f.GetFrameLevel and f:GetFrameLevel()) or -1
+        local bShown = b and b.IsShown and b:IsShown() or false
+        local bMouse = b and b.IsMouseEnabled and b:IsMouseEnabled() or false
+        local bScale = b and b.GetEffectiveScale and b:GetEffectiveScale() or -1
+        local bSelfScale = b and b.GetScale and b:GetScale() or 1
+        local bStrata = (b and b.GetFrameStrata and b:GetFrameStrata()) or "?"
+        local bLvl = (b and b.GetFrameLevel and b:GetFrameLevel()) or -1
+        local uiScale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or -1
+        local physW, physH = 0, 0
+        if type(GetPhysicalScreenSize) == "function" then
+            physW, physH = GetPhysicalScreenSize()
+        end
+        local combCVar = GetCVar and GetCVar("combinedBags")
+        Emit(string.format("F:sh=%s strip=%s gp=%s pin=%s gap=%s cols=%d rows=%d calcH=%.0f curH=%.0f fSc=%.2f(s=%.2f) fZ=%s:%d Bar:sh=%s m=%s sc=%.2f(s=%.2f) bZ=%s:%d pt=%s",
+            tostring(f:IsShown()), tostring(db and db.controllerBagStrip), tostring(IsControllerUIActive()),
+            tostring(db and db.bagPinAlignment), tostring(db and db.rowGap),
+            cols, rows, calcH, curH, fScale, fSelfScale, tostring(fStrata), fLvl,
+            tostring(bShown), tostring(bMouse), bScale, bSelfScale, tostring(bStrata), bLvl, FmtPt(b)))
+        Emit(string.format("Env: phys=%dx%d uiSc=%.2f combinedBags=%s fRect=%s",
+            tonumber(physW) or 0, tonumber(physH) or 0, uiScale, tostring(combCVar),
+            (f.GetRect and f:GetRect()) and string.format("%.0f,%.0f,%.0f,%.0f", f:GetRect()) or "n/a"))
+
+        local fKeys, bKeys, fSeen, bSeen = {}, {}, {}, {}
+        local pats = { "pad", "nav", "cursor", "focus", "grid", "inline", "bag", "reagent", "item", "slot", "pool", "calc", "row", "col", "height", "layout" }
+        local mtF = getmetatable(f)
+        for _, pat in ipairs(pats) do
+            CollectKeysMatching(f, pat, fKeys, fSeen)
+            if type(mtF) == "table" and type(mtF.__index) == "table" then
+                CollectKeysMatching(mtF.__index, pat, fKeys, fSeen)
+            end
+        end
+        if b then
+            local mtB = getmetatable(b)
+            for _, pat in ipairs({ "pad", "nav", "cursor", "focus", "bag" }) do
+                CollectKeysMatching(b, pat, bKeys, bSeen)
+                if type(mtB) == "table" and type(mtB.__index) == "table" then
+                    CollectKeysMatching(mtB.__index, pat, bKeys, bSeen)
+                end
+            end
+        end
+        Emit("KeysF=[" .. table.concat(fKeys, ",") .. "]")
+        Emit("KeysB=[" .. table.concat(bKeys, ",") .. "]")
+
+        local fVals, bVals = {}, {}
+        CollectMatchingFieldValues(f, "nav", fVals)
+        CollectMatchingFieldValues(f, "focus", fVals)
+        CollectMatchingFieldValues(f, "pad", fVals)
+        CollectMatchingFieldValues(b, "nav", bVals)
+        CollectMatchingFieldValues(b, "focus", bVals)
+        CollectMatchingFieldValues(b, "pad", bVals)
+        CollectMatchingFieldValues(b, "bagbutton", bVals)
+        if #fVals > 0 then Emit("ValsF: " .. table.concat(fVals, " | ")) end
+        if #bVals > 0 then Emit("ValsB: " .. table.concat(bVals, " | ")) end
+
+        local scNames = { "OnGamePadButtonDown", "OnKeyDown", "OnUpdate" }
+        local fSc, bSc = {}, {}
+        for _, sn in ipairs(scNames) do
+            if f.GetScript and f:GetScript(sn) then fSc[#fSc + 1] = sn end
+            if b and b.GetScript and b:GetScript(sn) then bSc[#bSc + 1] = sn end
+        end
+        Emit("ScriptsF=[" .. table.concat(fSc, ",") .. "] ScriptsB=[" .. table.concat(bSc, ",") .. "]")
+
+        -- SmartNavigation global inspection
+        local sn = _G.SmartNavigation
+        if sn then
+            local snShown = SafeCall(sn.IsShown, sn)
+            local snActive = SafeCall(sn.GetActiveFrame, sn)
+            local snCur = SafeCall(sn.GetCurrentButton, sn)
+            local snKeys, snSeen, snVals = {}, {}, {}
+            local mtS = getmetatable(sn)
+            CollectKeysMatching(sn, "", snKeys, snSeen)
+            if type(mtS) == "table" and type(mtS.__index) == "table" then
+                CollectKeysMatching(mtS.__index, "", snKeys, snSeen)
+            end
+            CollectMatchingFieldValues(sn, "", snVals)
+            Emit(string.format("SmartNav: sh=%s active=%s cur=%s",
+                tostring(snShown), SafeFrameName(snActive), DescribeBtn(snCur)))
+            Emit("SmartNavKeys=[" .. table.concat(snKeys, ",") .. "]")
+            if #snVals > 0 then
+                Emit("SmartNavVals: " .. table.concat(snVals, " | "))
+            end
+        else
+            Emit("SmartNav=nil")
+        end
+
+        local itemSet, itemList = {}, {}
+        if type(f.EnumerateValidItems) == "function" then
+            for _, btn in f:EnumerateValidItems() do
+                itemSet[btn] = true
+                if type(btn.IsShown) ~= "function" or btn:IsShown() then
+                    itemList[#itemList + 1] = btn
+                end
+            end
+        end
+        local extraKids = {}
+        for _, child in ipairs({ f:GetChildren() }) do
+            if not itemSet[child] and type(child.IsShown) == "function" and child:IsShown() then
+                local nm = SafeFrameName(child)
                 local me = (child.IsMouseEnabled and child:IsMouseEnabled()) and "M" or "-"
                 local cx, cy = child:GetCenter()
-                extraKids[#extraKids + 1] = string.format("B:%s(%s:%.0f,%.0f)", nm, me, tonumber(cx) or -1, tonumber(cy) or -1)
+                extraKids[#extraKids + 1] = string.format("%s(%s:%.0f,%.0f)", nm, me, tonumber(cx) or -1, tonumber(cy) or -1)
             end
         end
-    end
-    Emit("Items=" .. #itemList .. " NonItems(" .. #extraKids .. "): " .. table.concat(extraKids, "; "))
-
-    local sampleIdx = { 1, 2, math.min(cols > 0 and cols or 8, #itemList), math.min((cols > 0 and cols or 8) + 1, #itemList), #itemList }
-    local seenIdx = {}
-    for _, idx in ipairs(sampleIdx) do
-        local btn = itemList[idx]
-        if btn and not seenIdx[idx] then
-            seenIdx[idx] = true
-            local cx, cy = btn:GetCenter()
-            local bw, bh = btn:GetSize()
-            local pn = (btn.GetParent and btn:GetParent() and btn:GetParent().GetName and btn:GetParent():GetName()) or "anonP"
-            Emit(string.format("I[%d] bag=%s slot=%s p=%s sz=%.0fx%.0f pt=%s ctr=(%.1f,%.1f)",
-                idx, tostring(btn.GetBagID and btn:GetBagID()), tostring(btn.GetID and btn:GetID()),
-                tostring(pn), tonumber(bw) or -1, tonumber(bh) or -1,
-                FmtPt(btn), tonumber(cx) or -1, tonumber(cy) or -1))
-        end
-    end
-
-    -- Inspect Reagent Bag Holder & integrated Reagent Bag slots
-    local rBagID = GetReagentBagID()
-    local tmpl = (f.itemButtonPool and f.itemButtonPool.GetTemplate and f.itemButtonPool:GetTemplate()) or "nil"
-    local holderInfo = reagentBagHolder and string.format("sh=%s id=%s lvl=%s",
-        tostring(reagentBagHolder:IsShown()), tostring(reagentBagHolder:GetID()), tostring(reagentBagHolder:GetFrameLevel())) or "nil"
-    Emit(string.format("ReagentBagID=%s slots=%d tmpl=%s Holder=[%s] btnCount=%d",
-        tostring(rBagID), GetBagNumSlotsSafe(rBagID), tostring(tmpl), holderInfo, #reagentSlotButtons))
-    for i = 1, math.min(2, #reagentSlotButtons) do
-        local rbtn = reagentSlotButtons[i]
-        if rbtn then
-            local info = GetReagentItemInfoSafe(rBagID, i)
-            local rpn = (rbtn.GetParent and rbtn:GetParent() and rbtn:GetParent().GetName and rbtn:GetParent():GetName()) or "anonP"
-            Emit(string.format("R[%d] sh=%s m=%s bag=%s id=%s p=%s pt=%s lvl=%s icon=%s",
-                i, tostring(rbtn:IsShown()), tostring(rbtn.IsMouseEnabled and rbtn:IsMouseEnabled()),
-                tostring(rbtn.GetBagID and rbtn:GetBagID()), tostring(rbtn.GetID and rbtn:GetID()),
-                tostring(rpn), FmtPt(rbtn), tostring(rbtn.GetFrameLevel and rbtn:GetFrameLevel()),
-                tostring(info)))
-        end
-    end
-    local openCFs = {}
-    for i = 1, 13 do
-        local cf = _G["ContainerFrame" .. i]
-        if cf and (cf:IsShown() or ((cf.GetID and cf:GetID()) == rBagID) or cf.bagID == rBagID) then
-            local cid = (cf.GetID and cf:GetID()) or cf.bagID
-            openCFs[#openCFs + 1] = string.format("CF%d(id=%s,sh=%s,sz=%s,lvl=%s)", i, tostring(cid), tostring(cf:IsShown()), tostring(cf.size), tostring(cf:GetFrameLevel()))
-        end
-    end
-    Emit("OpenCFs=[" .. table.concat(openCFs, "; ") .. "]")
-
-    if b and type(b.GetBagButton) == "function" then
-        local maxBagID = math.max((ENDING_BAG_INDEX or 4), rBagID or 5)
-        for id = (KEYRING_CONTAINER or -2), maxBagID do
-            local btn = b:GetBagButton(id)
-            if btn then
-                local cx, cy = btn:GetCenter()
-                local bw, bh = btn:GetSize()
-                local bl, br, bb, bt = btn:GetLeft(), btn:GetRight(), btn:GetBottom(), btn:GetTop()
-                Emit(string.format("Bag[%d] sh=%s col=%s m=%s s=%.2f eff=%.2f sz=%.0fx%.0f pt=%s ctr=(%.1f,%.1f) rect=%.0f..%.0f,%.0f..%.0f",
-                    id, tostring(btn:IsShown()), tostring(btn.isCollapsed), tostring(btn.IsMouseEnabled and btn:IsMouseEnabled()),
-                    (btn.GetScale and btn:GetScale()) or 1,
-                    (btn.GetEffectiveScale and btn:GetEffectiveScale()) or -1,
-                    tonumber(bw) or -1, tonumber(bh) or -1,
-                    FmtPt(btn), tonumber(cx) or -1, tonumber(cy) or -1,
-                    tonumber(bl) or -1, tonumber(br) or -1, tonumber(bb) or -1, tonumber(bt) or -1))
+        if b then
+            for _, child in ipairs({ b:GetChildren() }) do
+                if type(child.IsShown) == "function" and child:IsShown() then
+                    local nm = SafeFrameName(child)
+                    local me = (child.IsMouseEnabled and child:IsMouseEnabled()) and "M" or "-"
+                    local cx, cy = child:GetCenter()
+                    extraKids[#extraKids + 1] = string.format("B:%s(%s:%.0f,%.0f)", nm, me, tonumber(cx) or -1, tonumber(cy) or -1)
+                end
             end
         end
+        Emit("Items=" .. #itemList .. " NonItems(" .. #extraKids .. "): " .. table.concat(extraKids, "; "))
+
+        -- Print key item samples across cols 1, 4, 5, 10 (bottom row & top rows)
+        local cCount = (cols > 0) and cols or 10
+        local sampleIdx = {
+            1,
+            math.max(1, cCount - 4), -- col 5 if 10 cols
+            math.max(1, cCount - 3), -- col 4 if 10 cols
+            math.min(cCount, #itemList), -- col 1
+            math.min(cCount + 1, #itemList),
+            math.max(1, #itemList - cCount + 1),
+            #itemList,
+        }
+        local seenIdx = {}
+        for _, idx in ipairs(sampleIdx) do
+            local btn = itemList[idx]
+            if btn and not seenIdx[idx] then
+                seenIdx[idx] = true
+                Emit(string.format("I[%d] %s pt=%s", idx, DescribeBtn(btn), FmtPt(btn)))
+            end
+        end
+        if itemList[1] then
+            local iVals = {}
+            CollectMatchingFieldValues(itemList[1], "", iVals)
+            if #iVals > 0 then Emit("ItemBtnFields: " .. table.concat(iVals, " | ")) end
+        end
+
+        local rBagID = GetReagentBagID()
+        local openCFs = {}
+        for i = 1, 13 do
+            local cf = _G["ContainerFrame" .. i]
+            if cf and (cf:IsShown() or ((cf.GetID and cf:GetID()) == rBagID) or cf.bagID == rBagID) then
+                local cid = (cf.GetID and cf:GetID()) or cf.bagID
+                openCFs[#openCFs + 1] = string.format("CF%d(id=%s,sh=%s,sz=%s,lvl=%s)", i, tostring(cid), tostring(cf:IsShown()), tostring(cf.size), tostring(cf:GetFrameLevel()))
+            end
+        end
+        Emit("OpenCFs=[" .. table.concat(openCFs, "; ") .. "]")
+
+        if b and type(b.GetBagButton) == "function" then
+            local maxBagID = math.max((ENDING_BAG_INDEX or 4), rBagID or 5)
+            local dumpedBagFields = false
+            for id = (KEYRING_CONTAINER or -2), maxBagID do
+                local btn = b:GetBagButton(id)
+                if btn then
+                    Emit(string.format("Bag[%d] sh=%s col=%s m=%s pt=%s %s",
+                        id, tostring(btn:IsShown()), tostring(btn.isCollapsed),
+                        tostring(btn.IsMouseEnabled and btn:IsMouseEnabled()),
+                        FmtPt(btn), DescribeBtn(btn)))
+                    if not dumpedBagFields and btn:IsShown() then
+                        dumpedBagFields = true
+                        local bgVals = {}
+                        CollectMatchingFieldValues(btn, "", bgVals)
+                        if #bgVals > 0 then Emit("BagBtnFields[" .. id .. "]: " .. table.concat(bgVals, " | ")) end
+                    end
+                end
+            end
+        end
+
+        local cAuto = GetCVar and GetCVar("GamePadCursorAutoEnable")
+        local cCtr = GetCVar and GetCVar("GamePadCursorCentering")
+        local cTgt = GetCVar and GetCVar("GamePadCursorForTargeting")
+        local cStk = GetCVar and GetCVar("GamePadCursorAutoDisableSticks")
+        Emit(string.format("CVars: AutoEnable=%s Centering=%s Targeting=%s Sticks=%s SoftCursor=%s",
+            tostring(cAuto), tostring(cCtr), tostring(cTgt), tostring(cStk),
+            tostring(SoftCursor and SoftCursor.IsShown and SoftCursor:IsShown())))
+
+        if db then
+            db[saveKey or "_lastDebug"] = lines
+        end
     end
 
-    local cAuto = GetCVar and GetCVar("GamePadCursorAutoEnable")
-    local cCtr = GetCVar and GetCVar("GamePadCursorCentering")
-    local cTgt = GetCVar and GetCVar("GamePadCursorForTargeting")
-    local cStk = GetCVar and GetCVar("GamePadCursorAutoDisableSticks")
-    Emit(string.format("CVars: AutoEnable=%s Centering=%s Targeting=%s Sticks=%s SoftCursor=%s",
-        tostring(cAuto), tostring(cCtr), tostring(cTgt), tostring(cStk),
-        tostring(SoftCursor and SoftCursor.IsShown and SoftCursor:IsShown())))
+    local function StopWatch(reason)
+        if watchFrame then
+            watchFrame:SetScript("OnUpdate", nil)
+        end
+        local db = YRG:GetModuleDB("BetterBagsModule")
+        if db then
+            db._lastNavTrace = navTrace
+        end
+        print("|cffffd100YRG BetterBagsModule:|r Debug watch ended (" .. tostring(reason) .. ", transitions=" .. tostring(#navTrace) .. "). /reload or log out to flush SavedVariables.")
+    end
 
-    if db then
-        db._lastDebug = lines
+    SLASH_YRGBAGDEBUG1 = "/yrgbagdebug"
+    SlashCmdList.YRGBAGDEBUG = function(msg)
+        local cmd = (type(msg) == "string") and msg:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
+        if cmd == "stop" then
+            StopWatch("manual")
+            return
+        elseif cmd == "watch" then
+            if not watchFrame then
+                watchFrame = CreateFrame("Frame")
+            end
+            navTrace = {}
+            capturedOpenSnapshot = false
+            lastWatchedBtn = nil
+            lastDpadHeld = nil
+            movedDuringHold = false
+            watchDeadline = (GetTime and GetTime() or 0) + 60
+            watchFrame:SetScript("OnUpdate", function()
+                local now = GetTime and GetTime() or 0
+                if now >= watchDeadline or #navTrace >= 25 then
+                    StopWatch(#navTrace >= 25 and "25 transitions" or "60s timeout")
+                    return
+                end
+                if ContainerFrameCombinedBags and ContainerFrameCombinedBags:IsShown() and IsControllerUIActive() then
+                    if not capturedOpenSnapshot then
+                        capturedOpenSnapshot = true
+                        if C_Timer and type(C_Timer.After) == "function" then
+                            C_Timer.After(0.25, function()
+                                CaptureBagDebug("_lastControllerDebug", true)
+                            end)
+                        else
+                            CaptureBagDebug("_lastControllerDebug", true)
+                        end
+                    end
+                    local heldKey = nil
+                    if type(IsKeyDown) == "function" then
+                        for _, k in ipairs({ "PADDUP", "PADDDOWN", "PADDLEFT", "PADDRIGHT" }) do
+                            local ok, down = pcall(IsKeyDown, k)
+                            if ok and down then
+                                heldKey = k
+                                break
+                            end
+                        end
+                    end
+                    if heldKey and heldKey ~= lastDpadHeld then
+                        lastDpadHeld = heldKey
+                        movedDuringHold = false
+                    elseif not heldKey and lastDpadHeld then
+                        if not movedDuringHold then
+                            navTrace[#navTrace + 1] = string.format("[%.2f] key=%s -> NO_CHANGE (cur=%s)",
+                                now, tostring(lastDpadHeld), lastWatchedBtn and SafeFrameName(lastWatchedBtn) or "nil")
+                        end
+                        lastDpadHeld = nil
+                        movedDuringHold = false
+                    end
+                    local sn = _G.SmartNavigation
+                    local cur = sn and SafeCall(sn.GetCurrentButton, sn)
+                    if cur and cur ~= lastWatchedBtn then
+                        navTrace[#navTrace + 1] = string.format("[%.2f] key=%s -> %s (prev=%s)",
+                            now, tostring(lastDpadHeld or "?"), DescribeBtn(cur),
+                            lastWatchedBtn and SafeFrameName(lastWatchedBtn) or "nil")
+                        lastWatchedBtn = cur
+                        movedDuringHold = true
+                    end
+                end
+            end)
+            print("|cffffd100YRG BetterBagsModule:|r Controller bag watch armed for 60s. Open bags in Controller Mode and navigate across Cols 4..10; type '/yrgbagdebug stop' when done.")
+            return
+        end
+        CaptureBagDebug("_lastDebug")
     end
 end
 
