@@ -95,7 +95,13 @@ local function GetMinimapUI()
 end
 
 local function HandleBuiltInCoordinates(takeOver)
+    local mui = GetMinimapUI()
+    mui.placardShowingCoords = takeOver and true or false
+
     local builtInCoords = {
+        (MinimapCluster and MinimapCluster.MinimapContainer and MinimapCluster.MinimapContainer.PlayerCoords) or false,
+        (MinimapCluster and MinimapCluster.PlayerCoords) or false,
+        (Minimap and Minimap.PlayerCoords) or false,
         _G["MinimapCoordinates"] or false,
         _G["MinimapCoordinatesText"] or false,
         (Minimap and Minimap.CoordinateFrame) or false,
@@ -124,6 +130,10 @@ local function HandleBuiltInCoordinates(takeOver)
                 end
             end
         end
+    end
+
+    if type(mui.UpdateBuiltInCoordinatesNudge) == "function" then
+        mui.UpdateBuiltInCoordinatesNudge()
     end
 end
 
@@ -849,6 +859,61 @@ function InfoPlacard:EnsureFrames()
     self.shardsBadge = CreatePlacardBadge(infoFrame, "RIGHT", 0.84, 0.58, 1.00)
 end
 
+function InfoPlacard:PositionPlacard(db)
+    if not self.infoFrame then return end
+    db = db or YRG:GetModuleDB("DynamicInfoPlacard")
+    if not db or not db.enabled or not self.infoFrame:IsShown() then return end
+
+    local mui = GetMinimapUI()
+    local userOffsetY = YRG.SafeNumber(db.infoPlacardOffsetY, -1)
+    local infoScale = mui.SafeRegionScale(self.infoFrame, 1)
+
+    local function AnchorToMinimapOrExp(targetLoc, expAnchor)
+        if expAnchor then
+            local expScale = mui.SafeRegionScale(expAnchor.container, infoScale)
+            local ratio = (infoScale > 0) and (expScale / infoScale) or 1
+            if targetLoc == "TOP" then
+                self.infoFrame:SetPoint("BOTTOM", expAnchor.container, "TOP", 0, (expAnchor.ringTopRimY * ratio) + 2 + userOffsetY)
+            else
+                self.infoFrame:SetPoint("TOP", expAnchor.expFrame, "BOTTOM", 0, 3 + userOffsetY)
+            end
+        elseif targetLoc == "TOP" then
+            self.infoFrame:SetPoint("BOTTOM", Minimap, "TOP", 0, 4 + userOffsetY)
+        else
+            self.infoFrame:SetPoint("TOP", Minimap, "BOTTOM", 0, -4 + userOffsetY)
+        end
+    end
+
+    self.infoFrame:ClearAllPoints()
+
+    local loc = (db.placardLocation == "TOP") and "TOP" or "BOTTOM"
+    local anchorMode = (db.placardAnchorPoint == "MINIMAP") and "MINIMAP" or "ZONE_TITLE"
+    local expInfo = (type(mui.GetExpAnchorInfo) == "function") and mui.GetExpAnchorInfo() or nil
+
+    if anchorMode == "ZONE_TITLE" then
+        local zoneTitle = (type(mui.GetZoneTitleAnchorFrame) == "function") and mui.GetZoneTitleAnchorFrame() or nil
+        if zoneTitle then
+            local zScale = mui.SafeRegionScale(zoneTitle, 1)
+            local mScale = mui.SafeRegionScale(Minimap, 1)
+            local zX = (type(mui.SafeRegionCenterX) == "function") and mui.SafeRegionCenterX(zoneTitle) or nil
+            local mX = (type(mui.SafeRegionCenterX) == "function") and mui.SafeRegionCenterX(Minimap) or nil
+            local xRelZoneCenter = 0
+            if zX and mX and infoScale > 0 then
+                xRelZoneCenter = ((mX * mScale) - (zX * zScale)) / infoScale
+            end
+            if loc == "TOP" then
+                self.infoFrame:SetPoint("BOTTOM", zoneTitle, "TOP", xRelZoneCenter, userOffsetY)
+            else
+                self.infoFrame:SetPoint("TOP", zoneTitle, "BOTTOM", xRelZoneCenter, userOffsetY)
+            end
+        else
+            AnchorToMinimapOrExp(loc, expInfo)
+        end
+    else
+        AnchorToMinimapOrExp(loc, expInfo)
+    end
+end
+
 function InfoPlacard:LayoutPlacard()
     if not self.infoFrame then return end
     local db = YRG:GetModuleDB("DynamicInfoPlacard")
@@ -870,7 +935,6 @@ function InfoPlacard:LayoutPlacard()
     local row1TSize = YRG.SafeNumber(db.row1TextSize or db.textSize, 13)
     local row2TSize = YRG.SafeNumber(db.row2TextSize or db.textSize, 14)
     local pad = db.cellPadding or 9
-    local userOffsetY = YRG.SafeNumber(db.infoPlacardOffsetY, -1)
     local fixedWidth = YRG.SafeNumber(db.infoPlacardWidth, 254)
     local dividerAlpha = math.max(0, math.min(1, (YRG.SafeNumber(db.rowDividerOpacityPct, 15)) / 100.0))
     local extraRowPad = math.max(0, YRG.SafeNumber(db.rowExtraPadding, 6))
@@ -982,62 +1046,10 @@ function InfoPlacard:LayoutPlacard()
         end
     end
 
-    local infoScale = mui.SafeRegionScale(self.infoFrame, 1)
-    local function AnchorToMinimapOrExp(targetLoc, expAnchor)
-        if expAnchor then
-            local expScale = mui.SafeRegionScale(expAnchor.container, infoScale)
-            local ratio = (infoScale > 0) and (expScale / infoScale) or 1
-            if targetLoc == "TOP" then
-                self.infoFrame:SetPoint("BOTTOM", expAnchor.container, "TOP", 0, (expAnchor.ringTopRimY * ratio) + 2 + userOffsetY)
-            else
-                self.infoFrame:SetPoint("TOP", expAnchor.expFrame, "BOTTOM", 0, 3 + userOffsetY)
-            end
-        elseif targetLoc == "TOP" then
-            self.infoFrame:SetPoint("BOTTOM", Minimap, "TOP", 0, 4 + userOffsetY)
-        else
-            self.infoFrame:SetPoint("TOP", Minimap, "BOTTOM", 0, -4 + userOffsetY)
-        end
-    end
-
     self.infoFrame:SetSize(finalInfoW, finalInfoH)
-    self.infoFrame:ClearAllPoints()
-
-    local loc = (db.placardLocation == "TOP") and "TOP" or "BOTTOM"
-    local anchorMode = (db.placardAnchorPoint == "MINIMAP") and "MINIMAP" or "ZONE_TITLE"
-    local expInfo = (type(mui.GetExpAnchorInfo) == "function") and mui.GetExpAnchorInfo() or nil
-
-    if anchorMode == "ZONE_TITLE" then
-        local zoneTitle = (type(mui.GetZoneTitleAnchorFrame) == "function") and mui.GetZoneTitleAnchorFrame() or nil
-        if zoneTitle then
-            local zScale = mui.SafeRegionScale(zoneTitle, 1)
-            local mScale = mui.SafeRegionScale(Minimap, 1)
-            if loc == "TOP" then
-                local zTop = (type(mui.SafeRegionTop) == "function") and mui.SafeRegionTop(zoneTitle) or nil
-                local mTop = (type(mui.SafeRegionTop) == "function") and mui.SafeRegionTop(Minimap) or nil
-                if zTop and mTop and infoScale > 0 then
-                    local yRelMapTop = ((zTop * zScale) - (mTop * mScale)) / infoScale + userOffsetY
-                    self.infoFrame:SetPoint("BOTTOM", Minimap, "TOP", 0, yRelMapTop)
-                else
-                    self.infoFrame:SetPoint("BOTTOM", zoneTitle, "TOP", 0, userOffsetY)
-                end
-            else
-                local zBot = (type(mui.SafeRegionBottom) == "function") and mui.SafeRegionBottom(zoneTitle) or nil
-                local mBot = (type(mui.SafeRegionBottom) == "function") and mui.SafeRegionBottom(Minimap) or nil
-                if zBot and mBot and infoScale > 0 then
-                    local yRelMapBot = ((zBot * zScale) - (mBot * mScale)) / infoScale + userOffsetY
-                    self.infoFrame:SetPoint("TOP", Minimap, "BOTTOM", 0, yRelMapBot)
-                else
-                    self.infoFrame:SetPoint("TOP", zoneTitle, "BOTTOM", 0, userOffsetY)
-                end
-            end
-        else
-            AnchorToMinimapOrExp(loc, expInfo)
-        end
-    else
-        AnchorToMinimapOrExp(loc, expInfo)
-    end
-
     self.infoFrame:Show()
+    self:PositionPlacard(db)
+
     if type(mui.SyncHeaderAndEditMode) == "function" then
         mui.SyncHeaderAndEditMode()
     end
@@ -1224,6 +1236,12 @@ function InfoPlacard:OnInitialize(db)
         local modDB = YRG:GetModuleDB("DynamicInfoPlacard")
         if modDB and modDB.enabled then
             InfoPlacard:LayoutPlacard()
+        end
+    end
+    mui.onInfoPlacardReposition = function()
+        local modDB = YRG:GetModuleDB("DynamicInfoPlacard")
+        if modDB and modDB.enabled then
+            InfoPlacard:PositionPlacard(modDB)
         end
     end
     mui.AppendKillPaceTooltipLines = function(remXP)

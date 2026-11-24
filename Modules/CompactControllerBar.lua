@@ -205,6 +205,8 @@ local S = {
 
     header = nil,
     holder = nil,
+    secureHolder = nil,
+    centerSlot = nil,
     guideHolder = nil,
     toolsHolder = nil,
     slots = {},
@@ -215,9 +217,7 @@ local S = {
     anchorPoints = {},
     buttonPoints = {},
     buttonSizes = {},
-    barButtonHooked = {},
     reanchorBarGuard = false,
-    barDriftPending = false,
 
     -- Extra Class/Pet/Stance buttons & flyout wheel state
     classSlots = {},      -- "Left"/"Right" -> SecureFrameTemplate slot
@@ -237,6 +237,17 @@ local S = {
     hookedFlyouts = {},
     origFlyoutPoints = {},
     flyoutConfirmPending = {},
+    flyoutScanPending = false,
+    classResnapPending = false,
+    classResnapTimer = false,
+    classWrapDebug = {},
+    secureFlyouts = {},
+    wrappedFlyoutSlices = {},
+    flyoutCount = 0,
+    wrappedClickScripts = {},
+    wrappedClassClickScripts = {},
+    rewrapQueued = false,
+    lastTraceStamp = {},
     centeringFlyoutGuard = false,
     hookedClassClick = {},
 
@@ -329,12 +340,30 @@ local function IsCVarOn(name)
     return false
 end
 
+local function IsForbiddenSafe(f)
+    if type(f) ~= "table" then return true end
+    if type(f.IsForbidden) == "function" then
+        local ok, forb = pcall(f.IsForbidden, f)
+        if not ok or forb then return true end
+    end
+    return false
+end
+
 local function IsProtectedSafe(f)
     if not f then return true end
     if type(f.IsForbidden) == "function" and f:IsForbidden() then return true end
     if type(f.IsProtected) == "function" then
         local ok, prot = pcall(f.IsProtected, f)
         if ok and prot then return true end
+    end
+    return false
+end
+
+local function IsExplicitlyProtected(f)
+    if type(f) ~= "table" or IsForbiddenSafe(f) then return false end
+    if type(f.IsProtected) == "function" then
+        local ok, prot = pcall(f.IsProtected, f)
+        return ok and prot and true or false
     end
     return false
 end
@@ -636,15 +665,7 @@ end
 
 -- Forward declarations
 local SyncLayout, PlaceSections, ApplyStyle, FitStyle, RefreshEmphasis, SetStyleShown, HandBack, HandBackWhenPossible, SetMoverActive, UpdateMoverBox
-
-local function IsForbiddenSafe(f)
-    if type(f) ~= "table" then return true end
-    if type(f.IsForbidden) == "function" then
-        local ok, forb = pcall(f.IsForbidden, f)
-        if not ok or forb then return true end
-    end
-    return false
-end
+local ApplyClassButtonFrames, ScanFlyoutCandidates, RewrapModifiedActionButtons, FLYOUT_SHOW_SNIP, FLYOUT_HIDE_SNIP
 
 local function RunCore(fn)
     if S.stopped then return false end
@@ -690,7 +711,7 @@ local function SafeTry(piece, fn)
 end
 
 --------------------------------------------------------------------------------
--- Selection Wheel (FlyoutRadial) Centering
+-- Selection Wheel (GamepadRadial) Centering
 --------------------------------------------------------------------------------
 local function SafeFrameLabel(frame)
     if IsForbiddenSafe(frame) then return "" end
@@ -702,24 +723,9 @@ local function SafeFrameLabel(frame)
     return (ok and type(nm) == "string") and nm or ""
 end
 
-local function HasDeniedFlyoutToken(low)
-    if type(low) ~= "string" or low == "" then return false end
-    for _, deny in ipairs({
-        "icon", "mask", "shadow", "ring", "border", "background", "backdrop",
-        "glow", "flash", "highlight", "prompt", "cooldown", "overlay", "edge", "wedge",
-        "actionbutton", "button", "anim", "reticle", "interrupt", "arrow", "autocast",
-        "textoverlay", "slot",
-    }) do
-        if low:find(deny, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
 local function IsBarOrClassFrame(f)
     if not f then return false end
-    if f == S.holder or f == S.mover or f == S.art or f == S.tray or f == UIParent
+    if f == S.holder or f == S.secureHolder or f == S.mover or f == S.art or f == S.tray or f == UIParent
         or f == S.root or f == S.pageUnit or f == S.guide or f == S.pageIndicator then
         return true
     end
@@ -747,35 +753,38 @@ local function IsBarOrClassFrame(f)
     return false
 end
 
-local function ReanchorBarButtonIfDrifted(button)
-    if S.reanchorBarGuard or not S.applied then return end
-    local slot = S.slots[button]
-    if not slot or IsForbiddenSafe(button) then return end
-    if InCombatLockdown() then
-        S.barDriftPending = true
-        return
-    end
-    local okN, n = pcall(button.GetNumPoints, button)
-    if okN and n == 1 then
-        local okP, pt, rel, relPt, ox, oy = pcall(button.GetPoint, button, 1)
-        if okP and pt == "CENTER" and rel == slot and relPt == "CENTER"
-            and math.abs(tonumber(ox) or 0) < 0.5 and math.abs(tonumber(oy) or 0) <= 3 then
-            return
+local function HasDeniedFlyoutToken(low)
+    if type(low) ~= "string" or low == "" then return false end
+    for _, deny in ipairs({
+        "icon", "mask", "shadow", "ring", "border", "background", "backdrop",
+        "glow", "flash", "highlight", "prompt", "cooldown", "overlay", "edge", "wedge",
+        "actionbutton", "button", "anim", "reticle", "interrupt", "arrow", "autocast",
+        "textoverlay", "slot", "staticpopup", "tooltip", "tutorial", "editmode",
+        "dropdown", "equipment", "collections", "wardrobe", "heirloom", "store",
+    }) do
+        if low:find(deny, 1, true) then
+            return true
         end
     end
-    S.reanchorBarGuard = true
-    pcall(function()
-        button:ClearAllPoints()
-        button:SetPoint("CENTER", slot, "CENTER")
-    end)
-    S.reanchorBarGuard = false
+    return false
 end
 
-local function ReanchorDriftedBarButtons()
-    if S.reanchorBarGuard or not S.applied or InCombatLockdown() then return end
-    S.barDriftPending = false
-    for button in pairs(S.slots) do
-        ReanchorBarButtonIfDrifted(button)
+local function RecordFlyoutTrace(tag, detail)
+    local db = GetDB()
+    if not db then return end
+    local now = (type(GetTime) == "function" and GetTime()) or 0
+    if S.lastTraceStamp[tag] and (now - S.lastTraceStamp[tag]) < 0.25 and S.lastTraceDetail == detail then
+        return
+    end
+    S.lastTraceStamp[tag] = now
+    S.lastTraceDetail = detail
+    if type(db._lastFlyoutDebug) ~= "table" then
+        db._lastFlyoutDebug = {}
+    end
+    local log = db._lastFlyoutDebug
+    log[#log + 1] = string.format("[%.1f c=%s] %s: %s", now, tostring(InCombatLockdown()), tostring(tag), tostring(detail or ""))
+    while #log > 15 do
+        table.remove(log, 1)
     end
 end
 
@@ -799,21 +808,6 @@ local function IsFlyoutExcludedFrame(frame)
     end
     if HasDeniedFlyoutToken(SafeFrameLabel(frame):lower()) then
         return true
-    end
-    local cur = frame
-    for _ = 1, 6 do
-        local okPar, par = pcall(cur.GetParent, cur)
-        if not okPar or not par or par == UIParent then break end
-        if par ~= S.root and par ~= S.pageUnit and IsBarOrClassFrame(par) then
-            return true
-        end
-        local okPBtn, pBtn = pcall(function()
-            return type(par.IsObjectType) == "function" and par:IsObjectType("Button")
-        end)
-        if okPBtn and pBtn then
-            return true
-        end
-        cur = par
     end
     return false
 end
@@ -877,29 +871,103 @@ local function CenterFlyoutFrame(flyout)
     end
 end
 
+local function WrapProtectedFlyoutSlices(frame, depth)
+    if InCombatLockdown() or not S.header or type(frame) ~= "table" or type(frame.GetChildren) ~= "function" then
+        return
+    end
+    depth = depth or 0
+    if depth > 4 then return end
+    local ok, kids = pcall(function() return { frame:GetChildren() } end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, ch in ipairs(kids) do
+        if type(ch) == "table" and not IsForbiddenSafe(ch) then
+            if not S.wrappedFlyoutSlices[ch] and IsExplicitlyProtected(ch) then
+                local okBtn, isBtn = pcall(function()
+                    return type(ch.IsObjectType) == "function" and ch:IsObjectType("Button")
+                end)
+                if okBtn and isBtn then
+                    local okWrap = pcall(SecureHandlerWrapScript, ch, "OnClick", S.header, "return nil, true", FLYOUT_HIDE_SNIP)
+                    if okWrap then
+                        S.wrappedFlyoutSlices[ch] = true
+                    end
+                end
+            end
+            WrapProtectedFlyoutSlices(ch, depth + 1)
+        end
+    end
+end
+
+local function DescribeFrameCompact(f)
+    if type(f) ~= "table" or IsForbiddenSafe(f) then return "invalid" end
+    local nm = SafeFrameLabel(f)
+    if nm == "" then nm = "anon" end
+    local okSh, sh = pcall(function() return type(f.IsShown) == "function" and f:IsShown() end)
+    local okPr, pr, epr = pcall(function() return type(f.IsProtected) == "function" and f:IsProtected() end)
+    local okPt, pt, rel = pcall(function() return type(f.GetPoint) == "function" and f:GetPoint(1) end)
+    local relNm = (okPt and rel) and SafeFrameLabel(rel) or "nil"
+    if relNm == "" then relNm = "anon" end
+    return string.format("%s(sh=%s,pr=%s/%s,pt=%s->%s)", nm, tostring(okSh and sh), tostring(okPr and pr), tostring(okPr and epr), tostring(okPt and pt), relNm)
+end
+
 local function RegisterFlyoutCandidate(frame)
-    if IsFlyoutExcludedFrame(frame) or S.hookedFlyouts[frame] or type(frame.SetPoint) ~= "function" then
+    if IsFlyoutExcludedFrame(frame) or type(frame.SetPoint) ~= "function" then
+        return
+    end
+    local isProt = IsExplicitlyProtected(frame)
+    if S.hookedFlyouts[frame] then
+        if isProt and not InCombatLockdown() then
+            WrapProtectedFlyoutSlices(frame, 0)
+        end
+        return
+    end
+    if InCombatLockdown() and isProt then
+        S.flyoutScanPending = true
+        RecordFlyoutTrace("ProtFlyoutDeferred", DescribeFrameCompact(frame))
         return
     end
     S.hookedFlyouts[frame] = true
-    if type(frame.HookScript) == "function" then
-        pcall(frame.HookScript, frame, "OnShow", CenterFlyoutFrame)
-        pcall(frame.HookScript, frame, "OnHide", function()
-            C_Timer.After(0, ReanchorDriftedBarButtons)
-        end)
-        local low = SafeFrameLabel(frame):lower()
-        if low:find("flyout", 1, true) or low:find("radial", 1, true) or low:find("wheel", 1, true) then
-            pcall(frame.HookScript, frame, "OnUpdate", ApplyFlyoutCenterPoint)
+    local function OnFlyoutShown(f)
+        CenterFlyoutFrame(f)
+        if not InCombatLockdown() and IsExplicitlyProtected(f) then
+            WrapProtectedFlyoutSlices(f, 0)
         end
+    end
+    local function OnFlyoutClosed()
+        C_Timer.After(0, function()
+            if S.applied and not S.reanchorGuard then
+                local db = GetDB()
+                if db and db.enabled then
+                    ApplyClassButtonFrames(db)
+                end
+            end
+        end)
+    end
+    if isProt and S.header and not S.secureFlyouts[frame] then
+        S.flyoutCount = (S.flyoutCount or 0) + 1
+        local idx = S.flyoutCount
+        local fRef = "flyout" .. idx
+        S.secureFlyouts[frame] = idx
+        S.header:SetAttribute("flyoutCount", idx)
+        pcall(SecureHandlerSetFrameRef, S.header, fRef, frame)
+        if FLYOUT_SHOW_SNIP and FLYOUT_HIDE_SNIP then
+            local showSnip = FLYOUT_SHOW_SNIP:gsub("%$FREF", fRef)
+            pcall(SecureHandlerWrapScript, frame, "OnShow", S.header, "return true, true", showSnip)
+            pcall(SecureHandlerWrapScript, frame, "OnHide", S.header, "return true, true", FLYOUT_HIDE_SNIP)
+        end
+        WrapProtectedFlyoutSlices(frame, 0)
+    end
+    if type(frame.HookScript) == "function" then
+        pcall(frame.HookScript, frame, "OnShow", OnFlyoutShown)
+        pcall(frame.HookScript, frame, "OnHide", OnFlyoutClosed)
     end
     pcall(hooksecurefunc, frame, "SetPoint", CenterFlyoutFrame)
     pcall(hooksecurefunc, frame, "SetAllPoints", CenterFlyoutFrame)
-    pcall(hooksecurefunc, frame, "Show", CenterFlyoutFrame)
+    pcall(hooksecurefunc, frame, "Show", OnFlyoutShown)
     pcall(hooksecurefunc, frame, "SetShown", function(f, shown)
         if shown then
-            CenterFlyoutFrame(f)
+            OnFlyoutShown(f)
         else
-            C_Timer.After(0, ReanchorDriftedBarButtons)
+            OnFlyoutClosed()
         end
     end)
     if type(frame.Layout) == "function" then
@@ -911,21 +979,24 @@ local function RegisterFlyoutCandidate(frame)
     end
 end
 
-local function MatchesFlyoutName(low)
+local function MatchesFlyoutName(low, allowPopup)
     if type(low) ~= "string" or low == "" then return false end
-    if not (low:find("flyout", 1, true) or low:find("radial", 1, true) or low:find("wheel", 1, true)) then
+    local matched = low:find("flyout", 1, true) or low:find("radial", 1, true) or low:find("wheel", 1, true)
+        or (allowPopup and low:find("popup", 1, true))
+    if not matched then
         return false
     end
     return not HasDeniedFlyoutToken(low)
 end
 
-local function ScanFlyoutCandidates()
+ScanFlyoutCandidates = function()
     local function CheckKids(parent)
-        if IsForbiddenSafe(parent) then return end
+        if IsForbiddenSafe(parent) or type(parent) ~= "table" then return end
         pcall(function()
             for k, v in pairs(parent) do
-                if type(k) == "string" and not IsFlyoutExcludedFrame(v) then
-                    if MatchesFlyoutName(k:lower()) then
+                if type(k) == "string" and type(v) == "table" and not IsFlyoutExcludedFrame(v) then
+                    local kl = k:lower()
+                    if MatchesFlyoutName(kl, true) or MatchesFlyoutName(SafeFrameLabel(v):lower(), true) then
                         RegisterFlyoutCandidate(v)
                     end
                 end
@@ -937,7 +1008,7 @@ local function ScanFlyoutCandidates()
                 for _, child in ipairs(kids) do
                     if not IsFlyoutExcludedFrame(child) then
                         local low = SafeFrameLabel(child):lower()
-                        if MatchesFlyoutName(low) then
+                        if MatchesFlyoutName(low, true) then
                             RegisterFlyoutCandidate(child)
                         end
                     end
@@ -948,9 +1019,18 @@ local function ScanFlyoutCandidates()
 
     if S.pageUnit then
         CheckKids(S.pageUnit)
+        for _, side in ipairs(CFG.SIDES) do
+            CheckKids(S.pageUnit[side .. "ClassAction"])
+        end
     end
     if S.root then
         CheckKids(S.root)
+    end
+    for _, info in ipairs(S.flatBars) do
+        local bar = info.bar
+        if not info.section then
+            CheckKids(bar)
+        end
     end
     if UIParent and type(UIParent.GetChildren) == "function" then
         local ok, kids = pcall(function() return { UIParent:GetChildren() } end)
@@ -974,6 +1054,7 @@ local function ScanFlyoutCandidates()
     }) do
         if type(_G[gName]) == "table" then
             RegisterFlyoutCandidate(_G[gName])
+            CheckKids(_G[gName])
         end
     end
     for f in pairs(S.hookedFlyouts) do
@@ -1040,7 +1121,7 @@ local function StylePlacardFrame(frame)
 end
 
 local function ApplySquareClassButtonStyle(side, btn, makeSquare)
-    if IsForbiddenSafe(btn) or InCombatLockdown() then return end
+    if IsForbiddenSafe(btn) or (InCombatLockdown() and IsProtectedSafe(btn)) then return end
     local plate = S.classPlates[side]
     local icon = btn.Icon or btn.icon or btn.IconTexture
     if not makeSquare then
@@ -1170,13 +1251,14 @@ local function ApplySquareClassButtonStyle(side, btn, makeSquare)
     end
 end
 
-local function ApplyClassButtonFrames(db)
-    if not S.pageUnit or InCombatLockdown() or S.reanchorGuard then return end
+ApplyClassButtonFrames = function(db)
+    if not S.pageUnit or S.reanchorGuard then return end
+    local inCombat = InCombatLockdown()
     local inline = (db.classButtonLayout or "INLINE") == "INLINE"
     local makeSquare = (db.squareClassButtons ~= false)
     local classSize = GetClassButtonSize(db)
 
-    if S.header then
+    if S.header and not inCombat then
         S.header:SetAttribute("classInline", inline)
         S.header:SetAttribute("classBtnSize", classSize)
     end
@@ -1189,56 +1271,64 @@ local function ApplyClassButtonFrames(db)
             local slot = S.classSlots[side]
             local pSlot = S.classPromptSlots[side]
 
-            if not IsForbiddenSafe(btn) and type(btn.SetPoint) == "function" then
-                SaveClassOriginals(side, btn)
-                if type(btn.SetIgnoreParentAlpha) == "function" then
-                    S.classIgnParentAlpha[btn] = true
-                    btn:SetIgnoreParentAlpha(true)
-                end
-                if inline and slot then
-                    btn:ClearAllPoints()
-                    btn:SetPoint("CENTER", slot, "CENTER", 0, 0)
-                    if type(btn.SetScale) == "function" then btn:SetScale(1) end
-                    ApplySquareClassButtonStyle(side, btn, makeSquare)
+            if type(btn) == "table" and not IsForbiddenSafe(btn) and type(btn.SetPoint) == "function" then
+                if inCombat and IsProtectedSafe(btn) then
+                    S.classResnapPending = true
                 else
-                    ApplySquareClassButtonStyle(side, btn, false)
-                    if type(btn.SetScale) == "function" then
-                        btn:SetScale(S.classOrigScales[btn] or 1)
+                    SaveClassOriginals(side, btn)
+                    if type(btn.SetIgnoreParentAlpha) == "function" then
+                        S.classIgnParentAlpha[btn] = true
+                        btn:SetIgnoreParentAlpha(true)
                     end
-                    if S.classOrigPoints[btn] then
+                    if inline and slot then
                         btn:ClearAllPoints()
-                        for _, pt in ipairs(S.classOrigPoints[btn]) do
-                            btn:SetPoint(unpack(pt, 1, 5))
+                        btn:SetPoint("CENTER", slot, "CENTER", 0, 0)
+                        if type(btn.SetScale) == "function" then btn:SetScale(1) end
+                        ApplySquareClassButtonStyle(side, btn, makeSquare)
+                    else
+                        ApplySquareClassButtonStyle(side, btn, false)
+                        if type(btn.SetScale) == "function" then
+                            btn:SetScale(S.classOrigScales[btn] or 1)
+                        end
+                        if S.classOrigPoints[btn] then
+                            btn:ClearAllPoints()
+                            for _, pt in ipairs(S.classOrigPoints[btn]) do
+                                btn:SetPoint(unpack(pt, 1, 5))
+                            end
                         end
                     end
                 end
             end
 
             local pScale = GetClassPromptScale(db)
-            if not IsForbiddenSafe(prompt) and type(prompt.SetPoint) == "function" then
-                SaveClassOriginals(side .. "Prompt", prompt)
-                if type(prompt.SetIgnoreParentAlpha) == "function" then
-                    S.classIgnParentAlpha[prompt] = true
-                    prompt:SetIgnoreParentAlpha(true)
-                end
-                if inline and pSlot then
-                    prompt:ClearAllPoints()
-                    prompt:SetPoint("CENTER", pSlot, "CENTER", 0, 0)
+            if type(prompt) == "table" and not IsForbiddenSafe(prompt) and type(prompt.SetPoint) == "function" then
+                if inCombat and IsProtectedSafe(prompt) then
+                    S.classResnapPending = true
                 else
-                    if S.classOrigPoints[prompt] then
+                    SaveClassOriginals(side .. "Prompt", prompt)
+                    if type(prompt.SetIgnoreParentAlpha) == "function" then
+                        S.classIgnParentAlpha[prompt] = true
+                        prompt:SetIgnoreParentAlpha(true)
+                    end
+                    if inline and pSlot then
                         prompt:ClearAllPoints()
-                        for _, pt in ipairs(S.classOrigPoints[prompt]) do
-                            prompt:SetPoint(unpack(pt, 1, 5))
+                        prompt:SetPoint("CENTER", pSlot, "CENTER", 0, 0)
+                    else
+                        if S.classOrigPoints[prompt] then
+                            prompt:ClearAllPoints()
+                            for _, pt in ipairs(S.classOrigPoints[prompt]) do
+                                prompt:SetPoint(unpack(pt, 1, 5))
+                            end
                         end
                     end
-                end
-                if type(prompt.SetScale) == "function" then
-                    prompt:SetScale(pScale)
-                elseif type(prompt.SetFont) == "function" then
-                    local okF, fPath, fSize, fFlags = pcall(prompt.GetFont, prompt)
-                    if okF and fPath and type(fSize) == "number" then
-                        if not S.fontBaseSizes[prompt] then S.fontBaseSizes[prompt] = fSize end
-                        pcall(prompt.SetFont, prompt, fPath, math.max(6, math.floor(S.fontBaseSizes[prompt] * pScale + 0.5)), fFlags)
+                    if type(prompt.SetScale) == "function" then
+                        prompt:SetScale(pScale)
+                    elseif type(prompt.SetFont) == "function" then
+                        local okF, fPath, fSize, fFlags = pcall(prompt.GetFont, prompt)
+                        if okF and fPath and type(fSize) == "number" then
+                            if not S.fontBaseSizes[prompt] then S.fontBaseSizes[prompt] = fSize end
+                            pcall(prompt.SetFont, prompt, fPath, math.max(6, math.floor(S.fontBaseSizes[prompt] * pScale + 0.5)), fFlags)
+                        end
                     end
                 end
             end
@@ -1294,15 +1384,50 @@ end
 local function InstallClassButtonHooks()
     if not S.pageUnit then return end
     local function ReSnapIfInline()
-        if S.reanchorGuard or not S.applied or InCombatLockdown() then return end
+        if S.reanchorGuard or not S.applied then return end
         local db = GetDB()
         if db and db.enabled then
             ApplyClassButtonFrames(db)
         end
     end
-    local function RescanFlyoutLater()
-        ScanFlyoutCandidates()
-        C_Timer.After(0, ScanFlyoutCandidates)
+    local function ScheduleClassResnap()
+        ReSnapIfInline()
+        if not S.classResnapTimer then
+            S.classResnapTimer = true
+            C_Timer.After(0, function()
+                S.classResnapTimer = false
+                ReSnapIfInline()
+            end)
+            C_Timer.After(0.05, ReSnapIfInline)
+        end
+    end
+    local function InspectButtonFlyoutRefs(tag, side, btn)
+        ScheduleClassResnap()
+        if tag == "OnFlyoutOpened" or tag == "UpdateFlyoutPopup" or tag == "OnFlyoutClosed" then
+            if type(btn) == "table" and not IsForbiddenSafe(btn) then
+                local okPar, par = pcall(btn.GetParent, btn)
+                if okPar and par and par ~= S.pageUnit and par ~= UIParent and par ~= S.root then
+                    RegisterFlyoutCandidate(par)
+                end
+                pcall(function()
+                    for k, v in pairs(btn) do
+                        if type(k) == "string" and type(v) == "table" then
+                            local kl = k:lower()
+                            if (kl:find("flyout", 1, true) or kl:find("radial", 1, true)
+                                or kl:find("wheel", 1, true) or kl:find("popup", 1, true))
+                                and not IsFlyoutExcludedFrame(v) then
+                                RegisterFlyoutCandidate(v)
+                            end
+                        end
+                    end
+                end)
+                RecordFlyoutTrace(tag .. ":" .. tostring(side),
+                    DescribeFrameCompact(btn) .. " par=" .. DescribeFrameCompact(okPar and par or nil))
+            end
+        end
+    end
+    local function OnClassInteract()
+        ScheduleClassResnap()
     end
 
     for _, side in ipairs(CFG.SIDES) do
@@ -1310,69 +1435,135 @@ local function InstallClassButtonHooks()
         if btn and not S.classHooked[btn] then
             S.classHooked[btn] = true
             SaveClassOriginals(side, btn)
-            pcall(hooksecurefunc, btn, "SetPoint", ReSnapIfInline)
-            pcall(hooksecurefunc, btn, "SetSize", ReSnapIfInline)
-            pcall(hooksecurefunc, btn, "SetWidth", ReSnapIfInline)
-            pcall(hooksecurefunc, btn, "SetHeight", ReSnapIfInline)
+            for _, fnName in ipairs({
+                "SetPoint", "SetAllPoints", "SetPointsOffset", "AdjustPointsOffset",
+                "SetSize", "SetWidth", "SetHeight",
+            }) do
+                if type(btn[fnName]) == "function" then
+                    pcall(hooksecurefunc, btn, fnName, ScheduleClassResnap)
+                end
+            end
+            for _, flyFn in ipairs({
+                "UpdateFlyout", "UpdateFlyoutPopup", "OnFlyoutOpened",
+                "OnFlyoutClosed", "HandleFlyoutClickOverride",
+            }) do
+                if type(btn[flyFn]) == "function" then
+                    pcall(hooksecurefunc, btn, flyFn, function(selfBtn)
+                        if flyFn == "UpdateFlyout" or flyFn == "HandleFlyoutClickOverride" then
+                            if S.applied and not S.rewrapQueued and type(btn.GetScript) == "function"
+                                and btn:GetScript("OnClick") ~= S.wrappedClassClickScripts[btn] then
+                                S.rewrapQueued = true
+                                C_Timer.After(0, function()
+                                    S.rewrapQueued = false
+                                    if S.applied and RewrapModifiedActionButtons then
+                                        RunOutOfCombat("rewrap_actions", RewrapModifiedActionButtons)
+                                    end
+                                end)
+                            end
+                            return
+                        end
+                        InspectButtonFlyoutRefs(flyFn, side, selfBtn or btn)
+                    end)
+                end
+            end
             if type(btn.HookScript) == "function" then
                 pcall(btn.HookScript, btn, "OnShow", function()
-                    ReSnapIfInline()
+                    ScheduleClassResnap()
                     if S.classPlates[side] and S.styleShown then
                         local db = GetDB()
                         local showBg = (not db) or (db.showBarBackground ~= false)
                         S.classPlates[side]:SetShown(showBg and db and (db.classButtonLayout or "INLINE") == "INLINE" and db.squareClassButtons ~= false)
                     end
-                    RescanFlyoutLater()
                 end)
                 pcall(btn.HookScript, btn, "OnHide", function()
                     if S.classPlates[side] then
                         S.classPlates[side]:Hide()
                     end
                 end)
-                pcall(btn.HookScript, btn, "OnClick", RescanFlyoutLater)
-                pcall(btn.HookScript, btn, "OnMouseDown", RescanFlyoutLater)
-                pcall(btn.HookScript, btn, "OnEvent", RescanFlyoutLater)
+                pcall(btn.HookScript, btn, "OnClick", OnClassInteract)
+                pcall(btn.HookScript, btn, "OnMouseDown", OnClassInteract)
+                pcall(btn.HookScript, btn, "OnMouseUp", OnClassInteract)
             end
-            pcall(function()
-                for k, v in pairs(btn) do
-                    if type(k) == "string" and type(v) == "function" then
-                        local low = k:lower()
-                        if low:find("flyout", 1, true) or low:find("radial", 1, true) or low:find("wheel", 1, true)
-                            or low:find("open", 1, true) or low:find("toggle", 1, true) or low:find("activate", 1, true) then
-                            pcall(hooksecurefunc, btn, k, RescanFlyoutLater)
-                        end
-                    end
-                end
-            end)
         end
         local prompt = S.pageUnit[side .. "InputPrompt"]
         if prompt and not S.classHooked[prompt] then
             S.classHooked[prompt] = true
             SaveClassOriginals(side .. "Prompt", prompt)
-            pcall(hooksecurefunc, prompt, "SetPoint", ReSnapIfInline)
-            pcall(hooksecurefunc, prompt, "SetScale", ReSnapIfInline)
+            for _, fnName in ipairs({ "SetPoint", "SetAllPoints", "SetScale" }) do
+                if type(prompt[fnName]) == "function" then
+                    pcall(hooksecurefunc, prompt, fnName, ScheduleClassResnap)
+                end
+            end
             if type(prompt.HookScript) == "function" then
-                pcall(prompt.HookScript, prompt, "OnShow", ReSnapIfInline)
+                pcall(prompt.HookScript, prompt, "OnShow", ScheduleClassResnap)
             end
         end
     end
-    pcall(function()
-        for k, v in pairs(S.pageUnit) do
-            if type(k) == "string" and type(v) == "function" then
-                local low = k:lower()
-                if low:find("flyout", 1, true) or low:find("radial", 1, true) or low:find("wheel", 1, true)
-                    or low:find("classaction", 1, true) then
-                    pcall(hooksecurefunc, S.pageUnit, k, RescanFlyoutLater)
-                end
-            end
-        end
-    end)
 end
 
 --------------------------------------------------------------------------------
 -- Flat Layout Engine (One Bar Mode)
 --------------------------------------------------------------------------------
 local PRE_CLICK = "return nil, true"
+local PRE_SHOW = "return true, true"
+local FLYOUT_SNAP_BODY = [[
+    local bars = owner:GetAttribute("barCount") or 0
+    local count = owner:GetAttribute("btnCount") or 8
+    local group = owner:GetAttribute("groupCount") or 4
+    local sq = owner:GetAttribute("sqSize") or 32
+    local rd = owner:GetAttribute("rdSize") or 30
+    for b = 1, bars do
+        for i = 1, count do
+            local btn = owner:GetFrameRef("b" .. b .. "-" .. i)
+            local slot = owner:GetFrameRef("s" .. b .. "-" .. i)
+            if btn and slot then
+                local sz = i > group and rd or sq
+                btn:ClearAllPoints()
+                btn:SetPoint("CENTER", slot, "CENTER", 0, 0)
+                btn:SetWidth(sz)
+                btn:SetHeight(sz)
+            end
+        end
+    end
+    if owner:GetAttribute("classInline") then
+        local cSize = owner:GetAttribute("classBtnSize")
+        local cbL, csL = owner:GetFrameRef("classBtnLeft"), owner:GetFrameRef("classSlotLeft")
+        if cbL and csL then
+            cbL:ClearAllPoints()
+            cbL:SetPoint("CENTER", csL, "CENTER", 0, 0)
+            if cSize then cbL:SetWidth(cSize); cbL:SetHeight(cSize) end
+        end
+        local cpL, cpsL = owner:GetFrameRef("classPromptLeft"), owner:GetFrameRef("classPSlotLeft")
+        if cpL and cpsL then cpL:ClearAllPoints(); cpL:SetPoint("CENTER", cpsL, "CENTER", 0, 0) end
+        local cbR, csR = owner:GetFrameRef("classBtnRight"), owner:GetFrameRef("classSlotRight")
+        if cbR and csR then
+            cbR:ClearAllPoints()
+            cbR:SetPoint("CENTER", csR, "CENTER", 0, 0)
+            if cSize then cbR:SetWidth(cSize); cbR:SetHeight(cSize) end
+        end
+        local cpR, cpsR = owner:GetFrameRef("classPromptRight"), owner:GetFrameRef("classPSlotRight")
+        if cpR and cpsR then cpR:ClearAllPoints(); cpR:SetPoint("CENTER", cpsR, "CENTER", 0, 0) end
+    end
+]]
+FLYOUT_SHOW_SNIP = [[
+    if owner:GetAttribute("flat") then
+        if owner:GetAttribute("centerWheel") then
+            local f = owner:GetFrameRef("$FREF")
+            local cs = owner:GetFrameRef("centerSlot")
+            if f and cs then
+                f:ClearAllPoints()
+                f:SetPoint("CENTER", cs, "CENTER", 0, 0)
+            end
+        end
+]] .. FLYOUT_SNAP_BODY .. [[
+    end
+]]
+FLYOUT_HIDE_SNIP = [[
+    if owner:GetAttribute("flat") then
+]] .. FLYOUT_SNAP_BODY .. [[
+    end
+]]
+
 local POST_CLICK = [[
     if owner:GetAttribute("flat") then
         local pressed
@@ -1386,15 +1577,63 @@ local POST_CLICK = [[
                 end
             end
         end
-        if pressed and not down then
-            local size = pressed > $GROUP and $ROUND or $SQUARE
-            for bar = 1, $BARS do
-                local other, slot = owner:GetFrameRef("b" .. bar .. "-" .. pressed), owner:GetFrameRef("s" .. bar .. "-" .. pressed)
-                if other and slot and bar ~= $BAR then
-                    other:ClearAllPoints()
-                    other:SetPoint("CENTER", slot, "CENTER", 0, 0)
-                    other:SetWidth(size)
-                    other:SetHeight(size)
+        if not down then
+            local bars = owner:GetAttribute("barCount") or $BARS
+            local count = owner:GetAttribute("btnCount") or $COUNT
+            local group = owner:GetAttribute("groupCount") or $GROUP
+            local sq = owner:GetAttribute("sqSize") or $SQUARE
+            local rd = owner:GetAttribute("rdSize") or $ROUND
+            for bar = 1, bars do
+                if bar ~= $BAR then
+                    for j = 1, count do
+                        local other, oslot = owner:GetFrameRef("b" .. bar .. "-" .. j), owner:GetFrameRef("s" .. bar .. "-" .. j)
+                        if other and oslot then
+                            local sz = j > group and rd or sq
+                            other:ClearAllPoints()
+                            other:SetPoint("CENTER", oslot, "CENTER", 0, 0)
+                            other:SetWidth(sz)
+                            other:SetHeight(sz)
+                        end
+                    end
+                elseif pressed then
+                    local sz = pressed > group and rd or sq
+                    local selfBtn = owner:GetFrameRef("b$BAR-" .. pressed)
+                    if selfBtn then
+                        selfBtn:SetWidth(sz)
+                        selfBtn:SetHeight(sz)
+                    end
+                end
+            end
+        end
+        if owner:GetAttribute("classInline") then
+            local cSize = owner:GetAttribute("classBtnSize")
+            local cbL, csL = owner:GetFrameRef("classBtnLeft"), owner:GetFrameRef("classSlotLeft")
+            if cbL and csL then
+                cbL:ClearAllPoints()
+                cbL:SetPoint("CENTER", csL, "CENTER", 0, 0)
+                if cSize then cbL:SetWidth(cSize); cbL:SetHeight(cSize) end
+            end
+            local cpL, cpsL = owner:GetFrameRef("classPromptLeft"), owner:GetFrameRef("classPSlotLeft")
+            if cpL and cpsL then cpL:ClearAllPoints(); cpL:SetPoint("CENTER", cpsL, "CENTER", 0, 0) end
+            local cbR, csR = owner:GetFrameRef("classBtnRight"), owner:GetFrameRef("classSlotRight")
+            if cbR and csR then
+                cbR:ClearAllPoints()
+                cbR:SetPoint("CENTER", csR, "CENTER", 0, 0)
+                if cSize then cbR:SetWidth(cSize); cbR:SetHeight(cSize) end
+            end
+            local cpR, cpsR = owner:GetFrameRef("classPromptRight"), owner:GetFrameRef("classPSlotRight")
+            if cpR and cpsR then cpR:ClearAllPoints(); cpR:SetPoint("CENTER", cpsR, "CENTER", 0, 0) end
+        end
+        if owner:GetAttribute("centerWheel") then
+            local cs = owner:GetFrameRef("centerSlot")
+            if cs then
+                local fc = owner:GetAttribute("flyoutCount") or 0
+                for k = 1, fc do
+                    local fl = owner:GetFrameRef("flyout" .. k)
+                    if fl and fl:IsShown() then
+                        fl:ClearAllPoints()
+                        fl:SetPoint("CENTER", cs, "CENTER", 0, 0)
+                    end
                 end
             end
         end
@@ -1402,23 +1641,38 @@ local POST_CLICK = [[
 ]]
 
 local CLASS_POST_CLICK = [[
-    if owner:GetAttribute("flat") and owner:GetAttribute("classInline") then
-        local cBtn = owner:GetFrameRef("$CREF")
-        local cSlot = owner:GetFrameRef("$SREF")
-        if cBtn and cSlot then
-            cBtn:ClearAllPoints()
-            cBtn:SetPoint("CENTER", cSlot, "CENTER", 0, 0)
+    if owner:GetAttribute("flat") then
+        if owner:GetAttribute("classInline") then
             local cSize = owner:GetAttribute("classBtnSize")
-            if cSize then
-                cBtn:SetWidth(cSize)
-                cBtn:SetHeight(cSize)
+            local cbL, csL = owner:GetFrameRef("classBtnLeft"), owner:GetFrameRef("classSlotLeft")
+            if cbL and csL then
+                cbL:ClearAllPoints()
+                cbL:SetPoint("CENTER", csL, "CENTER", 0, 0)
+                if cSize then cbL:SetWidth(cSize); cbL:SetHeight(cSize) end
             end
+            local cpL, cpsL = owner:GetFrameRef("classPromptLeft"), owner:GetFrameRef("classPSlotLeft")
+            if cpL and cpsL then cpL:ClearAllPoints(); cpL:SetPoint("CENTER", cpsL, "CENTER", 0, 0) end
+            local cbR, csR = owner:GetFrameRef("classBtnRight"), owner:GetFrameRef("classSlotRight")
+            if cbR and csR then
+                cbR:ClearAllPoints()
+                cbR:SetPoint("CENTER", csR, "CENTER", 0, 0)
+                if cSize then cbR:SetWidth(cSize); cbR:SetHeight(cSize) end
+            end
+            local cpR, cpsR = owner:GetFrameRef("classPromptRight"), owner:GetFrameRef("classPSlotRight")
+            if cpR and cpsR then cpR:ClearAllPoints(); cpR:SetPoint("CENTER", cpsR, "CENTER", 0, 0) end
         end
-        local pFrm = owner:GetFrameRef("$PREF")
-        local pSlot = owner:GetFrameRef("$PSREF")
-        if pFrm and pSlot then
-            pFrm:ClearAllPoints()
-            pFrm:SetPoint("CENTER", pSlot, "CENTER", 0, 0)
+        if owner:GetAttribute("centerWheel") then
+            local cs = owner:GetFrameRef("centerSlot")
+            if cs then
+                local fc = owner:GetAttribute("flyoutCount") or 0
+                for k = 1, fc do
+                    local fl = owner:GetFrameRef("flyout" .. k)
+                    if fl and fl:IsShown() then
+                        fl:ClearAllPoints()
+                        fl:SetPoint("CENTER", cs, "CENTER", 0, 0)
+                    end
+                end
+            end
         end
     end
 ]]
@@ -1455,8 +1709,11 @@ local function RestorePointer()
 end
 
 local function PlaceSlots(db)
-    local sectionHolder = S.holder
-    local pitch = GetSlotPitch(db)
+    local inline = (db.classButtonLayout or "INLINE") == "INLINE"
+    local hasClass = HasClassButton("Left") or HasClassButton("Right")
+    local anchorIsAway = (not inline) and hasClass
+    local lastAnchor = S.anchors[#S.anchors]
+    local secureOrigin = S.secureHolder or S.holder
     local cSize = GetClassButtonSize(db)
     local pScale = GetClassPromptScale(db)
     local classOff = GetClassSlotOffsetFromBarEdge(db)
@@ -1464,24 +1721,31 @@ local function PlaceSlots(db)
 
     for _, info in ipairs(S.flatBars) do
         local bar = info.bar
+        local away = anchorIsAway and bar:GetParent() == lastAnchor
         EachBarButton(bar, function(button, side, idx)
             local slot = S.slots[button]
             if slot then
                 local ox = SlotOffsetX(side, idx, db)
                 S.slotOffsets[button] = ox
                 slot:ClearAllPoints()
-                slot:SetPoint("CENTER", sectionHolder, "BOTTOM", ox, CFG.BUTTON_SIZE / 2)
+                if secureOrigin then
+                    slot:SetPoint("CENTER", secureOrigin, "BOTTOM", ox, CFG.BUTTON_SIZE / 2)
+                elseif away then
+                    slot:SetPoint("CENTER", S.holder, "BOTTOM", ox, CFG.BUTTON_SIZE / 2)
+                else
+                    slot:SetPoint("CENTER", bar, "CENTER", ox, 0)
+                end
             end
         end)
     end
 
     if S.classSlots.Left then
         S.classSlots.Left:ClearAllPoints()
-        S.classSlots.Left:SetPoint("CENTER", sectionHolder, "BOTTOMLEFT", -classOff, CFG.BUTTON_SIZE / 2)
+        S.classSlots.Left:SetPoint("CENTER", secureOrigin, "BOTTOMLEFT", -classOff, CFG.BUTTON_SIZE / 2)
     end
     if S.classSlots.Right then
         S.classSlots.Right:ClearAllPoints()
-        S.classSlots.Right:SetPoint("CENTER", sectionHolder, "BOTTOMRIGHT", classOff, CFG.BUTTON_SIZE / 2)
+        S.classSlots.Right:SetPoint("CENTER", secureOrigin, "BOTTOMRIGHT", classOff, CFG.BUTTON_SIZE / 2)
     end
     if S.classPromptSlots.Left and S.classSlots.Left then
         S.classPromptSlots.Left:ClearAllPoints()
@@ -1539,6 +1803,18 @@ local function BuildFlatRows(db)
         end
     end
 
+    newHeader:SetAttribute("barCount", #S.wrappedBars)
+    newHeader:SetAttribute("btnCount", 2 * CFG.BUTTONS_PER_GROUP)
+    newHeader:SetAttribute("groupCount", CFG.BUTTONS_PER_GROUP)
+    newHeader:SetAttribute("sqSize", squareSize)
+    newHeader:SetAttribute("rdSize", roundSize)
+    newHeader:SetAttribute("centerWheel", (not db) or (db.centerFlyoutWheel ~= false))
+    newHeader:SetAttribute("flyoutCount", 0)
+    if S.centerSlot then
+        pcall(SecureHandlerSetFrameRef, newHeader, "centerSlot", S.centerSlot)
+    end
+
+    local slotParent = S.secureHolder or S.holder
     for _, info in ipairs(S.flatBars) do
         local bar, buttons = info.bar, {}
         S.barButtons[bar] = buttons
@@ -1551,15 +1827,12 @@ local function BuildFlatRows(db)
             end
             local slot = CreateFrame("Frame", nil, bar, "SecureFrameTemplate")
             slot:SetSize(1, 1)
-            slot:SetPoint("CENTER", S.holder, "BOTTOM", S.slotOffsets[button], CFG.BUTTON_SIZE / 2)
-            S.slots[button] = slot
-            if not S.barButtonHooked[button] then
-                S.barButtonHooked[button] = true
-                pcall(hooksecurefunc, button, "SetPoint", ReanchorBarButtonIfDrifted)
-                if type(button.HookScript) == "function" then
-                    pcall(button.HookScript, button, "OnShow", ReanchorBarButtonIfDrifted)
-                end
+            if slotParent then
+                slot:SetPoint("CENTER", slotParent, "BOTTOM", S.slotOffsets[button], CFG.BUTTON_SIZE / 2)
+            else
+                slot:SetPoint("CENTER", bar, "CENTER", S.slotOffsets[button], 0)
             end
+            S.slots[button] = slot
             if info.wrapIndex then
                 pcall(SecureHandlerSetFrameRef, newHeader, "b" .. info.wrapIndex .. "-" .. #buttons, button)
                 pcall(SecureHandlerSetFrameRef, newHeader, "s" .. info.wrapIndex .. "-" .. #buttons, slot)
@@ -1572,7 +1845,10 @@ local function BuildFlatRows(db)
             })
             S.postClicks[bar] = postClick
             for _, button in ipairs(buttons) do
-                pcall(SecureHandlerWrapScript, button, "OnClick", newHeader, PRE_CLICK, postClick)
+                local okWrap = pcall(SecureHandlerWrapScript, button, "OnClick", newHeader, PRE_CLICK, postClick)
+                if okWrap and type(button.GetScript) == "function" then
+                    S.wrappedClickScripts[button] = button:GetScript("OnClick")
+                end
             end
         end
     end
@@ -1590,7 +1866,7 @@ local function BuildFlatRows(db)
         local pFrm = S.pageUnit[side .. "InputPrompt"]
         local isFrameBtn = type(cBtn) == "table" and not IsForbiddenSafe(cBtn)
             and type(cBtn.IsObjectType) == "function" and select(2, pcall(cBtn.IsObjectType, cBtn, "Frame"))
-        if isFrameBtn then
+        if isFrameBtn and IsExplicitlyProtected(cBtn) then
             local cRef = "classBtn" .. side
             local sRef = "classSlot" .. side
             local pRef = "classPrompt" .. side
@@ -1598,18 +1874,23 @@ local function BuildFlatRows(db)
             local okRef = pcall(SecureHandlerSetFrameRef, newHeader, cRef, cBtn)
                 and pcall(SecureHandlerSetFrameRef, newHeader, sRef, cSlot)
             if okRef then
-                local isFramePrompt = type(pFrm) == "table" and not IsForbiddenSafe(pFrm)
-                    and type(pFrm.IsObjectType) == "function" and select(2, pcall(pFrm.IsObjectType, pFrm, "Frame"))
-                if isFramePrompt then
+                if IsExplicitlyProtected(pFrm) and select(2, pcall(pFrm.IsObjectType, pFrm, "Frame")) then
                     pcall(SecureHandlerSetFrameRef, newHeader, pRef, pFrm)
                     pcall(SecureHandlerSetFrameRef, newHeader, psRef, pSlot)
                 end
                 local snip = CLASS_POST_CLICK:gsub("%$(%u+)", {
                     CREF = cRef, SREF = sRef, PREF = pRef, PSREF = psRef,
                 })
-                pcall(SecureHandlerWrapScript, cBtn, "OnClick", newHeader, PRE_CLICK, snip)
-                pcall(SecureHandlerWrapScript, cBtn, "OnShow", newHeader, PRE_CLICK, snip)
+                local okClick = pcall(SecureHandlerWrapScript, cBtn, "OnClick", newHeader, PRE_CLICK, snip)
+                if okClick and type(cBtn.GetScript) == "function" then
+                    S.wrappedClassClickScripts[cBtn] = cBtn:GetScript("OnClick")
+                    S.classWrapDebug["snip_" .. side] = snip
+                end
+                local okShow = pcall(SecureHandlerWrapScript, cBtn, "OnShow", newHeader, PRE_SHOW, snip)
+                S.classWrapDebug[side] = "prot=true,clk=" .. tostring(okClick) .. ",shw=" .. tostring(okShow)
             end
+        elseif isFrameBtn then
+            S.classWrapDebug[side] = "prot=false"
         end
     end
 
@@ -1635,11 +1916,51 @@ local function BuildFlatRows(db)
     end
 end
 
+RewrapModifiedActionButtons = function()
+    if InCombatLockdown() or not S.header then return end
+    for _, bar in ipairs(S.wrappedBars) do
+        local postClick = S.postClicks[bar]
+        if postClick and S.barButtons[bar] then
+            for _, button in ipairs(S.barButtons[bar]) do
+                if IsExplicitlyProtected(button) and type(button.GetScript) == "function" then
+                    local cur = button:GetScript("OnClick")
+                    if cur ~= S.wrappedClickScripts[button] then
+                        local ok = pcall(SecureHandlerWrapScript, button, "OnClick", S.header, PRE_CLICK, postClick)
+                        if ok then
+                            S.wrappedClickScripts[button] = button:GetScript("OnClick")
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if S.pageUnit then
+        for _, side in ipairs(CFG.SIDES) do
+            local cBtn = S.pageUnit[side .. "ClassAction"]
+            local snip = S.classWrapDebug["snip_" .. side]
+            if cBtn and snip and IsExplicitlyProtected(cBtn) and type(cBtn.GetScript) == "function" then
+                if cBtn:GetScript("OnClick") ~= S.wrappedClassClickScripts[cBtn] then
+                    local ok = pcall(SecureHandlerWrapScript, cBtn, "OnClick", S.header, PRE_CLICK, snip)
+                    if ok then
+                        S.wrappedClassClickScripts[cBtn] = cBtn:GetScript("OnClick")
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function WrapFixedSlots()
     local topBar = S.bars[1]
-    if not (topBar and S.header and S.postClicks[topBar]) then return end
+    if not (topBar and topBar.Right and S.header and S.postClicks[topBar]) then return end
     for i = 1, CFG.BUTTONS_PER_GROUP do
-        SecureHandlerWrapScript(topBar.Right["ActionButton" .. i], "OnClick", S.header, PRE_CLICK, S.postClicks[topBar])
+        local btn = topBar.Right["ActionButton" .. i]
+        if btn and IsExplicitlyProtected(btn) then
+            local ok = pcall(SecureHandlerWrapScript, btn, "OnClick", S.header, PRE_CLICK, S.postClicks[topBar])
+            if ok and type(btn.GetScript) == "function" then
+                S.wrappedClickScripts[btn] = btn:GetScript("OnClick")
+            end
+        end
     end
 end
 
@@ -1650,9 +1971,18 @@ PlaceSections = function()
 
     local width, height = HotbarSize(db)
     local xOff = IsCenterXLocked(db) and 0 or (tonumber(db.x) or 0)
+    local yOff = tonumber(db.y) or -16
     S.holder:SetSize(width, height)
     S.holder:ClearAllPoints()
-    S.holder:SetPoint("TOP", S.pageUnit, "CENTER", xOff / scale, (tonumber(db.y) or -16) / scale)
+    S.holder:SetPoint("TOP", S.pageUnit, "CENTER", xOff / scale, yOff / scale)
+    if S.secureHolder then
+        S.secureHolder:SetSize(width, height)
+        S.secureHolder:ClearAllPoints()
+        S.secureHolder:SetPoint("TOP", S.pageUnit, "CENTER", xOff / scale, yOff / scale)
+    end
+    if S.header then
+        S.header:SetAttribute("centerWheel", (not db) or (db.centerFlyoutWheel ~= false))
+    end
 
     local margin = CFG.SCREEN_MARGIN / (UnitSize() * scale)
     local left, right, top, bottom = ComputeBounds(db)
@@ -1676,6 +2006,7 @@ PlaceSections = function()
     SafeTry("classButtons", function()
         ApplyClassButtonFrames(db)
     end)
+    RewrapModifiedActionButtons()
 end
 
 local function BuildLayoutFrames()
@@ -1683,6 +2014,10 @@ local function BuildLayoutFrames()
     S.holder = CreateFrame("Frame", nil, S.pageUnit)
     S.holder:SetMovable(true)
     S.holder:SetClampedToScreen(true)
+    S.secureHolder = CreateFrame("Frame", nil, S.pageUnit, "SecureFrameTemplate")
+    S.centerSlot = CreateFrame("Frame", nil, UIParent, "SecureFrameTemplate")
+    S.centerSlot:SetSize(1, 1)
+    S.centerSlot:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 
     S.guideHolder = CreateFrame("Frame", nil, S.pageUnit)
     S.toolsHolder = CreateFrame("Frame", nil, S.pageUnit)
@@ -2413,6 +2748,10 @@ local function CreateMoverOverlay()
                     end
                     S.holder:ClearAllPoints()
                     S.holder:SetPoint("TOP", S.pageUnit, "CENTER", 0, nextY / scale)
+                    if S.secureHolder then
+                        S.secureHolder:ClearAllPoints()
+                        S.secureHolder:SetPoint("TOP", S.pageUnit, "CENTER", 0, nextY / scale)
+                    end
                 end)
             else
                 S.holder:StartMoving()
@@ -2580,7 +2919,8 @@ function CompactBar:Refresh()
         if S.built then HandBackWhenPossible() end
         return
     end
-    if not ShouldBeActiveNow() then
+    local db = GetDB()
+    if not (db and db.enabled) or IsBlocked() then
         SetMoverActive(false)
         SetStyleShown(false)
         if S.built then HandBackWhenPossible() end
@@ -2677,25 +3017,84 @@ local function InstallBlizzardHooks()
     end
     local function OnBarRestyled(bar)
         if S.applied and restyleJobs[bar] and not IsBlocked() then
+            if InCombatLockdown() then
+                local b1 = bar and bar.Left and bar.Left.ActionButton1
+                local clkOk = b1 and type(b1.GetScript) == "function" and (b1:GetScript("OnClick") == S.wrappedClickScripts[b1])
+                RecordFlyoutTrace("CombatRestyle", tostring(restyleKeys[bar]) .. " b1=" .. DescribeFrameCompact(b1) .. " clk=" .. tostring(clkOk))
+            end
             RunOutOfCombat(restyleKeys[bar], restyleJobs[bar])
         end
     end
     hooksecurefunc(GamepadActionBarStyleUtil, "ApplyCollapsedActionBarStyle", OnBarRestyled)
     hooksecurefunc(GamepadActionBarStyleUtil, "ApplyExpandedActionBarStyle", OnBarRestyled)
 
-    hooksecurefunc(GamepadMainActionBarFrame, "SetupNonbindableActions", function()
-        if S.built then RunOutOfCombat("fixed_slots", WrapFixedSlots) end
-    end)
-
-    if type(S.root.HookScript) == "function" then
-        S.root:HookScript("OnShow", function()
-            CompactBar:Refresh()
-        end)
-        S.root:HookScript("OnHide", function()
-            SetMoverActive(false)
-            SetStyleShown(false)
+    -- Watch flyout methods on bar ActionButtons cleanly (O(1) fast-path on UpdateFlyout; inspect only on actual flyout open/close)
+    local function ScheduleCoalescedRewrap()
+        if S.rewrapQueued or not S.applied then return end
+        S.rewrapQueued = true
+        C_Timer.After(0, function()
+            S.rewrapQueued = false
+            if S.applied and RewrapModifiedActionButtons then
+                RunOutOfCombat("rewrap_actions", RewrapModifiedActionButtons)
+            end
         end)
     end
+    local function OnActionButtonFlyout(fnName, barInfo, btn)
+        if not S.applied or type(btn) ~= "table" or IsForbiddenSafe(btn) then return end
+        if fnName == "UpdateFlyout" or fnName == "HandleFlyoutClickOverride" then
+            if type(btn.GetScript) == "function" and btn:GetScript("OnClick") ~= S.wrappedClickScripts[btn] then
+                ScheduleCoalescedRewrap()
+            end
+            return
+        end
+        local okPar, par = pcall(btn.GetParent, btn)
+        if okPar and par and par ~= barInfo.bar and par ~= barInfo.bar.Left and par ~= barInfo.bar.Right
+            and par ~= S.pageUnit and par ~= UIParent and par ~= S.root then
+            RegisterFlyoutCandidate(par)
+        end
+        pcall(function()
+            for k, v in pairs(btn) do
+                if type(k) == "string" and type(v) == "table" then
+                    local kl = k:lower()
+                    if (kl:find("flyout", 1, true) or kl:find("radial", 1, true)
+                        or kl:find("wheel", 1, true) or kl:find("popup", 1, true))
+                        and not IsFlyoutExcludedFrame(v) then
+                        RegisterFlyoutCandidate(v)
+                    end
+                end
+            end
+        end)
+        local okClk = type(btn.GetScript) == "function" and (btn:GetScript("OnClick") == S.wrappedClickScripts[btn])
+        RecordFlyoutTrace("Btn:" .. fnName, tostring(barInfo.key) .. " " .. DescribeFrameCompact(btn)
+            .. " par=" .. DescribeFrameCompact(okPar and par or nil) .. " clk=" .. tostring(okClk))
+        if fnName == "OnFlyoutClosed" then
+            ScheduleCoalescedRewrap()
+        end
+    end
+    for _, info in ipairs(S.flatBars) do
+        EachBarButton(info.bar, function(btn)
+            if type(btn) == "table" and not S.hookedClassClick[btn] then
+                S.hookedClassClick[btn] = true
+                for _, flyFn in ipairs({
+                    "UpdateFlyout", "UpdateFlyoutPopup", "OnFlyoutOpened",
+                    "OnFlyoutClosed", "HandleFlyoutClickOverride",
+                }) do
+                    if type(btn[flyFn]) == "function" then
+                        pcall(hooksecurefunc, btn, flyFn, function(selfBtn)
+                            OnActionButtonFlyout(flyFn, info, selfBtn or btn)
+                        end)
+                    end
+                end
+            end
+        end)
+    end
+
+    hooksecurefunc(GamepadMainActionBarFrame, "SetupNonbindableActions", function()
+        if S.built then
+            RunOutOfCombat("fixed_slots", WrapFixedSlots)
+            RunOutOfCombat("rewrap_actions", RewrapModifiedActionButtons)
+        end
+    end)
 
     if S.features.releaseFix then
         local releasedIndex
@@ -2720,22 +3119,25 @@ local function InstallBlizzardHooks()
             end
         end
         hooksecurefunc(GamepadMainActionBarFrame, "PressActionButton", function(_, index, _, down)
-            if S.applied then
-                if not down then
-                    releasedIndex = index
-                    SafeTry("releaseFix", ClearPushedLook)
-                    local activeBar = S.pageUnit:GetActiveBar()
-                    if activeBar and not S.postClicks[activeBar] then
-                        strayReleases[index] = true
-                        RunOutOfCombat("released_buttons", ResetStrayReleases)
-                    end
-                elseif down then
-                    C_Timer.After(0, ScanFlyoutCandidates)
+            if S.applied and not down then
+                releasedIndex = index
+                SafeTry("releaseFix", ClearPushedLook)
+                local activeBar = S.pageUnit:GetActiveBar()
+                if activeBar and not S.postClicks[activeBar] then
+                    strayReleases[index] = true
+                    RunOutOfCombat("released_buttons", ResetStrayReleases)
                 end
             end
         end)
     end
 
+    local function OnOverrideMoved()
+        C_Timer.After(0, function()
+            if S.applied then RunOutOfCombat("sections", function()
+                if S.applied then PlaceSections(); FitStyle() end
+            end) end
+        end)
+    end
     if S.features.settingWatch and CVarCallbackRegistry then
         local function OnCVar()
             C_Timer.After(0, function() CompactBar:Refresh() end)
@@ -2743,15 +3145,13 @@ local function InstallBlizzardHooks()
         local owner = {}
         CVarCallbackRegistry:RegisterCallback("GamepadUseCompactActionBar", OnCVar, owner)
         CVarCallbackRegistry:RegisterCallback("GamepadShowActionBarScaling", OnCVar, owner)
-        local function OnOverrideMoved()
-            C_Timer.After(0, function()
-                if S.applied then RunOutOfCombat("sections", function()
-                    if S.applied then PlaceSections(); FitStyle() end
-                end) end
-            end)
-        end
         CVarCallbackRegistry:RegisterCallback("GamepadPossessBarOverride", OnOverrideMoved, owner)
         CVarCallbackRegistry:RegisterCallback("GamepadStanceBarOverride", OnOverrideMoved, owner)
+    end
+    local overrideWatcher = CreateFrame("Frame")
+    overrideWatcher:SetScript("OnEvent", OnOverrideMoved)
+    for _, ev in ipairs({ "GAMEPAD_POSSESS_BAR_OVERRIDE_CHANGED", "GAMEPAD_STANCE_BAR_OVERRIDE_CHANGED" }) do
+        pcall(overrideWatcher.RegisterEvent, overrideWatcher, ev)
     end
 end
 
@@ -2842,11 +3242,12 @@ function CompactBar:OnInitialize(db)
 
     self.eventFrame = CreateFrame("Frame")
     for _, ev in ipairs({
-        "ADDON_LOADED", "PLAYER_LOGIN", "VARIABLES_LOADED",
-        "INPUT_DEVICE_INTERFACE_TRANSITION", "GAME_PAD_ACTIVE_CHANGED",
+        "ADDON_LOADED", "PLAYER_LOGIN", "VARIABLES_LOADED", "PLAYER_ENTERING_WORLD",
+        "INPUT_DEVICE_INTERFACE_TRANSITION",
         "PLAYER_REGEN_ENABLED", "PLAYER_REGEN_DISABLED",
         "UI_SCALE_CHANGED", "DISPLAY_SIZE_CHANGED",
-        "UPDATE_SHAPESHIFT_FORM", "PET_BAR_UPDATE", "UPDATE_BINDINGS", "ACTIONBAR_SLOT_CHANGED",
+        "ACTIONBAR_SLOT_CHANGED", "UPDATE_SHAPESHIFT_FORM",
+        "UPDATE_SHAPESHIFT_FORMS", "PET_BAR_UPDATE", "SPELLS_CHANGED",
     }) do
         pcall(self.eventFrame.RegisterEvent, self.eventFrame, ev)
     end
@@ -2863,20 +3264,26 @@ function CompactBar:OnInitialize(db)
                 S.handBackPending = false
                 xpcall(HandBack, geterrorhandler())
             end
-            if S.barDriftPending and S.applied then
-                RunOutOfCombat("reanchor_bars", ReanchorDriftedBarButtons)
+            if S.applied and RewrapModifiedActionButtons then
+                RunOutOfCombat("rewrap_actions", RewrapModifiedActionButtons)
+            end
+            if S.classResnapPending and S.applied then
+                S.classResnapPending = false
+                local mdb = GetDB()
+                if mdb and mdb.enabled then
+                    ApplyClassButtonFrames(mdb)
+                end
+            end
+            if S.flyoutScanPending and S.enabled and S.built then
+                S.flyoutScanPending = false
+                ScanFlyoutCandidates()
             end
             local order, work = S.pendingOrder, S.pendingWork
             S.pendingOrder, S.pendingWork = {}, {}
             for _, key in ipairs(order) do
                 RunOutOfCombat(key, work[key])
             end
-        elseif event == "UPDATE_SHAPESHIFT_FORM" or event == "PET_BAR_UPDATE"
-            or event == "UPDATE_BINDINGS" or event == "ACTIONBAR_SLOT_CHANGED" then
-            if S.enabled and S.built then
-                ScanFlyoutCandidates()
-            end
-        elseif event == "INPUT_DEVICE_INTERFACE_TRANSITION" or event == "GAME_PAD_ACTIVE_CHANGED" then
+        elseif event == "INPUT_DEVICE_INTERFACE_TRANSITION" then
             C_Timer.After(0, function()
                 if S.enabled and not S.initialized then
                     TryInitializeBlizzardBars()
@@ -2885,11 +3292,23 @@ function CompactBar:OnInitialize(db)
                 CompactBar:UpdateStatusText()
             end)
         elseif event == "VARIABLES_LOADED" or event == "PLAYER_LOGIN"
-            or event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
+            or event == "PLAYER_ENTERING_WORLD" or event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
             if S.enabled and not S.initialized then
                 TryInitializeBlizzardBars()
             end
             CompactBar:Refresh()
+        elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "UPDATE_SHAPESHIFT_FORM"
+            or event == "UPDATE_SHAPESHIFT_FORMS" or event == "PET_BAR_UPDATE" or event == "SPELLS_CHANGED" then
+            if S.applied and not S.rewrapQueued then
+                S.rewrapQueued = true
+                C_Timer.After(0, function()
+                    S.rewrapQueued = false
+                    if S.applied and RewrapModifiedActionButtons then
+                        RunOutOfCombat("rewrap_actions", RewrapModifiedActionButtons)
+                    end
+                end)
+            end
+            return
         end
         CompactBar:UpdateStatusText()
     end)
@@ -3008,8 +3427,9 @@ local function CaptureClassAndFlyoutDebug(db)
                     end
                 end
                 local parName = btn.GetParent and SafeFrameLabel(btn:GetParent()) or "nil"
-                out[#out + 1] = string.format("%sClassAction: sh=%s parent=%s sz=%.0fx%.0f kids=[%s] fields=[%s]",
-                    side, tostring(btn.IsShown and btn:IsShown()),
+                out[#out + 1] = string.format("%sClassAction: sh=%s prot=%s wrap=[%s] parent=%s sz=%.0fx%.0f kids=[%s] fields=[%s]",
+                    side, tostring(btn.IsShown and btn:IsShown()), tostring(IsProtectedSafe(btn)),
+                    tostring(S.classWrapDebug[side] or "none"),
                     parName ~= "" and parName or "anon",
                     YRG.SafeNumber(btn.GetWidth and btn:GetWidth(), 0), YRG.SafeNumber(btn.GetHeight and btn:GetHeight(), 0),
                     table.concat(kids, ","), table.concat(fields, ","))
@@ -3020,15 +3440,19 @@ local function CaptureClassAndFlyoutDebug(db)
     end
     local flyList = {}
     for f in pairs(S.hookedFlyouts) do
-        local nm = SafeFrameLabel(f)
-        if nm == "" then nm = "anon" end
-        local okS, sh = pcall(function() return f.IsShown and f:IsShown() end)
-        local okP, pt, rel = pcall(function() return f.GetPoint and f:GetPoint(1) end)
-        local relNm = (okP and rel) and SafeFrameLabel(rel) or "nil"
-        flyList[#flyList + 1] = string.format("%s(sh=%s,pt=%s->%s,prot=%s)",
-            nm, tostring(okS and sh), tostring(okP and pt), relNm ~= "" and relNm or "anon", tostring(IsProtectedSafe(f)))
+        flyList[#flyList + 1] = DescribeFrameCompact(f) .. ",sec=" .. tostring(S.secureFlyouts[f] or 0)
     end
     out[#out + 1] = "HookedFlyouts=[" .. table.concat(flyList, "; ") .. "]"
+    local flyBtns = {}
+    for _, info in ipairs(S.flatBars) do
+        EachBarButton(info.bar, function(btn)
+            if type(btn) == "table" and not IsForbiddenSafe(btn) and btn.isFlyoutAction then
+                local clkOk = type(btn.GetScript) == "function" and (btn:GetScript("OnClick") == S.wrappedClickScripts[btn])
+                flyBtns[#flyBtns + 1] = tostring(info.key) .. ":" .. DescribeFrameCompact(btn) .. ",clkWrap=" .. tostring(clkOk)
+            end
+        end)
+    end
+    out[#out + 1] = "FlyoutActionBtns=[" .. table.concat(flyBtns, "; ") .. "]"
     if db then db._lastInspect = out end
     for _, line in ipairs(out) do
         print("|cffffd100[CCB]|r " .. line)
@@ -3267,7 +3691,19 @@ function CompactBar:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.centerFlyoutWheel = val and true or false end
-            if not val then RestoreFlyoutFrames() else ScanFlyoutCandidates() end
+            C_Timer.After(0, function()
+                if not S.enabled then return end
+                RunOutOfCombat("center_wheel", function()
+                    if S.header then
+                        S.header:SetAttribute("centerWheel", val and true or false)
+                    end
+                    if not val then
+                        RestoreFlyoutFrames()
+                    elseif S.built then
+                        ScanFlyoutCandidates()
+                    end
+                end)
+            end)
         end,
     })
 
@@ -3288,7 +3724,7 @@ function CompactBar:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.showBarBackground = val and true or false end
-            if S.styled then SafeTry("plates", FitStyle) end
+            NotifyAfterSettingChange()
         end,
     })
 
@@ -3308,7 +3744,7 @@ function CompactBar:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.labelScale = tonumber(val) or 1.0 end
-            if S.styled then FitStyle() end
+            NotifyAfterSettingChange()
         end,
     })
 
@@ -3331,7 +3767,6 @@ function CompactBar:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.glyphScale = tonumber(val) or 1.0 end
-            if S.styled then FitStyle() end
             NotifyAfterSettingChange()
         end,
     })
@@ -3355,7 +3790,6 @@ function CompactBar:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.glyphPosition = (val == "CORNER") and "CORNER" or "BELOW" end
-            if S.styled then SafeTry("glyphs", FitGlyphs) end
             NotifyAfterSettingChange()
         end,
     })
@@ -3378,7 +3812,6 @@ function CompactBar:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.glyphBelowOffset = GetGlyphBelowOffset({ glyphBelowOffset = val }) end
-            if S.styled then SafeTry("glyphs", FitGlyphs) end
             NotifyAfterSettingChange()
         end,
     })

@@ -2,7 +2,7 @@
 
 Modular UI and Quality-of-Life suite for **World of Warcraft Forever (`1.60.1` / `## Interface: 16001`)**, designed to work cleanly across desktop (Keyboard/Mouse) and Steamdeck / Controller UI mode.
 
-- **Version:** `2.4.4`
+- **Version:** `2.4.5`
 - **Author:** Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP
 - **SavedVariables:** `YRGDB`
 - **Settings Command:** `/yrg`
@@ -41,7 +41,7 @@ Configured directly on the main `/yrg` settings page (`Core.lua`):
 Each module can be toggled independently on the main `YRG` panel and has its own dedicated subpage under `/yrg`:
 
 ### 1. BetterBagsModule (`Modules/BetterBagsModule.lua`)
-- **Controller Mode Separate Bag Strip:** Removes inline bag headers and docks bag buttons into a clean strip above items (`LEFT`, `CENTER`, or `RIGHT` alignment, adjustable row spacing, and optional 3D beveled divider line). Includes an optional **Scale Bag Buttons to Fit Column Width (Steamdeck Fix)** toggle for `GamepadBagBar` while keeping Blizzard's native Gamepad D-Pad navigation and container item actions taint-free.
+- **Controller Mode Separate Bag Strip:** Removes inline bag headers and docks bag buttons into a clean strip above items (`LEFT`, `CENTER`, or `RIGHT` alignment, adjustable row spacing, and optional 3D beveled divider line). Includes an optional **Scale Bag Buttons to Fit Column Width (Steamdeck Fix)** toggle for `GamepadBagBar` while keeping Blizzard's native Gamepad D-Pad navigation and container item actions smooth and taint-free (including during combat).
 - **Desktop Combined Bags & Reagent Bag Merge:** Merges your Reagent Bag cleanly into a dedicated bottom section separated by a 3D beveled divider with soft purple tinting on empty reagent slots (while preserving item-quality borders), alongside live Search, Sort, translucent Money pill, Free Slots footer, and **Unlock Combined Bags Frame to Move (Non-Controller)** + position reset.
 - **Layout, Ammo & Visibility Options (All Modes):**
   - **Empty Cell Location:** Anchor unused slots at `Top-Left`, `Bottom-Right`, or `Dynamic` (`10`, `9`, or `8` column auto-fit).

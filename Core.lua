@@ -1,7 +1,7 @@
 local addonName, YRG = ...
 _G.YRG = YRG
 
-YRG.version = "2.4.4"
+YRG.version = "2.4.5"
 YRG.author = "Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP"
 YRG.modules = {}
 YRG.moduleOrder = {}

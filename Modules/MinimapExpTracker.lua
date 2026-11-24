@@ -52,6 +52,11 @@ local COLOR_SCHEME_OPTIONS = {
     { value = "red",    label = "Red" },
 }
 
+local COORD_NUDGE_DIR_OPTIONS = {
+    { value = "UP",   label = "Up (Above EXP Ring Rim, Default)" },
+    { value = "DOWN", label = "Down (Below % Badge)" },
+}
+
 local MUI = YRG.MinimapUI or {}
 YRG.MinimapUI = MUI
 
@@ -78,6 +83,8 @@ local ExpTracker = {
         -- Bottom-Fixed EXP Percentage Placard
         showDecimals = true,
         expTextSize = 16,
+        nudgeBuiltInCoords = true,
+        nudgeBuiltInCoordsDir = "UP",
     }
 }
 
@@ -1010,20 +1017,21 @@ local function HasHorizontalTwoPointStretch(region)
 end
 
 local function GetTargetPlacardScreenWidth(db)
-    for _, placard in ipairs({ MUI.infoFrame or false, ExpTracker.expFrame or false }) do
-        if placard and placard.IsShown and placard:IsShown() then
-            local w = SafeRegionWidth(placard)
-            local s = SafeRegionScale(placard, 1)
-            if w and s > 0 then
-                return w * s, s
-            end
+    local infoFrame = MUI.infoFrame
+    if infoFrame and infoFrame.IsShown and infoFrame:IsShown() then
+        local w = SafeRegionWidth(infoFrame)
+        local s = SafeRegionScale(infoFrame, 1)
+        if w and s > 0 then
+            return w * s, s
         end
     end
     local infoDB = YRG:GetModuleDB("DynamicInfoPlacard")
     local clusterScale = SafeRegionScale(MinimapCluster or Minimap, 1)
-    local fallbackW = YRG.SafeNumber(infoDB and infoDB.infoPlacardWidth, YRG.SafeNumber(db and db.infoPlacardWidth, 254))
-    if clusterScale > 0 and fallbackW > 0 then
-        return fallbackW * clusterScale, clusterScale
+    if infoDB and infoDB.enabled then
+        local fallbackW = YRG.SafeNumber(infoDB.infoPlacardWidth, YRG.SafeNumber(db and db.infoPlacardWidth, 254))
+        if clusterScale > 0 and fallbackW > 0 then
+            return fallbackW * clusterScale, clusterScale
+        end
     end
     return nil, clusterScale
 end
@@ -1089,7 +1097,8 @@ local function ApplyMinimapHeaderWidth(db)
     local borderTop = mc and mc.BorderTop
     if not zoneBtn then return end
 
-    local shouldStretch = IsInfoPlacardTitleAnchored() or (db and db.enabled and db.matchPlacardWidth and true) or false
+    local infoShown = (MUI.infoFrame and MUI.infoFrame.IsShown and MUI.infoFrame:IsShown()) and true or false
+    local shouldStretch = IsInfoPlacardTitleAnchored() and infoShown
     if not shouldStretch then
         local candidates = {
             zoneBtn,
@@ -1223,6 +1232,52 @@ local function IsMinimapHeaderOnBottom()
     return false
 end
 
+local function GetMinimapVisualScreenBoundsY()
+    local visBot, visTop = nil, nil
+    local function Expand(f, topInsetRatio, botInsetRatio)
+        if not f or (type(f.IsShown) == "function" and not f:IsShown()) then return end
+        local b = SafeRegionBottom(f)
+        local t = SafeRegionTop(f)
+        local sc = SafeRegionScale(f, 0)
+        if not (b and t and t > b and sc and sc > 0) then return end
+        local h = t - b
+        local sb = (b + h * (botInsetRatio or 0)) * sc
+        local st = (t - h * (topInsetRatio or 0)) * sc
+        visBot = visBot and math.min(visBot, sb) or sb
+        visTop = visTop and math.max(visTop, st) or st
+    end
+    if Minimap then Expand(Minimap, 0, 0) end
+    if ExpTracker.container then Expand(ExpTracker.container, 42 / 512, 56 / 512) end
+    if ExpTracker.expFrame then Expand(ExpTracker.expFrame, 0, 0) end
+    return visBot, visTop
+end
+
+local function GetHeaderVisualScreenBoundsY(roots)
+    local hBot, hTop = nil, nil
+    local seen = {}
+    local function Expand(f)
+        if not f or seen[f] or (type(f.IsShown) == "function" and not f:IsShown()) then return end
+        seen[f] = true
+        local b = SafeRegionBottom(f)
+        local t = SafeRegionTop(f)
+        local sc = SafeRegionScale(f, 0)
+        if b and t and t > b and sc and sc > 0 then
+            hBot = hBot and math.min(hBot, b * sc) or (b * sc)
+            hTop = hTop and math.max(hTop, t * sc) or (t * sc)
+        end
+    end
+    for _, entry in ipairs(roots or {}) do
+        Expand(entry.frame)
+    end
+    if MinimapCluster then
+        Expand(MinimapCluster.BorderTop)
+        Expand(MinimapCluster.ZoneTextButton)
+    end
+    Expand(_G["MinimapBorderTop"])
+    Expand(_G["MinimapZoneTextButton"])
+    return hBot, hTop
+end
+
 local function ApplyMinimapHeaderCenter(db)
     if headerCenteringGuard then return end
     if InCombatLockdown() then
@@ -1261,18 +1316,45 @@ local function ApplyMinimapHeaderCenter(db)
         end
     end
 
+    local mcScale = SafeRegionScale((mapUnit and mapUnit.GetParent and mapUnit:GetParent()) or MinimapCluster, 1)
+    local mapVisBotScreen, mapVisTopScreen = GetMinimapVisualScreenBoundsY()
+    local hdrCurBotScreen, hdrCurTopScreen = GetHeaderVisualScreenBoundsY(roots)
+
     local desiredShiftScreenY = 0
     if db and db.enabled and headerOnBottom and (not headerAnchoredToMap) and mapUnit and math.abs(mapUnitScale - 1.0) > 0.001 then
         local targetH = (type(mapUnit.GetHeight) == "function" and YRG.SafeNumber(mapUnit:GetHeight(), 0)) or 140
         if targetH <= 0 then targetH = 140 end
         local unitSpan = targetH
         local tTop = SafeRegionTop(mapUnit)
-        local eBot = (ExpTracker.expFrame and ExpTracker.expFrame:IsShown()) and SafeRegionBottom(ExpTracker.expFrame) or nil
-        if tTop and eBot and tTop > eBot then
-            unitSpan = tTop - eBot
+        local tScale = SafeRegionScale(mapUnit, mcScale * mapUnitScale)
+        if tTop and mapVisBotScreen and tScale > 0 and (tTop * tScale) > mapVisBotScreen then
+            unitSpan = ((tTop * tScale) - mapVisBotScreen) / tScale
         end
-        local mcScale = SafeRegionScale((mapUnit.GetParent and mapUnit:GetParent()) or MinimapCluster, 1)
         desiredShiftScreenY = unitSpan * (1 - mapUnitScale) * mcScale
+    end
+
+    if db and db.enabled and (not headerAnchoredToMap) and hdrCurBotScreen and hdrCurTopScreen then
+        local refEntry = roots[1]
+        local refF = refEntry and refEntry.frame
+        local refBase = refF and (refF._yrgPreShiftPoints or refEntry.pts)
+        local refScale = refF and SafeRegionScale(refF, mcScale) or mcScale
+        if refEntry and refBase and refBase[1] and refEntry.pts and refEntry.pts[1] and refScale > 0 then
+            local appliedCurY = (refEntry.pts[1].y - refBase[1].y) * refScale
+            local baseHdrTopScreen = hdrCurTopScreen - appliedCurY
+            local baseHdrBotScreen = hdrCurBotScreen - appliedCurY
+            local minGap = 4 * mcScale
+            if headerOnBottom and mapVisBotScreen then
+                local maxAllowedTop = mapVisBotScreen - minGap
+                if (baseHdrTopScreen + desiredShiftScreenY) > maxAllowedTop then
+                    desiredShiftScreenY = maxAllowedTop - baseHdrTopScreen
+                end
+            elseif (not headerOnBottom) and mapVisTopScreen then
+                local minAllowedBot = mapVisTopScreen + minGap
+                if (baseHdrBotScreen + desiredShiftScreenY) < minAllowedBot then
+                    desiredShiftScreenY = minAllowedBot - baseHdrBotScreen
+                end
+            end
+        end
     end
 
     if (not shouldCenter) and math.abs(desiredShiftScreenY) < 0.35 then
@@ -1551,6 +1633,219 @@ function MUI.GetExpAnchorInfo()
         expH = expH,
     }
 end
+
+local coordNudgeGuard = false
+local coordNudgeScheduled = false
+local hookedCoordFrames = setmetatable({}, { __mode = "k" })
+
+local function IsPlacardShowingCoords()
+    if MUI.placardShowingCoords ~= nil then
+        return MUI.placardShowingCoords and true or false
+    end
+    local infoDB = YRG:GetModuleDB("DynamicInfoPlacard")
+    if not infoDB or not infoDB.enabled then
+        return false
+    end
+    local mode = infoDB.row1LeftMode
+    if mode == nil and infoDB.showCoordinates == false then
+        mode = "none"
+    end
+    return mode == "coords"
+end
+
+local function GetBuiltInCoordFrames()
+    local frames = {}
+    local seen = {}
+    local function TryAdd(frame)
+        if type(frame) ~= "table" or seen[frame] or type(frame.SetPoint) ~= "function" then
+            return
+        end
+        local cur = frame
+        for _ = 1, 6 do
+            local okP, par = pcall(cur.GetParent, cur)
+            if not okP or not par then break end
+            if seen[par] then return end
+            cur = par
+        end
+        seen[frame] = true
+        table.insert(frames, frame)
+    end
+    TryAdd(MinimapCluster and MinimapCluster.MinimapContainer and MinimapCluster.MinimapContainer.PlayerCoords)
+    TryAdd(MinimapCluster and MinimapCluster.PlayerCoords)
+    TryAdd(Minimap and Minimap.PlayerCoords)
+    TryAdd(_G["MinimapCoordinates"])
+    TryAdd(Minimap and Minimap.CoordinateFrame)
+    TryAdd(Minimap and Minimap.Coordinates)
+    TryAdd(_G["MinimapCoordinatesText"])
+    return frames
+end
+
+local function ShouldNudgeBuiltInCoords(db)
+    if not db or not db.enabled or db.nudgeBuiltInCoords == false then
+        return false
+    end
+    if not (ExpTracker.container and ExpTracker.container.IsShown and ExpTracker.container:IsShown()) then
+        return false
+    end
+    if not (ExpTracker.expFrame and ExpTracker.expFrame.IsShown and ExpTracker.expFrame:IsShown()) then
+        return false
+    end
+    return not IsPlacardShowingCoords()
+end
+
+local function UpdateBuiltInCoordsNudge()
+    if coordNudgeGuard then return end
+    local db = YRG:GetModuleDB("MinimapExpTracker")
+    local coordFrames = GetBuiltInCoordFrames()
+    if #coordFrames == 0 then return end
+
+    local shouldNudge = ShouldNudgeBuiltInCoords(db)
+
+    for _, frame in ipairs(coordFrames) do
+        if not hookedCoordFrames[frame] then
+            hookedCoordFrames[frame] = true
+            pcall(hooksecurefunc, frame, "SetPoint", function(f)
+                if coordNudgeGuard then return end
+                f._yrgOrigCoordPts = nil
+                f._yrgOrigCoordCenterDX = nil
+                f._yrgCoordNudgeApplied = nil
+                if not coordNudgeScheduled and C_Timer and type(C_Timer.After) == "function" then
+                    coordNudgeScheduled = true
+                    C_Timer.After(0, function()
+                        coordNudgeScheduled = false
+                        UpdateBuiltInCoordsNudge()
+                    end)
+                end
+            end)
+            if type(frame.HookScript) == "function" then
+                pcall(frame.HookScript, frame, "OnShow", function()
+                    if coordNudgeGuard then return end
+                    if not coordNudgeScheduled and C_Timer and type(C_Timer.After) == "function" then
+                        coordNudgeScheduled = true
+                        C_Timer.After(0, function()
+                            coordNudgeScheduled = false
+                            UpdateBuiltInCoordsNudge()
+                        end)
+                    end
+                end)
+            end
+        end
+
+        local okProt, isProt = pcall(function()
+            return type(frame.IsProtected) == "function" and frame:IsProtected()
+        end)
+        local locked = InCombatLockdown() and okProt and isProt
+
+        if not shouldNudge then
+            if frame._yrgCoordNudgeApplied then
+                if locked then
+                    ExpTracker._pendingCoordNudge = true
+                else
+                    local savedPts = frame._yrgOrigCoordPts
+                    coordNudgeGuard = true
+                    if savedPts and #savedPts > 0 then
+                        pcall(function()
+                            if type(frame.ClearAllPoints) == "function" then
+                                frame:ClearAllPoints()
+                            end
+                            for _, p in ipairs(savedPts) do
+                                frame:SetPoint(p.pt, p.relTo, p.relPt, p.x, p.y)
+                            end
+                        end)
+                    end
+                    frame._yrgCoordNudgeApplied = nil
+                    frame._yrgOrigCoordPts = nil
+                    frame._yrgOrigCoordCenterDX = nil
+                    coordNudgeGuard = false
+                end
+            end
+        else
+            if locked then
+                ExpTracker._pendingCoordNudge = true
+            else
+                local frameScale = SafeRegionScale(frame, 1)
+                if not frame._yrgOrigCoordPts and not frame._yrgCoordNudgeApplied
+                    and type(frame.GetNumPoints) == "function" and type(frame.GetPoint) == "function" then
+                    local pts = {}
+                    local n = YRG.SafeNumber(frame:GetNumPoints(), 0)
+                    for i = 1, n do
+                        local okP, pt, relTo, relPt, x, y = pcall(frame.GetPoint, frame, i)
+                        if okP and pt then
+                            table.insert(pts, {
+                                pt = pt,
+                                relTo = relTo,
+                                relPt = relPt or pt,
+                                x = YRG.SafeNumber(x, 0),
+                                y = YRG.SafeNumber(y, 0),
+                            })
+                        end
+                    end
+                    if #pts > 0 then
+                        frame._yrgOrigCoordPts = pts
+                    end
+                    local fCX = SafeRegionCenterX(frame)
+                    local mCX = SafeRegionCenterX(Minimap)
+                    local mScale = SafeRegionScale(Minimap, frameScale)
+                    if fCX and mCX then
+                        local dxScreen = (fCX * frameScale) - (mCX * mScale)
+                        frame._yrgOrigCoordCenterDX = (math.abs(dxScreen) <= (6 * mScale)) and 0 or dxScreen
+                    else
+                        frame._yrgOrigCoordCenterDX = 0
+                    end
+                end
+
+                local expFrame = ExpTracker.expFrame
+                local expScale = SafeRegionScale(expFrame, frameScale)
+                local mapScale = SafeRegionScale(Minimap, frameScale)
+                local xOff = (frame._yrgOrigCoordCenterDX or 0) / math.max(frameScale, 0.01)
+                local dir = (db and db.nudgeBuiltInCoordsDir == "DOWN") and "DOWN" or "UP"
+
+                local wantPt, wantRel, wantRelPt, wantX, wantY
+                if dir == "UP" then
+                    local mapBot = SafeRegionBottom(Minimap)
+                    local expTop = SafeRegionTop(expFrame)
+                    if mapBot and expTop then
+                        local clearAboveExp = (expTop * expScale) - (mapBot * mapScale) + (2 * expScale)
+                        local screenDeltaY = math.max(14 * mapScale, clearAboveExp)
+                        wantPt, wantRel, wantRelPt = "BOTTOM", Minimap, "BOTTOM"
+                        wantX, wantY = xOff, screenDeltaY / math.max(frameScale, 0.01)
+                    else
+                        wantPt, wantRel, wantRelPt = "BOTTOM", expFrame, "TOP"
+                        wantX, wantY = xOff, (2 * expScale) / math.max(frameScale, 0.01)
+                    end
+                else
+                    wantPt, wantRel, wantRelPt = "TOP", expFrame, "BOTTOM"
+                    wantX, wantY = xOff, -(2 * expScale) / math.max(frameScale, 0.01)
+                end
+
+                local alreadyPlaced = false
+                if frame._yrgCoordNudgeApplied and type(frame.GetNumPoints) == "function"
+                    and YRG.SafeNumber(frame:GetNumPoints(), 0) == 1 and type(frame.GetPoint) == "function" then
+                    local okP, pt, relTo, relPt, cx, cy = pcall(frame.GetPoint, frame, 1)
+                    if okP and pt == wantPt and relTo == wantRel and relPt == wantRelPt
+                        and math.abs(YRG.SafeNumber(cx, 0) - wantX) < 0.35
+                        and math.abs(YRG.SafeNumber(cy, 0) - wantY) < 0.35 then
+                        alreadyPlaced = true
+                    end
+                end
+
+                if not alreadyPlaced then
+                    coordNudgeGuard = true
+                    pcall(function()
+                        if type(frame.ClearAllPoints) == "function" then
+                            frame:ClearAllPoints()
+                        end
+                        frame:SetPoint(wantPt, wantRel, wantRelPt, wantX, wantY)
+                    end)
+                    frame._yrgCoordNudgeApplied = true
+                    coordNudgeGuard = false
+                end
+            end
+        end
+    end
+end
+
+MUI.UpdateBuiltInCoordinatesNudge = UpdateBuiltInCoordsNudge
 
 local STRATA_RANK = {
     BACKGROUND = 1,
@@ -2101,17 +2396,28 @@ local function ApplyMinimapUnitScale(unitScale, resetCachedPts)
     end
 end
 
+local headerSyncGuard = false
+
 function MUI.SyncHeaderAndEditMode()
+    if headerSyncGuard then return end
+    headerSyncGuard = true
     local db = YRG:GetModuleDB("MinimapExpTracker")
     ApplyMinimapHeaderWidth(db)
     if db and db.enabled then
         ApplyMinimapUnitScale(db.mapScale or 1.0, false)
     end
     ApplyMinimapHeaderCenter(db)
+    if type(MUI.onInfoPlacardReposition) == "function" then
+        pcall(MUI.onInfoPlacardReposition)
+    end
+    if type(MUI.UpdateBuiltInCoordinatesNudge) == "function" then
+        MUI.UpdateBuiltInCoordinatesNudge()
+    end
     if ExpTracker.expHitFrame then
         ApplyExpHitBoxLayering(ExpTracker.expHitFrame)
     end
     UpdateEditModeMinimapSelection()
+    headerSyncGuard = false
 end
 
 function MUI.NotifyInfoPlacardLayout()
@@ -2223,6 +2529,7 @@ function ExpTracker:ApplyVisualSettings()
         self:ApplyHideAddonButtonsSetting(db)
     end
     self:UpdateXP()
+    MUI.SyncHeaderAndEditMode()
 
     pcall(function()
         local mapUnit = GetMinimapScaleUnitTarget()
@@ -2290,6 +2597,7 @@ function ExpTracker:UpdateXP()
         ApplyMinimapHeaderWidth(db)
         ApplyMinimapHeaderCenter(db)
         ApplyMinimapHeaderDarkness(db)
+        MUI.UpdateBuiltInCoordinatesNudge()
         MUI.NotifyInfoPlacardLayout()
         UpdateEditModeMinimapSelection()
         return
@@ -2299,6 +2607,7 @@ function ExpTracker:UpdateXP()
     local maxLevel = (GetMaxPlayerLevel and GetMaxPlayerLevel()) or 60
     if db.hideAtMaxLevel and level >= maxLevel then
         self.container:Hide()
+        MUI.UpdateBuiltInCoordinatesNudge()
         MUI.NotifyInfoPlacardLayout()
         UpdateEditModeMinimapSelection()
         return
@@ -2345,6 +2654,12 @@ function ExpTracker:OnInitialize(db)
     if db.mapScale == nil then
         db.mapScale = 1.0
     end
+    if db.nudgeBuiltInCoords == nil then
+        db.nudgeBuiltInCoords = true
+    end
+    if db.nudgeBuiltInCoordsDir ~= "UP" and db.nudgeBuiltInCoordsDir ~= "DOWN" then
+        db.nudgeBuiltInCoordsDir = "UP"
+    end
     db.headerOffsetX = nil
     db.expColor = nil
     db.restedColor = nil
@@ -2363,6 +2678,10 @@ function ExpTracker:OnInitialize(db)
                     ApplyMinimapHeaderCenter(modDB)
                     self:LayoutPlacards()
                 end
+            end
+            if self._pendingCoordNudge then
+                self._pendingCoordNudge = nil
+                MUI.UpdateBuiltInCoordinatesNudge()
             end
         else
             self:UpdateXP()
@@ -2385,7 +2704,7 @@ function ExpTracker:OnInitialize(db)
 
         local syncingHeader = false
         local function SyncMinimapHeaderLayout()
-            if syncingHeader or headerWidthGuard or headerCenteringGuard or mapScaleAnchorGuard then return end
+            if syncingHeader or headerWidthGuard or headerCenteringGuard or mapScaleAnchorGuard or coordNudgeGuard then return end
             syncingHeader = true
             local modDB = YRG:GetModuleDB("MinimapExpTracker")
             if modDB and modDB.enabled then
@@ -2514,6 +2833,7 @@ function ExpTracker:OnDisable(db)
         end
     end
     self:ApplyDefaultExpBarVisibility(db)
+    MUI.UpdateBuiltInCoordinatesNudge()
     MUI.NotifyInfoPlacardLayout()
     UpdateEditModeMinimapSelection()
 end
@@ -2753,6 +3073,44 @@ function ExpTracker:BuildConfigUI(ctx, db)
             local mdb = GetDB()
             if mdb then mdb.expTextSize = val end
             self:ApplyVisualSettings()
+        end,
+    })
+
+    ctx:AddCheckbox({
+        key = "nudgeBuiltInCoords",
+        name = "Auto-Nudge Minimap Coordinates",
+        tooltip = "Automatically repositions Blizzard's built-in minimap coordinates clear of the EXP ring and % badge whenever the EXP ring is visible and the Info Placard is not showing coordinates.",
+        defaultValue = true,
+        notifies = { "YRG_MinimapExpTracker_nudgeBuiltInCoordsDir" },
+        get = function()
+            local mdb = GetDB()
+            return mdb == nil or mdb.nudgeBuiltInCoords ~= false
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then mdb.nudgeBuiltInCoords = val and true or false end
+            MUI.UpdateBuiltInCoordinatesNudge()
+        end,
+    })
+
+    ctx:AddDropdown({
+        key = "nudgeBuiltInCoordsDir",
+        name = "Minimap Coordinates Nudge Position",
+        tooltip = "Places Blizzard's built-in minimap coordinates up above the bottom ring rim (default) or down below the EXP % badge.",
+        defaultValue = "UP",
+        options = COORD_NUDGE_DIR_OPTIONS,
+        canModify = function()
+            local mdb = GetDB()
+            return mdb == nil or mdb.nudgeBuiltInCoords ~= false
+        end,
+        get = function()
+            local mdb = GetDB()
+            return (mdb and mdb.nudgeBuiltInCoordsDir == "DOWN") and "DOWN" or "UP"
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then mdb.nudgeBuiltInCoordsDir = (val == "DOWN") and "DOWN" or "UP" end
+            MUI.UpdateBuiltInCoordinatesNudge()
         end,
     })
 end

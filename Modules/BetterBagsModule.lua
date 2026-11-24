@@ -259,24 +259,28 @@ local function SortItemEntriesByGrid(entries, stepY)
     end)
 end
 
-local function MeasureAndSortItemEntries(entries, frame, itemW, itemH)
-    local maxX, minY
-    local xs, ys = {}, {}
-    for _, entry in ipairs(entries) do
-        local x, y = entry.x, entry.y
-        if x and y then
-            if not maxX or x > maxX then maxX = x end
-            if not minY or y < minY then minY = y end
-            xs[#xs + 1] = x
-            ys[#ys + 1] = y
-        end
-    end
-
+local function MeasureAndSortItemEntries(entries, frame, itemW, itemH, skipSort)
     local geom = nativeBagGeom[frame]
     if not geom then
         geom = {}
         nativeBagGeom[frame] = geom
     end
+    local needSteps = (not geom.stepX or not geom.stepY)
+    local maxX, minY
+    local xs = needSteps and {} or nil
+    local ys = needSteps and {} or nil
+    for _, entry in ipairs(entries) do
+        local x, y = entry.x, entry.y
+        if x and y then
+            if not maxX or x > maxX then maxX = x end
+            if not minY or y < minY then minY = y end
+            if needSteps then
+                xs[#xs + 1] = x
+                ys[#ys + 1] = y
+            end
+        end
+    end
+
     if minY and minY < 20 and (
         not geom.baseY
         or math.abs(minY - geom.baseY) < 0.4
@@ -294,7 +298,7 @@ local function MeasureAndSortItemEntries(entries, frame, itemW, itemH)
     local stepX = geom.stepX or (itemW + 5)
     local stepY = geom.stepY or (itemH + 5)
     -- Use a tight upper bound (< 1.4x button size) so inline bag header gaps never masquerade as slot spacing.
-    if #xs > 1 then
+    if needSteps and #xs > 1 then
         table.sort(xs, function(a, b) return a > b end)
         local minDx = nil
         for i = 2, #xs do
@@ -308,7 +312,7 @@ local function MeasureAndSortItemEntries(entries, frame, itemW, itemH)
             geom.stepX = minDx
         end
     end
-    if #ys > 1 then
+    if needSteps and #ys > 1 then
         table.sort(ys)
         local minDy = nil
         for i = 2, #ys do
@@ -323,7 +327,9 @@ local function MeasureAndSortItemEntries(entries, frame, itemW, itemH)
         end
     end
 
-    SortItemEntriesByGrid(entries, stepY)
+    if not skipSort then
+        SortItemEntriesByGrid(entries, stepY)
+    end
 
     return geom.baseX or 0, geom.baseY or 4, stepX, stepY, minY
 end
@@ -578,43 +584,77 @@ local function UpdateSectionDividerOverlay(key, frame, anchor, frameLevel, baseX
         sectionDividers[divKey] = entry
     end
     local divF, topTex, botTex = entry.frame, entry.topTex, entry.botTex
-    if divF:GetParent() ~= targetParent then
-        divF:SetParent(targetParent)
+    if entry.parent ~= targetParent then
+        if divF:GetParent() ~= targetParent then
+            divF:SetParent(targetParent)
+        end
+        entry.parent = targetParent
     end
     local scaleFactor = 1
     if targetParent == UIParent then
         local ancScale = math.max(YRG.SafeNumber(anchor and anchor.GetEffectiveScale and anchor:GetEffectiveScale(), 1), 0.01)
         local uiScale = math.max(YRG.SafeNumber(UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale(), 1), 0.01)
         scaleFactor = math.max(ancScale / uiScale, 0.01)
-        divF:SetScale(scaleFactor)
-    else
-        divF:SetScale(1)
     end
-    if type(divF.SetFrameStrata) == "function" and frame.GetFrameStrata then
-        divF:SetFrameStrata(frame:GetFrameStrata() or "MEDIUM")
+    if not entry.scale or math.abs(entry.scale - scaleFactor) >= 0.001 then
+        divF:SetScale(scaleFactor)
+        entry.scale = scaleFactor
+    end
+    local strata = (frame.GetFrameStrata and frame:GetFrameStrata()) or "MEDIUM"
+    if type(divF.SetFrameStrata) == "function" and entry.strata ~= strata then
+        divF:SetFrameStrata(strata)
+        entry.strata = strata
     end
     local topH = 2 / scaleFactor
     local botH = 1 / scaleFactor
     local lineAlpha = (type(alpha) == "number") and alpha or 0.50
-    topTex:SetDrawLayer("OVERLAY")
-    topTex:SetHeight(topH)
-    topTex:SetColorTexture(0.02, 0.01, 0.005, math.min(0.85, lineAlpha + 0.08))
-    botTex:SetDrawLayer("OVERLAY")
-    botTex:SetHeight(botH)
-    botTex:SetColorTexture(0.84, 0.72, 0.52, math.max(0.08, lineAlpha * 0.32))
-    divF:SetFrameLevel(frameLevel + 5)
-    divF:ClearAllPoints()
+    if not entry.topH or math.abs(entry.topH - topH) >= 0.001 then
+        topTex:SetDrawLayer("OVERLAY")
+        topTex:SetHeight(topH)
+        botTex:SetDrawLayer("OVERLAY")
+        botTex:SetHeight(botH)
+        entry.topH = topH
+        entry.botH = botH
+    end
+    if not entry.alpha or math.abs(entry.alpha - lineAlpha) >= 0.001 then
+        topTex:SetColorTexture(0.02, 0.01, 0.005, math.min(0.85, lineAlpha + 0.08))
+        botTex:SetColorTexture(0.84, 0.72, 0.52, math.max(0.08, lineAlpha * 0.32))
+        entry.alpha = lineAlpha
+    end
+    local lvl = frameLevel + 5
+    if entry.level ~= lvl then
+        divF:SetFrameLevel(lvl)
+        entry.level = lvl
+    end
     local snappedBottomY = math.floor(((divY or 0) * scaleFactor) - 1.5 + 0.5) / scaleFactor
-    divF:SetPoint("BOTTOMRIGHT", anchor, "TOPRIGHT", baseX, snappedBottomY)
-    divF:SetSize(widthPx, topH + botH)
-    divF:SetShown(isCustom or ((frame.IsShown and frame:IsShown()) and true or false))
+    if entry.anchor ~= anchor or entry.baseX ~= baseX or entry.bottomY ~= snappedBottomY then
+        divF:ClearAllPoints()
+        divF:SetPoint("BOTTOMRIGHT", anchor, "TOPRIGHT", baseX, snappedBottomY)
+        entry.anchor = anchor
+        entry.baseX = baseX
+        entry.bottomY = snappedBottomY
+    end
+    local totalH = topH + botH
+    if entry.w ~= widthPx or not entry.h or math.abs(entry.h - totalH) >= 0.001 then
+        divF:SetSize(widthPx, totalH)
+        entry.w = widthPx
+        entry.h = totalH
+    end
+    local wantShown = (isCustom or ((frame.IsShown and frame:IsShown()) and true or false)) and true or false
+    if entry.shown ~= wantShown then
+        divF:SetShown(wantShown)
+        entry.shown = wantShown
+    end
 end
 
 local function HideSectionDivider(key)
     local divKey = (key == true) and "ammo" or tostring(key)
     local entry = sectionDividers[divKey]
     if entry and entry.frame then
-        entry.frame:Hide()
+        if entry.shown ~= false or entry.frame:IsShown() then
+            entry.frame:Hide()
+        end
+        entry.shown = false
     end
 end
 
@@ -682,6 +722,10 @@ local function SafeNavCallMulti(fn, ...)
 end
 
 local function ClearDualZoneData()
+    if dualZoneData.columns == 0 and dualZoneData.itemRows == 0 and dualZoneData.bagRows == 0
+        and not next(dualZoneData.btnMap) then
+        return
+    end
     dualZoneData.columns = 0
     dualZoneData.itemRows = 0
     dualZoneData.bagRows = 0
@@ -1501,10 +1545,7 @@ end
 -- =========================================================================
 local function ApplyControllerBagStripLayout()
     if applying then return end
-    if InCombatLockdown() then
-        pending = true
-        return
-    end
+    local inCombat = InCombatLockdown() and true or false
     pending = false
 
     local db = YRG:GetModuleDB("BetterBagsModule")
@@ -1535,6 +1576,7 @@ local function ApplyControllerBagStripLayout()
         return
     end
     if IsFrameProtectedOrForbidden(frame) or IsFrameProtectedOrForbidden(bar) then
+        if inCombat then pending = true end
         HideDividerOverlay()
         ResetDualZoneNavState()
         return
@@ -1555,6 +1597,7 @@ local function ApplyControllerBagStripLayout()
 
     local anchor = frame.MoneyFrame
     if not anchor or IsFrameProtectedOrForbidden(anchor) or columns < 1 then
+        if inCombat then pending = true end
         HideDividerOverlay()
         ResetDualZoneNavState()
         return
@@ -1562,6 +1605,7 @@ local function ApplyControllerBagStripLayout()
 
     local bags = CollectControllerBagButtons(bar, false)
     if not bags or #bags == 0 then
+        if inCombat then pending = true end
         HideDividerOverlay()
         ResetDualZoneNavState()
         return
@@ -1569,9 +1613,11 @@ local function ApplyControllerBagStripLayout()
 
     local items, ammoEntries, stdEntries = {}, {}, {}
     local sepAmmo = (db.separateAmmoBagRow == true)
+    local ammoBagCache = sepAmmo and {} or nil
     local itemW, itemH = template.width, template.height
     for _, button in frame:EnumerateValidItems() do
         if IsFrameProtectedOrForbidden(button) then
+            if inCombat then pending = true end
             HideDividerOverlay()
             ResetDualZoneNavState()
             return
@@ -1590,7 +1636,15 @@ local function ApplyControllerBagStripLayout()
                 end
                 local entry = { button = button, x = x, y = y }
                 items[#items + 1] = entry
-                if sepAmmo and IsAmmoOrQuiverBag(bID) then
+                local isAmmo = false
+                if sepAmmo then
+                    isAmmo = ammoBagCache[bID]
+                    if isAmmo == nil then
+                        isAmmo = IsAmmoOrQuiverBag(bID) and true or false
+                        ammoBagCache[bID] = isAmmo
+                    end
+                end
+                if isAmmo then
                     ammoEntries[#ammoEntries + 1] = entry
                 else
                     stdEntries[#stdEntries + 1] = entry
@@ -1599,7 +1653,7 @@ local function ApplyControllerBagStripLayout()
         end
     end
 
-    local baseX, baseY, stepX, stepY = MeasureAndSortItemEntries(items, frame, itemW, itemH)
+    local baseX, baseY, stepX, stepY = MeasureAndSortItemEntries(items, frame, itemW, itemH, true)
     SortItemEntriesByGrid(ammoEntries, stepY)
     SortItemEntriesByGrid(stdEntries, stepY)
 
@@ -2015,6 +2069,9 @@ local function ApplyGreyVisualsToNativeFrame(frame, enabled)
         or type(frame.EnumerateValidItems) ~= "function" then
         return
     end
+    if not enabled and not next(nativeGreyAppliedBtns) then
+        return
+    end
     local poorQuality = (Enum and Enum.ItemQuality and Enum.ItemQuality.Poor) or 0
     for _, btn in frame:EnumerateValidItems() do
         if btn and not IsFrameProtectedOrForbidden(btn)
@@ -2030,8 +2087,13 @@ local function ApplyGreyVisualsToNativeFrame(frame, enabled)
             local hasItem = (icon ~= nil)
             local isPoorGrey = enabled and hasItem and (quality == poorQuality)
             if isPoorGrey then
-                ApplyPoorItemVisualStyle(btn, true)
-                nativeGreyAppliedBtns[btn] = true
+                local wash = greyWashOverlays[btn]
+                local iconTex = btn.icon or btn.Icon
+                local alreadyDesat = iconTex and type(iconTex.IsDesaturated) == "function" and iconTex:IsDesaturated()
+                if nativeGreyAppliedBtns[btn] ~= icon or not wash or not wash:IsShown() or not alreadyDesat then
+                    ApplyPoorItemVisualStyle(btn, true)
+                    nativeGreyAppliedBtns[btn] = icon
+                end
             elseif nativeGreyAppliedBtns[btn] then
                 nativeGreyAppliedBtns[btn] = nil
                 ApplyPoorItemVisualStyle(btn, false, hasItem and 1 or nil, locked and true or false)
@@ -2040,17 +2102,34 @@ local function ApplyGreyVisualsToNativeFrame(frame, enabled)
     end
 end
 
+local nativeGreyRefreshPending = false
+
 local function RefreshNativeBagGreyItems(forceOff)
     local db = YRG:GetModuleDB("BetterBagsModule")
     local enabled = (not forceOff) and db and db.enabled and (db.dimGreyItems ~= false) and true or false
     if ContainerFrameCombinedBags then
         ApplyGreyVisualsToNativeFrame(ContainerFrameCombinedBags, enabled)
     end
-    for i = 1, 13 do
-        local cf = _G["ContainerFrame" .. i]
-        if cf and cf.IsShown and cf:IsShown() then
-            ApplyGreyVisualsToNativeFrame(cf, enabled)
+    if not (IsControllerUIActive() and ContainerFrameCombinedBags and ContainerFrameCombinedBags:IsShown()) then
+        for i = 1, 13 do
+            local cf = _G["ContainerFrame" .. i]
+            if cf and cf.IsShown and cf:IsShown() then
+                ApplyGreyVisualsToNativeFrame(cf, enabled)
+            end
         end
+    end
+end
+
+local function ScheduleRefreshNativeBagGreyItems()
+    if nativeGreyRefreshPending then return end
+    if C_Timer and type(C_Timer.After) == "function" then
+        nativeGreyRefreshPending = true
+        C_Timer.After(0, function()
+            nativeGreyRefreshPending = false
+            RefreshNativeBagGreyItems()
+        end)
+    else
+        RefreshNativeBagGreyItems()
     end
 end
 
@@ -2595,7 +2674,6 @@ end
 local function SyncBlizzardBagParentSuppression(suppress)
     -- Never reparent ContainerFrameCombinedBags via SetParent; doing so taints its
     -- secure/gamepad container state across Mouse <-> Controller transitions.
-    if InCombatLockdown() then return end
     if suppress and not IsControllerUIActive() then
         local cfb = ContainerFrameCombinedBags
         if cfb and cfb:IsShown() and CanSafelyModifyFrame(cfb) then
@@ -2608,14 +2686,14 @@ local function HideBlizzardBagsForCustomMode()
     if customBags.hidingBlizzard or IsControllerUIActive() then return end
     customBags.hidingBlizzard = true
     if ContainerFrameCombinedBags and ContainerFrameCombinedBags:IsShown() then
-        if CanSafelyModifyFrame(ContainerFrameCombinedBags) and not InCombatLockdown() then
+        if CanSafelyModifyFrame(ContainerFrameCombinedBags) then
             pcall(ContainerFrameCombinedBags.Hide, ContainerFrameCombinedBags)
         end
     end
     local rBagID = GetReagentBagID()
     for i = 1, 13 do
         local cf = _G["ContainerFrame" .. i]
-        if cf and cf.IsShown and cf:IsShown() and CanSafelyModifyFrame(cf) and not InCombatLockdown() then
+        if cf and cf.IsShown and cf:IsShown() and CanSafelyModifyFrame(cf) then
             local cid = (type(cf.GetBagID) == "function" and cf:GetBagID())
                 or cf.bagID
                 or (type(cf.GetID) == "function" and cf:GetID())
@@ -3722,11 +3800,15 @@ function customBags:Open()
     local db = YRG:GetModuleDB("BetterBagsModule")
     if not ShouldUseCustomReagentCombinedFrame(db) then return end
     if InCombatLockdown() then
+        HideBlizzardBagsForCustomMode()
         local f = self.frame
+        local cfb = ContainerFrameCombinedBags
         local diag = {
             hasFrame = f ~= nil,
             isProt = f and f.IsProtected and (select(1, f:IsProtected())) or false,
             wasShown = f and f.IsShown and f:IsShown() or false,
+            cfbCanMod = cfb and CanSafelyModifyFrame(cfb) or false,
+            cfbAfterHideShown = (cfb and cfb.IsShown and cfb:IsShown()) and true or false,
         }
         if f then
             if not f:IsShown() then
@@ -3765,7 +3847,7 @@ function customBags:Close()
     end
     self.isOpen = false
     local db = YRG:GetModuleDB("BetterBagsModule")
-    if not InCombatLockdown() and ShouldUseCustomReagentCombinedFrame(db) then
+    if ShouldUseCustomReagentCombinedFrame(db) then
         HideBlizzardBagsForCustomMode()
     end
 end
@@ -3862,7 +3944,7 @@ local function ApplyNonControllerReagentMerge()
     end
 
     SyncBlizzardBagParentSuppression(false)
-    if customBags.frame and customBags.frame:IsShown() and not InCombatLockdown() then
+    if customBags.frame and customBags.frame:IsShown() and CanSafelyModifyFrame(customBags.frame) then
         customBags:Close()
     end
 
@@ -3911,6 +3993,7 @@ local function ApplyNonControllerReagentMerge()
     local reagentBagID = GetReagentBagID()
     local itemW, itemH = template.width, template.height
     local allEntries, ammoEntries, stdEntries = {}, {}, {}
+    local ammoBagCache = sepAmmo and {} or nil
     for _, btn in frame:EnumerateValidItems() do
         if IsFrameProtectedOrForbidden(btn) then return end
         local okBag, bID = pcall(btn.GetBagID, btn)
@@ -3929,11 +4012,16 @@ local function ApplyNonControllerReagentMerge()
             end
             local entry = { button = btn, x = x, y = y }
             allEntries[#allEntries + 1] = entry
-            local okAmmo, isAmmo = false, false
+            local isAmmo = false
             if sepAmmo then
-                okAmmo, isAmmo = pcall(IsAmmoOrQuiverBag, bID)
+                isAmmo = ammoBagCache[bID]
+                if isAmmo == nil then
+                    local okAmmo, resAmmo = pcall(IsAmmoOrQuiverBag, bID)
+                    isAmmo = (okAmmo and resAmmo) and true or false
+                    ammoBagCache[bID] = isAmmo
+                end
             end
-            if okAmmo and isAmmo then
+            if isAmmo then
                 ammoEntries[#ammoEntries + 1] = entry
             else
                 stdEntries[#stdEntries + 1] = entry
@@ -3952,7 +4040,7 @@ local function ApplyNonControllerReagentMerge()
         return
     end
 
-    local baseX, baseY, stepX, stepY = MeasureAndSortItemEntries(allEntries, frame, itemW, itemH)
+    local baseX, baseY, stepX, stepY = MeasureAndSortItemEntries(allEntries, frame, itemW, itemH, true)
     SortItemEntriesByGrid(ammoEntries, stepY)
     SortItemEntriesByGrid(stdEntries, stepY)
 
@@ -4008,16 +4096,20 @@ ApplyUnifiedBagLayout = function()
     if customBags.hidingBlizzard then return end
     if IsControllerUIActive() then
         bagDragState.dragging = false
-        customBags:Close()
-        HideReagentOverlays()
+        if customBags.isOpen or (customBags.frame and customBags.frame:IsShown()) then
+            customBags:Close()
+            HideReagentOverlays()
+        end
         ApplyControllerBagStripLayout()
-        RefreshNativeBagGreyItems()
+        if ContainerFrameCombinedBags and ContainerFrameCombinedBags:IsShown() then
+            ScheduleRefreshNativeBagGreyItems()
+        end
     else
         HideDividerOverlay()
         ResetDualZoneNavState()
         ResetControllerBagButtonScales()
         ApplyNonControllerReagentMerge()
-        RefreshNativeBagGreyItems()
+        ScheduleRefreshNativeBagGreyItems()
     end
 end
 
@@ -5429,7 +5521,7 @@ local function InstallAutomationHooks()
         if cf then
             cf:HookScript("OnShow", function(selfCf)
                 local db = YRG:GetModuleDB("BetterBagsModule")
-                if ShouldUseCustomReagentCombinedFrame(db) and selfCf and not IsFrameProtectedOrForbidden(selfCf) then
+                if ShouldUseCustomReagentCombinedFrame(db) and selfCf and CanSafelyModifyFrame(selfCf) then
                     local cid = (type(selfCf.GetBagID) == "function" and selfCf:GetBagID())
                         or selfCf.bagID
                         or (type(selfCf.GetID) == "function" and selfCf:GetID())
@@ -5457,7 +5549,7 @@ local function InstallAutomationHooks()
     end
 
     local function EnsureBlizzardBagsUnsuppressed()
-        if customBags.frame and customBags.frame:IsShown() and not InCombatLockdown() then
+        if customBags.frame and customBags.frame:IsShown() and CanSafelyModifyFrame(customBags.frame) then
             customBags:Close()
         end
         if customBags.savedBlizzParent or (ContainerFrameCombinedBags and customBags.hiddenBagParent and ContainerFrameCombinedBags:GetParent() == customBags.hiddenBagParent) then
@@ -5604,11 +5696,11 @@ InstallControllerStripHooks = function()
 
     if not controllerStripHooked and type(UpdateContainerFrameAnchors) == "function"
         and ContainerFrameCombinedBags then
-        hooksecurefunc("UpdateContainerFrameAnchors", ApplyAndScheduleUnifiedBagLayout)
+        hooksecurefunc("UpdateContainerFrameAnchors", ScheduleUnifiedBagLayout)
         for _, methodName in ipairs({ "UpdateItems", "UpdateItemLayout", "SetupGamepad", "FocusGamepad" }) do
             if type(ContainerFrameCombinedBags[methodName]) == "function" then
-                local hookFn = (methodName == "SetupGamepad" or methodName == "FocusGamepad")
-                    and ApplyAndScheduleUnifiedBagLayout or ApplyUnifiedBagLayout
+                local hookFn = (methodName == "UpdateItemLayout")
+                    and ApplyUnifiedBagLayout or ScheduleUnifiedBagLayout
                 hooksecurefunc(ContainerFrameCombinedBags, methodName, hookFn)
             end
         end
@@ -5631,11 +5723,11 @@ InstallControllerStripHooks = function()
     -- demand-loaded GamepadBagBar updates never leave bag buttons unpinned/unscaled.
     if GamepadBagBar and not gamepadBagBarHooked then
         if type(GamepadBagBar.HookScript) == "function" then
-            GamepadBagBar:HookScript("OnShow", ApplyAndScheduleUnifiedBagLayout)
+            GamepadBagBar:HookScript("OnShow", ScheduleUnifiedBagLayout)
         end
         for _, methodName in ipairs({ "Layout", "Update", "SetupGamepad", "UpdateBagButtons" }) do
             if type(GamepadBagBar[methodName]) == "function" then
-                hooksecurefunc(GamepadBagBar, methodName, ApplyAndScheduleUnifiedBagLayout)
+                hooksecurefunc(GamepadBagBar, methodName, ScheduleUnifiedBagLayout)
             end
         end
         gamepadBagBarHooked = true
@@ -5751,7 +5843,7 @@ function BetterBags:OnInitialize(db)
             if customBags.frame and customBags.frame:IsShown() then
                 customBags:ScheduleRefreshSlots()
             end
-            RefreshNativeBagGreyItems()
+            ScheduleRefreshNativeBagGreyItems()
         elseif event == "ITEM_LOCK_CHANGED" or event == "CURSOR_CHANGED" or event == "CURRENT_SPELL_CAST_CHANGED"
             or event == "BAG_UPDATE_DELAYED" or event == "BAG_UPDATE_COOLDOWN"
             or event == "BAG_NEW_ITEMS_UPDATED" or event == "INVENTORY_SEARCH_UPDATE" then
@@ -5775,7 +5867,7 @@ function BetterBags:OnInitialize(db)
             if customBags.frame and customBags.frame:IsShown() then
                 customBags:ScheduleRefreshSlots()
             end
-            RefreshNativeBagGreyItems()
+            ScheduleRefreshNativeBagGreyItems()
             if event == "BAG_UPDATE_DELAYED" then
                 if not customBags.frame then
                     customBags:PrepareHidden()
