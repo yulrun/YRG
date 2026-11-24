@@ -1,7 +1,7 @@
 local addonName, YRG = ...
 _G.YRG = YRG
 
-YRG.version = "2.4.3"
+YRG.version = "2.4.4"
 YRG.author = "Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP"
 YRG.modules = {}
 YRG.moduleOrder = {}
@@ -806,18 +806,38 @@ local function UpdateChatFrameGradientBg(cf, index)
             meta.gradBg = grad
         end
 
+        local ofsX, ofsY = -4, -4
+        local cfEff = math.max(YRG.SafeNumber(cf.GetEffectiveScale and cf:GetEffectiveScale(), 1), 0.01)
+        local uiEff = math.max(YRG.SafeNumber(UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale(), 1), 0.01)
+        local cfLeft = YRG.SafeNumber(cf.GetLeft and cf:GetLeft(), nil)
+        local cfBottom = YRG.SafeNumber(cf.GetBottom and cf:GetBottom(), nil)
+        if cfLeft and cfBottom then
+            local scaleRatio = uiEff / cfEff
+            local uiLeft = YRG.SafeNumber(UIParent and UIParent.GetLeft and UIParent:GetLeft(), 0)
+            local uiBottom = YRG.SafeNumber(UIParent and UIParent.GetBottom and UIParent:GetBottom(), 0)
+            local distLeft = cfLeft - (uiLeft * scaleRatio)
+            local distBottom = cfBottom - (uiBottom * scaleRatio)
+            -- Extend negative offset past 0 when near screen edges so UI snapping/scaling leaves zero gap
+            if distLeft <= 16 then
+                ofsX = math.min(ofsX, -math.max(4, math.ceil(math.max(distLeft, 0) + 4)))
+            end
+            if distBottom <= 16 then
+                ofsY = math.min(ofsY, -math.max(4, math.ceil(math.max(distBottom, 0) + 4)))
+            end
+        elseif cf == ChatFrame1 or index == 1 then
+            ofsX, ofsY = -10, -10
+        end
+
         local widthPct = (sdb and tonumber(sdb.chatGradientWidthPct)) or 135
         local heightPct = (sdb and tonumber(sdb.chatGradientHeightPct)) or 135
         local opacityPct = (sdb and tonumber(sdb.chatGradientOpacityPct)) or 65
         local baseAlpha = math.max(0, math.min(1, opacityPct / 100.0))
 
-        local baseW = math.max((cf:GetWidth() or 320) + 8, 40)
-        local baseH = math.max((cf:GetHeight() or 140) + 8, 30)
+        local baseW = math.max((cf:GetWidth() or 320) + (-ofsX) + 4, 40)
+        local baseH = math.max((cf:GetHeight() or 140) + (-ofsY) + 4, 30)
         local targetW = math.floor((baseW * (widthPct / 100.0)) + 0.5)
         local targetH = math.floor((baseH * (heightPct / 100.0)) + 0.5)
 
-        local cfEff = math.max(YRG.SafeNumber(cf.GetEffectiveScale and cf:GetEffectiveScale(), 1), 0.01)
-        local uiEff = math.max(YRG.SafeNumber(UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale(), 1), 0.01)
         local relScale = cfEff / uiEff
 
         local gf = meta.gradFrame
@@ -825,12 +845,14 @@ local function UpdateChatFrameGradientBg(cf, index)
             meta.lastScale = relScale
             gf:SetScale(relScale)
         end
-        if meta.lastW ~= targetW or meta.lastH ~= targetH or meta.lastAnchorCF ~= cf then
+        if meta.lastW ~= targetW or meta.lastH ~= targetH or meta.lastOfsX ~= ofsX or meta.lastOfsY ~= ofsY or meta.lastAnchorCF ~= cf then
             meta.lastW = targetW
             meta.lastH = targetH
+            meta.lastOfsX = ofsX
+            meta.lastOfsY = ofsY
             meta.lastAnchorCF = cf
             gf:ClearAllPoints()
-            gf:SetPoint("BOTTOMLEFT", cf, "BOTTOMLEFT", -4, -4)
+            gf:SetPoint("BOTTOMLEFT", cf, "BOTTOMLEFT", ofsX, ofsY)
             gf:SetSize(targetW, targetH)
         end
 
@@ -1055,6 +1077,7 @@ local function EnforceChatFrame1EdgeSnap()
         end
         settingChatPointGuard = false
     end
+    UpdateChatFrameGradientBg(ChatFrame1, 1)
 end
 
 ScheduleChatSnap = function()

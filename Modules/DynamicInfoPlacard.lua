@@ -818,7 +818,7 @@ function InfoPlacard:EnsureFrames()
     if self.infoFrame then return end
 
     local mui = GetMinimapUI()
-    local parent = Minimap or UIParent
+    local parent = MinimapCluster or Minimap or UIParent
     local infoFrame = CreateFrame("Frame", "YRGMinimapInfoPlacard", parent, "BackdropTemplate")
     local bestStrata = (parent.GetFrameStrata and parent:GetFrameStrata()) or "MEDIUM"
     local baseLvl = (parent.GetFrameLevel and parent:GetFrameLevel()) or 1
@@ -982,10 +982,13 @@ function InfoPlacard:LayoutPlacard()
         end
     end
 
+    local infoScale = mui.SafeRegionScale(self.infoFrame, 1)
     local function AnchorToMinimapOrExp(targetLoc, expAnchor)
         if expAnchor then
+            local expScale = mui.SafeRegionScale(expAnchor.container, infoScale)
+            local ratio = (infoScale > 0) and (expScale / infoScale) or 1
             if targetLoc == "TOP" then
-                self.infoFrame:SetPoint("BOTTOM", expAnchor.container, "TOP", 0, expAnchor.ringTopRimY + 2 + userOffsetY)
+                self.infoFrame:SetPoint("BOTTOM", expAnchor.container, "TOP", 0, (expAnchor.ringTopRimY * ratio) + 2 + userOffsetY)
             else
                 self.infoFrame:SetPoint("TOP", expAnchor.expFrame, "BOTTOM", 0, 3 + userOffsetY)
             end
@@ -1011,8 +1014,8 @@ function InfoPlacard:LayoutPlacard()
             if loc == "TOP" then
                 local zTop = (type(mui.SafeRegionTop) == "function") and mui.SafeRegionTop(zoneTitle) or nil
                 local mTop = (type(mui.SafeRegionTop) == "function") and mui.SafeRegionTop(Minimap) or nil
-                if zTop and mTop and mScale > 0 then
-                    local yRelMapTop = ((zTop * zScale) - (mTop * mScale)) / mScale + userOffsetY
+                if zTop and mTop and infoScale > 0 then
+                    local yRelMapTop = ((zTop * zScale) - (mTop * mScale)) / infoScale + userOffsetY
                     self.infoFrame:SetPoint("BOTTOM", Minimap, "TOP", 0, yRelMapTop)
                 else
                     self.infoFrame:SetPoint("BOTTOM", zoneTitle, "TOP", 0, userOffsetY)
@@ -1020,8 +1023,8 @@ function InfoPlacard:LayoutPlacard()
             else
                 local zBot = (type(mui.SafeRegionBottom) == "function") and mui.SafeRegionBottom(zoneTitle) or nil
                 local mBot = (type(mui.SafeRegionBottom) == "function") and mui.SafeRegionBottom(Minimap) or nil
-                if zBot and mBot and mScale > 0 then
-                    local yRelMapBot = ((zBot * zScale) - (mBot * mScale)) / mScale + userOffsetY
+                if zBot and mBot and infoScale > 0 then
+                    local yRelMapBot = ((zBot * zScale) - (mBot * mScale)) / infoScale + userOffsetY
                     self.infoFrame:SetPoint("TOP", Minimap, "BOTTOM", 0, yRelMapBot)
                 else
                     self.infoFrame:SetPoint("TOP", zoneTitle, "BOTTOM", 0, userOffsetY)

@@ -62,6 +62,7 @@ local ExpTracker = {
     defaults = {
         enabled = true,
         masterScale = 1.0,
+        mapScale = 1.0,
         fillStyle = "conduit",
         bubbleOverlay = "bevel",
         bubbleOverlayOpacityPct = 85,
@@ -793,6 +794,7 @@ MUI.SafeRegionScale = SafeRegionScale
 MUI.SafeRegionCenterX = SafeRegionCenterX
 
 local headerCenteringGuard = false
+local hookedHeaderAnchorFrames = setmetatable({}, { __mode = "k" })
 
 local function IsFramePointAnchoredToAny(frame, targetSet, visited)
     if not frame or type(frame.GetNumPoints) ~= "function" then return false end
@@ -1018,12 +1020,12 @@ local function GetTargetPlacardScreenWidth(db)
         end
     end
     local infoDB = YRG:GetModuleDB("DynamicInfoPlacard")
-    local mapScale = SafeRegionScale(Minimap, 1)
+    local clusterScale = SafeRegionScale(MinimapCluster or Minimap, 1)
     local fallbackW = YRG.SafeNumber(infoDB and infoDB.infoPlacardWidth, YRG.SafeNumber(db and db.infoPlacardWidth, 254))
-    if mapScale > 0 and fallbackW > 0 then
-        return fallbackW * mapScale, mapScale
+    if clusterScale > 0 and fallbackW > 0 then
+        return fallbackW * clusterScale, clusterScale
     end
-    return nil, mapScale
+    return nil, clusterScale
 end
 
 local function ApplyWidthDelta(region, deltaW, minW)
@@ -1183,6 +1185,44 @@ local function ApplyMinimapHeaderWidth(db)
     headerWidthGuard = false
 end
 
+local mapScaleAnchorGuard = false
+
+local function GetMinimapScaleUnitTarget()
+    if MinimapCluster and MinimapCluster.MinimapContainer and Minimap
+        and type(Minimap.GetParent) == "function" and Minimap:GetParent() == MinimapCluster.MinimapContainer then
+        local prot = type(MinimapCluster.MinimapContainer.IsProtected) == "function"
+            and MinimapCluster.MinimapContainer:IsProtected()
+        if not prot then
+            return MinimapCluster.MinimapContainer
+        end
+    end
+    if Minimap and not (type(Minimap.IsProtected) == "function" and Minimap:IsProtected()) then
+        return Minimap
+    end
+    return nil
+end
+
+local function IsMinimapHeaderOnBottom()
+    if MinimapCluster then
+        if type(MinimapCluster.IsHeaderUnderneath) == "function" then
+            local ok, v = pcall(MinimapCluster.IsHeaderUnderneath, MinimapCluster)
+            if ok and v ~= nil then return v and true or false end
+        end
+        if MinimapCluster.headerUnderneath ~= nil then
+            return MinimapCluster.headerUnderneath and true or false
+        end
+    end
+    local hdr = GetZoneTitleAnchorFrame()
+    local hy = SafeRegionCenterY(hdr)
+    local hScale = SafeRegionScale(hdr, 1)
+    local my = SafeRegionCenterY(Minimap)
+    local mScale = SafeRegionScale(Minimap, 1)
+    if hy and my then
+        return (hy * hScale) < (my * mScale)
+    end
+    return false
+end
+
 local function ApplyMinimapHeaderCenter(db)
     if headerCenteringGuard then return end
     if InCombatLockdown() then
@@ -1193,8 +1233,49 @@ local function ApplyMinimapHeaderCenter(db)
     local roots = GetMinimapHeaderAnchors()
     if not roots then return end
 
+    for _, entry in ipairs(roots) do
+        local f = entry.frame
+        if not hookedHeaderAnchorFrames[f] and type(f.SetPoint) == "function" then
+            hookedHeaderAnchorFrames[f] = true
+            pcall(hooksecurefunc, f, "SetPoint", function(frame)
+                if headerCenteringGuard then return end
+                frame._yrgPreShiftPoints = nil
+                frame._yrgCenterApplied = nil
+            end)
+        end
+    end
+
     local shouldCenter = IsInfoPlacardTitleAnchored() or (db and db.enabled and (db.centerMinimapHeader ~= false)) or false
-    if not shouldCenter then
+    local mapUnit = GetMinimapScaleUnitTarget()
+    local mapUnitScale = (db and db.enabled and db.mapScale) or 1.0
+    local headerOnBottom = IsMinimapHeaderOnBottom()
+    local headerAnchoredToMap = false
+    if mapUnit then
+        local mapSet = { [mapUnit] = true }
+        if Minimap then mapSet[Minimap] = true end
+        for _, entry in ipairs(roots) do
+            if IsFramePointAnchoredToAny(entry.frame, mapSet) then
+                headerAnchoredToMap = true
+                break
+            end
+        end
+    end
+
+    local desiredShiftScreenY = 0
+    if db and db.enabled and headerOnBottom and (not headerAnchoredToMap) and mapUnit and math.abs(mapUnitScale - 1.0) > 0.001 then
+        local targetH = (type(mapUnit.GetHeight) == "function" and YRG.SafeNumber(mapUnit:GetHeight(), 0)) or 140
+        if targetH <= 0 then targetH = 140 end
+        local unitSpan = targetH
+        local tTop = SafeRegionTop(mapUnit)
+        local eBot = (ExpTracker.expFrame and ExpTracker.expFrame:IsShown()) and SafeRegionBottom(ExpTracker.expFrame) or nil
+        if tTop and eBot and tTop > eBot then
+            unitSpan = tTop - eBot
+        end
+        local mcScale = SafeRegionScale((mapUnit.GetParent and mapUnit:GetParent()) or MinimapCluster, 1)
+        desiredShiftScreenY = unitSpan * (1 - mapUnitScale) * mcScale
+    end
+
+    if (not shouldCenter) and math.abs(desiredShiftScreenY) < 0.35 then
         local hadApplied = false
         for _, entry in ipairs(roots) do
             if entry.frame._yrgCenterApplied then
@@ -1229,12 +1310,26 @@ local function ApplyMinimapHeaderCenter(db)
     local mapX = SafeRegionCenterX(Minimap)
     local mapScale = SafeRegionScale(Minimap, 1)
     local visScreenX = GetCombinedVisualHeaderBoundsX(roots)
-    if not (mapX and visScreenX and mapScale > 0) then
-        return
+    local deltaScreenX = 0
+    if shouldCenter and mapX and visScreenX and mapScale > 0 then
+        deltaScreenX = (mapX * mapScale) - visScreenX
     end
 
-    local deltaScreenX = (mapX * mapScale) - visScreenX
-    if math.abs(deltaScreenX) < 0.35 then
+    local needShiftY = false
+    for _, entry in ipairs(roots) do
+        local f = entry.frame
+        local fScale = SafeRegionScale(f, 1)
+        local basePts = f._yrgPreShiftPoints or entry.pts
+        if fScale > 0 and basePts and basePts[1] and entry.pts and entry.pts[1] then
+            local wantY = basePts[1].y + (desiredShiftScreenY / fScale)
+            if math.abs(entry.pts[1].y - wantY) >= 0.35 then
+                needShiftY = true
+                break
+            end
+        end
+    end
+
+    if math.abs(deltaScreenX) < 0.35 and not needShiftY then
         return
     end
 
@@ -1246,16 +1341,20 @@ local function ApplyMinimapHeaderCenter(db)
             if not f._yrgCenterApplied then
                 f._yrgPreShiftPoints = entry.pts
             end
-            local shiftLocal = deltaScreenX / fScale
+            local basePts = f._yrgPreShiftPoints or entry.pts
+            local shiftLocalX = deltaScreenX / fScale
+            local shiftLocalY = desiredShiftScreenY / fScale
             local ok = false
             if #entry.pts == 1 then
                 local p = entry.pts[1]
-                ok = pcall(f.SetPoint, f, p.pt, p.relTo, p.relPt, p.x + shiftLocal, p.y)
+                local bp = basePts[1] or p
+                ok = pcall(f.SetPoint, f, p.pt, p.relTo, p.relPt, p.x + shiftLocalX, bp.y + shiftLocalY)
             elseif type(f.ClearAllPoints) == "function" then
                 ok = pcall(function()
                     f:ClearAllPoints()
-                    for _, p in ipairs(entry.pts) do
-                        f:SetPoint(p.pt, p.relTo, p.relPt, p.x + shiftLocal, p.y)
+                    for idx, p in ipairs(entry.pts) do
+                        local bp = basePts[idx] or p
+                        f:SetPoint(p.pt, p.relTo, p.relPt, p.x + shiftLocalX, bp.y + shiftLocalY)
                     end
                 end)
             end
@@ -1636,6 +1735,12 @@ local savedSelectionPoints = nil
 local selectionBoundsModified = false
 local updatingSelectionBounds = false
 local lastSelectionOffsets = nil
+local hookedClusterClamp = false
+local savedClusterClampInsets = nil
+local clampInsetsModified = false
+local settingMinimapClampGuard = false
+local lastClampInsets = nil
+local hookedMapUnitFrames = setmetatable({}, { __mode = "k" })
 
 local function IsEditModeActive()
     if EditModeManagerFrame then
@@ -1651,6 +1756,166 @@ local function IsEditModeActive()
         return true
     end
     return false
+end
+
+local function ComputeMinimapVisualBounds(db)
+    if not MinimapCluster then return nil end
+
+    local hasRing = (db and db.enabled and ExpTracker.container and ExpTracker.container:IsShown()) and true or false
+    local infoF = MUI.infoFrame
+    local hasInfo = (infoF and type(infoF.IsShown) == "function" and infoF:IsShown()) and true or false
+    local hasAny = hasRing or hasInfo
+
+    local cL = YRG.SafeOptionalNumber(MinimapCluster.GetLeft and MinimapCluster:GetLeft())
+    local cR = YRG.SafeOptionalNumber(MinimapCluster.GetRight and MinimapCluster:GetRight())
+    local cB = YRG.SafeOptionalNumber(MinimapCluster.GetBottom and MinimapCluster:GetBottom())
+    local cT = YRG.SafeOptionalNumber(MinimapCluster.GetTop and MinimapCluster:GetTop())
+    local cScale = YRG.SafeOptionalNumber(MinimapCluster.GetEffectiveScale and MinimapCluster:GetEffectiveScale())
+    if not (cL and cR and cB and cT and cScale and cScale > 0) then
+        return nil, nil, nil, nil, nil, nil, nil, nil, nil, hasAny
+    end
+
+    local uLeft, uRight, uBottom, uTop = nil, nil, nil, nil
+
+    local function ExpandWithFrame(f, insetRatioL, insetRatioR, insetRatioT, insetRatioB)
+        if not f or (type(f.IsShown) == "function" and not f:IsShown()) then return end
+        local fL = YRG.SafeOptionalNumber(f.GetLeft and f:GetLeft())
+        local fR = YRG.SafeOptionalNumber(f.GetRight and f:GetRight())
+        local fB = YRG.SafeOptionalNumber(f.GetBottom and f:GetBottom())
+        local fT = YRG.SafeOptionalNumber(f.GetTop and f:GetTop())
+        local fScale = YRG.SafeOptionalNumber(f.GetEffectiveScale and f:GetEffectiveScale()) or cScale
+        if not (fL and fR and fB and fT and fScale and fScale > 0) then return end
+
+        local fw = fR - fL
+        local fh = fT - fB
+        fL = fL + fw * (insetRatioL or 0)
+        fR = fR - fw * (insetRatioR or 0)
+        fT = fT - fh * (insetRatioT or 0)
+        fB = fB + fh * (insetRatioB or 0)
+
+        uLeft = uLeft and math.min(uLeft, fL * fScale) or (fL * fScale)
+        uRight = uRight and math.max(uRight, fR * fScale) or (fR * fScale)
+        uBottom = uBottom and math.min(uBottom, fB * fScale) or (fB * fScale)
+        uTop = uTop and math.max(uTop, fT * fScale) or (fT * fScale)
+    end
+
+    if Minimap and (not Minimap.IsShown or Minimap:IsShown()) then
+        ExpandWithFrame(Minimap, 0, 0, 0, 0)
+    end
+    -- Ring texture uses 512x512 canvas with ~48px side, 42px top, 56px bottom transparent margin
+    if ExpTracker.container and ExpTracker.container:IsShown() then
+        ExpandWithFrame(ExpTracker.container, 48 / 512, 48 / 512, 42 / 512, 56 / 512)
+    end
+    if ExpTracker.expFrame and ExpTracker.expFrame:IsShown() then
+        ExpandWithFrame(ExpTracker.expFrame, 0, 0, 0, 0)
+    end
+    if MUI.infoFrame and MUI.infoFrame:IsShown() then
+        ExpandWithFrame(MUI.infoFrame, 0, 0, 0, 0)
+    end
+    for _, hdrPart in ipairs({
+        (MinimapCluster and MinimapCluster.BorderTop) or false,
+        (MinimapCluster and MinimapCluster.ZoneTextButton) or false,
+        _G["MinimapBorderTop"] or false,
+        _G["MinimapZoneTextButton"] or false,
+        (MinimapCluster and MinimapCluster.Tracking) or false,
+        _G["TimeManagerClockButton"] or false,
+        _G["GameTimeFrame"] or false,
+    }) do
+        if hdrPart then
+            ExpandWithFrame(hdrPart, 0, 0, 0, 0)
+        end
+    end
+    if not (uLeft and uRight and uBottom and uTop) then
+        uLeft = cL * cScale
+        uRight = cR * cScale
+        uBottom = cB * cScale
+        uTop = cT * cScale
+    end
+
+    return uLeft, uRight, uBottom, uTop, cL, cR, cB, cT, cScale, hasAny
+end
+
+local function RestoreMinimapClampRectInsets()
+    if not clampInsetsModified or settingMinimapClampGuard or InCombatLockdown() or not MinimapCluster then return end
+    local isProtected = type(MinimapCluster.IsProtected) == "function" and MinimapCluster:IsProtected()
+    if isProtected or type(MinimapCluster.SetClampRectInsets) ~= "function" then return end
+
+    local ins = savedClusterClampInsets or { 0, 0, 0, 0 }
+    settingMinimapClampGuard = true
+    pcall(MinimapCluster.SetClampRectInsets, MinimapCluster, ins[1] or 0, ins[2] or 0, ins[3] or 0, ins[4] or 0)
+    settingMinimapClampGuard = false
+    clampInsetsModified = false
+    lastClampInsets = nil
+end
+
+local ApplyMinimapClampRectInsets
+ApplyMinimapClampRectInsets = function(forceReapply)
+    if settingMinimapClampGuard or InCombatLockdown() or not MinimapCluster then return end
+    local isProtected = type(MinimapCluster.IsProtected) == "function" and MinimapCluster:IsProtected()
+    if isProtected or type(MinimapCluster.SetClampRectInsets) ~= "function" then return end
+
+    if not hookedClusterClamp and type(MinimapCluster) == "table" then
+        hookedClusterClamp = true
+        if not savedClusterClampInsets and type(MinimapCluster.GetClampRectInsets) == "function" then
+            local okG, l, r, t, b = pcall(MinimapCluster.GetClampRectInsets, MinimapCluster)
+            if okG and l ~= nil then
+                savedClusterClampInsets = {
+                    YRG.SafeNumber(l, 0),
+                    YRG.SafeNumber(r, 0),
+                    YRG.SafeNumber(t, 0),
+                    YRG.SafeNumber(b, 0),
+                }
+            end
+        end
+        pcall(hooksecurefunc, MinimapCluster, "SetClampRectInsets", function(_, l, r, t, b)
+            if settingMinimapClampGuard then return end
+            savedClusterClampInsets = {
+                YRG.SafeNumber(l, 0),
+                YRG.SafeNumber(r, 0),
+                YRG.SafeNumber(t, 0),
+                YRG.SafeNumber(b, 0),
+            }
+            lastClampInsets = nil
+            if not InCombatLockdown() then
+                ApplyMinimapClampRectInsets(true)
+            end
+        end)
+    end
+
+    local db = YRG:GetModuleDB("MinimapExpTracker")
+    local uLeft, uRight, uBottom, uTop, cL, cR, cB, cT, cScale, hasAny = ComputeMinimapVisualBounds(db)
+    if not hasAny then
+        RestoreMinimapClampRectInsets()
+        return
+    end
+    if not (uLeft and uRight and uBottom and uTop and cL and cR and cB and cT and cScale and cScale > 0) then
+        return
+    end
+
+    local uScale = YRG.SafeOptionalNumber(UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or cScale
+    local topPaddingLocal = (10 * uScale) / cScale
+
+    local clampL = (uLeft - (cL * cScale)) / cScale
+    local clampR = (uRight - (cR * cScale)) / cScale
+    local clampT = ((uTop - (cT * cScale)) / cScale) + topPaddingLocal
+    local clampB = (uBottom - (cB * cScale)) / cScale
+
+    if not forceReapply and clampInsetsModified and lastClampInsets then
+        if math.abs(lastClampInsets[1] - clampL) < 0.2
+            and math.abs(lastClampInsets[2] - clampR) < 0.2
+            and math.abs(lastClampInsets[3] - clampT) < 0.2
+            and math.abs(lastClampInsets[4] - clampB) < 0.2 then
+            return
+        end
+    end
+
+    settingMinimapClampGuard = true
+    local ok = pcall(MinimapCluster.SetClampRectInsets, MinimapCluster, clampL, clampR, clampT, clampB)
+    settingMinimapClampGuard = false
+    if ok then
+        clampInsetsModified = true
+        lastClampInsets = { clampL, clampR, clampT, clampB }
+    end
 end
 
 local function RestoreEditModeMinimapSelection()
@@ -1678,6 +1943,8 @@ local function UpdateEditModeMinimapSelection(forceReapply)
     if updatingSelectionBounds then return end
     if InCombatLockdown() then return end
 
+    ApplyMinimapClampRectInsets(forceReapply)
+
     local db = YRG:GetModuleDB("MinimapExpTracker")
     local sel = MinimapCluster and MinimapCluster.Selection
     if not sel or not MinimapCluster then return end
@@ -1695,10 +1962,8 @@ local function UpdateEditModeMinimapSelection(forceReapply)
         end)
     end
 
-    local hasRing = (db and db.enabled and ExpTracker.container and ExpTracker.container:IsShown()) and true or false
-    local infoF = MUI.infoFrame
-    local hasInfo = (infoF and type(infoF.IsShown) == "function" and infoF:IsShown()) and true or false
-    if (not hasRing and not hasInfo) or not IsEditModeActive() then
+    local uLeft, uRight, uBottom, uTop, cL, cR, cB, cT, cScale, hasAny = ComputeMinimapVisualBounds(db)
+    if (not hasAny) or not IsEditModeActive() then
         RestoreEditModeMinimapSelection()
         return
     end
@@ -1717,52 +1982,9 @@ local function UpdateEditModeMinimapSelection(forceReapply)
         end
     end
 
-    local cL = YRG.SafeOptionalNumber(MinimapCluster.GetLeft and MinimapCluster:GetLeft())
-    local cR = YRG.SafeOptionalNumber(MinimapCluster.GetRight and MinimapCluster:GetRight())
-    local cB = YRG.SafeOptionalNumber(MinimapCluster.GetBottom and MinimapCluster:GetBottom())
-    local cT = YRG.SafeOptionalNumber(MinimapCluster.GetTop and MinimapCluster:GetTop())
-    local cScale = YRG.SafeOptionalNumber(MinimapCluster.GetEffectiveScale and MinimapCluster:GetEffectiveScale())
     local sScale = YRG.SafeOptionalNumber(sel.GetEffectiveScale and sel:GetEffectiveScale()) or cScale
-    if not (cL and cR and cB and cT and cScale and sScale and cScale > 0 and sScale > 0) then
+    if not (uLeft and uRight and uBottom and uTop and cL and cR and cB and cT and cScale and sScale and cScale > 0 and sScale > 0) then
         return
-    end
-
-    local uLeft = cL * cScale
-    local uRight = cR * cScale
-    local uBottom = cB * cScale
-    local uTop = cT * cScale
-
-    local function ExpandWithFrame(f, insetRatioL, insetRatioR, insetRatioT, insetRatioB)
-        if not f or (type(f.IsShown) == "function" and not f:IsShown()) then return end
-        local fL = YRG.SafeOptionalNumber(f.GetLeft and f:GetLeft())
-        local fR = YRG.SafeOptionalNumber(f.GetRight and f:GetRight())
-        local fB = YRG.SafeOptionalNumber(f.GetBottom and f:GetBottom())
-        local fT = YRG.SafeOptionalNumber(f.GetTop and f:GetTop())
-        local fScale = YRG.SafeOptionalNumber(f.GetEffectiveScale and f:GetEffectiveScale()) or cScale
-        if not (fL and fR and fB and fT and fScale and fScale > 0) then return end
-
-        local fw = fR - fL
-        local fh = fT - fB
-        fL = fL + fw * (insetRatioL or 0)
-        fR = fR - fw * (insetRatioR or 0)
-        fT = fT - fh * (insetRatioT or 0)
-        fB = fB + fh * (insetRatioB or 0)
-
-        uLeft = math.min(uLeft, fL * fScale)
-        uRight = math.max(uRight, fR * fScale)
-        uBottom = math.min(uBottom, fB * fScale)
-        uTop = math.max(uTop, fT * fScale)
-    end
-
-    -- Ring texture uses 512x512 canvas with ~48px side, 42px top, 56px bottom transparent margin
-    if ExpTracker.container and ExpTracker.container:IsShown() then
-        ExpandWithFrame(ExpTracker.container, 48 / 512, 48 / 512, 42 / 512, 56 / 512)
-    end
-    if ExpTracker.expFrame and ExpTracker.expFrame:IsShown() then
-        ExpandWithFrame(ExpTracker.expFrame, 0, 0, 0, 0)
-    end
-    if MUI.infoFrame and MUI.infoFrame:IsShown() then
-        ExpandWithFrame(MUI.infoFrame, 0, 0, 0, 0)
     end
 
     local offLeft = (uLeft - (cL * cScale)) / sScale
@@ -1795,9 +2017,96 @@ end
 MUI.UpdateEditModeSelection = UpdateEditModeMinimapSelection
 MUI.RestoreEditModeSelection = RestoreEditModeMinimapSelection
 
+local function ApplyMinimapUnitScale(unitScale, resetCachedPts)
+    local target = GetMinimapScaleUnitTarget()
+    if not target or type(target.SetScale) ~= "function" then return end
+    if InCombatLockdown() then return end
+
+    if not hookedMapUnitFrames[target] and type(target) == "table" and type(target.SetPoint) == "function" then
+        hookedMapUnitFrames[target] = true
+        pcall(hooksecurefunc, target, "SetPoint", function(frame)
+            if mapScaleAnchorGuard then return end
+            frame._yrgOrigMapPts = nil
+            frame._yrgMapOffsetApplied = nil
+        end)
+    end
+
+    local desired = math.max(0.50, math.min(1.80, YRG.SafeNumber(unitScale, 1.0)))
+    if resetCachedPts and not mapScaleAnchorGuard and not target._yrgMapOffsetApplied then
+        target._yrgOrigMapPts = nil
+    end
+
+    if not target._yrgOrigMapPts and type(target.GetNumPoints) == "function" and type(target.GetPoint) == "function" then
+        local pts = {}
+        local n = YRG.SafeNumber(target:GetNumPoints(), 0)
+        for i = 1, n do
+            local ok, pt, relTo, relPt, x, y = pcall(target.GetPoint, target, i)
+            if ok and pt then
+                table.insert(pts, {
+                    pt = pt,
+                    relTo = relTo,
+                    relPt = relPt or pt,
+                    x = YRG.SafeNumber(x, 0),
+                    y = YRG.SafeNumber(y, 0),
+                })
+            end
+        end
+        if #pts > 0 then
+            target._yrgOrigMapPts = pts
+        end
+    end
+
+    local curScale = (type(target.GetScale) == "function") and YRG.SafeNumber(target:GetScale(), 1.0) or 1.0
+    if math.abs(curScale - desired) > 0.001 then
+        pcall(target.SetScale, target, desired)
+    end
+
+    local origPts = target._yrgOrigMapPts
+    if origPts and #origPts > 0 and type(target.SetPoint) == "function" then
+        mapScaleAnchorGuard = true
+        if math.abs(desired - 1.0) <= 0.001 then
+            if target._yrgMapOffsetApplied then
+                pcall(function()
+                    if #origPts > 1 and type(target.ClearAllPoints) == "function" then
+                        target:ClearAllPoints()
+                    end
+                    for _, p in ipairs(origPts) do
+                        target:SetPoint(p.pt, p.relTo, p.relPt, p.x, p.y)
+                    end
+                end)
+                target._yrgMapOffsetApplied = nil
+            end
+        else
+            local targetH = (type(target.GetHeight) == "function" and YRG.SafeNumber(target:GetHeight(), 0)) or 140
+            if targetH <= 0 then targetH = 140 end
+            local halfH = targetH * 0.5
+            pcall(function()
+                if #origPts > 1 and type(target.ClearAllPoints) == "function" then
+                    target:ClearAllPoints()
+                end
+                for _, p in ipairs(origPts) do
+                    local nx = p.x / desired
+                    local ny = p.y / desired
+                    if p.pt:find("BOTTOM", 1, true) then
+                        ny = (p.y + targetH * (1 - desired)) / desired
+                    elseif not p.pt:find("TOP", 1, true) then
+                        ny = (p.y + halfH * (1 - desired)) / desired
+                    end
+                    target:SetPoint(p.pt, p.relTo, p.relPt, nx, ny)
+                end
+            end)
+            target._yrgMapOffsetApplied = true
+        end
+        mapScaleAnchorGuard = false
+    end
+end
+
 function MUI.SyncHeaderAndEditMode()
     local db = YRG:GetModuleDB("MinimapExpTracker")
     ApplyMinimapHeaderWidth(db)
+    if db and db.enabled then
+        ApplyMinimapUnitScale(db.mapScale or 1.0, false)
+    end
     ApplyMinimapHeaderCenter(db)
     if ExpTracker.expHitFrame then
         ApplyExpHitBoxLayering(ExpTracker.expHitFrame)
@@ -1874,6 +2183,8 @@ function ExpTracker:ApplyVisualSettings()
         end
     end
 
+    ApplyMinimapUnitScale(db.mapScale or 1.0, false)
+
     local mapWidth = Minimap:GetWidth() or 140
     local baseRingSize = mapWidth * (512 / 368)
 
@@ -1912,6 +2223,35 @@ function ExpTracker:ApplyVisualSettings()
         self:ApplyHideAddonButtonsSetting(db)
     end
     self:UpdateXP()
+
+    pcall(function()
+        local mapUnit = GetMinimapScaleUnitTarget()
+        local hdr = GetZoneTitleAnchorFrame()
+        local _, _, _, uTop, _, _, _, _, cScale = ComputeMinimapVisualBounds(db)
+        local ptsDesc = ""
+        if mapUnit and mapUnit._yrgOrigMapPts then
+            local segs = {}
+            for _, p in ipairs(mapUnit._yrgOrigMapPts) do
+                local rn = (p.relTo and p.relTo.GetName and p.relTo:GetName()) or tostring(p.relTo)
+                segs[#segs + 1] = string.format("%s->%s:%s(%.1f,%.1f)", tostring(p.pt), tostring(rn), tostring(p.relPt), p.x, p.y)
+            end
+            ptsDesc = table.concat(segs, ";")
+        end
+        db._lastMapScaleDiag = {
+            masterScale = db.masterScale,
+            mapScale = db.mapScale,
+            target = (mapUnit and mapUnit.GetName and mapUnit:GetName()) or ((MinimapCluster and mapUnit == MinimapCluster.MinimapContainer) and "MinimapContainer") or tostring(mapUnit),
+            hdrBottom = IsMinimapHeaderOnBottom(),
+            mcTop = MinimapCluster and MinimapCluster.GetTop and YRG.SafeOptionalNumber(MinimapCluster:GetTop()),
+            tTop = mapUnit and mapUnit.GetTop and YRG.SafeOptionalNumber(mapUnit:GetTop()),
+            visTop = (uTop and cScale and cScale > 0) and (uTop / cScale) or nil,
+            clampT = lastClampInsets and lastClampInsets[3] or nil,
+            clampR = lastClampInsets and lastClampInsets[2] or nil,
+            hdrTop = hdr and hdr.GetTop and YRG.SafeOptionalNumber(hdr:GetTop()),
+            hdrBot = hdr and hdr.GetBottom and YRG.SafeOptionalNumber(hdr:GetBottom()),
+            origPts = ptsDesc,
+        }
+    end)
 end
 
 function ExpTracker:ApplyHideAddonButtonsSetting(db)
@@ -2002,6 +2342,9 @@ function ExpTracker:OnInitialize(db)
     if not db.colorScheme or not COLOR_SCHEMES[db.colorScheme] then
         db.colorScheme = "blue"
     end
+    if db.mapScale == nil then
+        db.mapScale = 1.0
+    end
     db.headerOffsetX = nil
     db.expColor = nil
     db.restedColor = nil
@@ -2040,9 +2383,13 @@ function ExpTracker:OnInitialize(db)
         MUI.hooksRegistered = true
         Minimap:HookScript("OnSizeChanged", OnAnyMinimapLayoutChange)
 
+        local syncingHeader = false
         local function SyncMinimapHeaderLayout()
+            if syncingHeader or headerWidthGuard or headerCenteringGuard or mapScaleAnchorGuard then return end
+            syncingHeader = true
             local modDB = YRG:GetModuleDB("MinimapExpTracker")
             if modDB and modDB.enabled then
+                ApplyMinimapUnitScale(modDB.mapScale or 1.0, false)
                 self:LayoutPlacards()
             else
                 MUI.NotifyInfoPlacardLayout()
@@ -2050,9 +2397,14 @@ function ExpTracker:OnInitialize(db)
             end
             if C_Timer and type(C_Timer.After) == "function" then
                 C_Timer.After(0, function()
+                    local mdb = YRG:GetModuleDB("MinimapExpTracker")
+                    if mdb and mdb.enabled then
+                        ApplyMinimapUnitScale(mdb.mapScale or 1.0, false)
+                    end
                     MUI.SyncHeaderAndEditMode()
                 end)
             end
+            syncingHeader = false
         end
 
         if MinimapCluster then
@@ -2127,6 +2479,7 @@ function ExpTracker:OnEnable(db)
                 ApplyMinimapHeaderCenter(modDB)
             end
             MUI.NotifyInfoPlacardLayout()
+            MUI.SyncHeaderAndEditMode()
         end)
         C_Timer.After(1.0, function()
             local modDB = YRG:GetModuleDB("MinimapExpTracker")
@@ -2151,6 +2504,7 @@ function ExpTracker:OnDisable(db)
     if self.ApplyHideAddonButtonsSetting then
         self:ApplyHideAddonButtonsSetting(db)
     end
+    ApplyMinimapUnitScale(1.0, false)
     local scaleTarget = MinimapCluster or Minimap
     if scaleTarget and type(scaleTarget.SetScale) == "function" then
         local curScale = (type(scaleTarget.GetScale) == "function") and YRG.SafeNumber(scaleTarget:GetScale(), 1.0) or 1.0
@@ -2333,7 +2687,7 @@ function ExpTracker:BuildConfigUI(ctx, db)
     ctx:AddSlider({
         key = "masterScale",
         name = "Minimap Master Scale",
-        tooltip = "Overall scale factor applied to the minimap cluster and attached YRG placards.",
+        tooltip = "Overall scale factor applied to the entire minimap cluster (including the title bar, Info Placard, and minimap unit).",
         min = 0.70, max = 1.40, step = 0.02, defaultValue = 1.0,
         format = function(v) return string.format("%.2f", v) end,
         get = function()
@@ -2343,6 +2697,23 @@ function ExpTracker:BuildConfigUI(ctx, db)
         set = function(val)
             local mdb = GetDB()
             if mdb then mdb.masterScale = val end
+            self:ApplyVisualSettings()
+        end,
+    })
+
+    ctx:AddSlider({
+        key = "mapScale",
+        name = "Minimap & EXP Ring Scale",
+        tooltip = "Independent scale factor applied to the minimap, radial EXP ring, and bottom EXP placard as one unit, separate from the title bar and Info Placard.",
+        min = 0.60, max = 1.50, step = 0.02, defaultValue = 1.0,
+        format = function(v) return string.format("%.2f", v) end,
+        get = function()
+            local mdb = GetDB()
+            return (mdb and mdb.mapScale) or 1.0
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then mdb.mapScale = val end
             self:ApplyVisualSettings()
         end,
     })

@@ -59,6 +59,7 @@ local ClassImprovements = {
         petFeederEnabled = true,
         petFeederIgnoreCrafted = true,
         petFeederBlacklist = {},
+        hunterBetterPartyMember = true,
     }
 }
 
@@ -604,6 +605,7 @@ local HandlePrepUIError
 local HandlePrepUnitSpellcast
 local HandlePrepStateInvalidation
 local PetFeeder = {}
+local BetterParty = {}
 
 function ClassImprovements:OnInitialize(db)
     -- Migrate from previous ComboPoints module key or standalone ForeverComboPlatesDB
@@ -709,6 +711,13 @@ function ClassImprovements:OnInitialize(db)
             if PetFeeder.OnEvent then
                 PetFeeder.OnEvent(event, arg1, arg2, arg3)
             end
+            if BetterParty.OnEvent then
+                BetterParty.OnEvent(event, arg1, arg2)
+            end
+        elseif event == "ZONE_CHANGED_NEW_AREA" or event == "PET_BAR_UPDATE" then
+            if BetterParty.OnEvent then
+                BetterParty.OnEvent(event, arg1, arg2)
+            end
         elseif event == "UPDATE_MACROS" then
             if EnsureRoguePrepMacro then
                 EnsureRoguePrepMacro(false, false)
@@ -741,6 +750,9 @@ function ClassImprovements:OnInitialize(db)
             or event == "EDIT_MODE_LAYOUTS_UPDATED" or event == "UNIT_LEVEL" or event == "PLAYER_LEVEL_UP" then
             if PetFeeder.OnEvent then
                 PetFeeder.OnEvent(event, arg1, arg2, arg3)
+            end
+            if BetterParty.OnEvent and (event == "UNIT_PET" or event == "PET_BAR_UPDATE" or event == "PLAYER_REGEN_ENABLED") then
+                BetterParty.OnEvent(event, arg1, arg2)
             end
         elseif event == "PLAYER_TARGET_CHANGED"
             or event == "NAME_PLATE_UNIT_ADDED"
@@ -831,6 +843,8 @@ function ClassImprovements:OnEnable(db)
     playerClass = select(2, UnitClass("player"))
 
     self.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "ZONE_CHANGED_NEW_AREA")
+    pcall(self.eventFrame.RegisterEvent, self.eventFrame, "PET_BAR_UPDATE")
     self.eventFrame:RegisterEvent("UPDATE_MACROS")
     self.eventFrame:RegisterEvent("REPLACE_ENCHANT")
     pcall(self.eventFrame.RegisterEvent, self.eventFrame, "UI_ERROR_MESSAGE")
@@ -869,6 +883,9 @@ function ClassImprovements:OnEnable(db)
     self:UpdateDruidManaBar()
     if PetFeeder.OnEnable then
         PetFeeder.OnEnable()
+    end
+    if BetterParty.OnEnable then
+        BetterParty.OnEnable()
     end
 end
 
@@ -1149,6 +1166,9 @@ function ClassImprovements:OnDisable(db)
     end
     if PetFeeder.OnDisable then
         PetFeeder.OnDisable()
+    end
+    if BetterParty.OnDisable then
+        BetterParty.OnDisable()
     end
     if self.eventFrame then
         self.eventFrame:UnregisterAllEvents()
@@ -4950,6 +4970,256 @@ do
     end
 end
 
+-- ============================================================================
+-- HUNTER: BETTER PARTY MEMBER (Passive + Growl Auto-Cast Off in Instances)
+-- ============================================================================
+do
+    local GROWL_SPELL_IDS = {
+        [2649] = true,
+        [14916] = true,
+        [14917] = true,
+        [14918] = true,
+        [14919] = true,
+        [14920] = true,
+        [14921] = true,
+        [27047] = true,
+        [61676] = true,
+    }
+
+    local wasInPvEInstance = false
+    local lastInstanceKey = nil
+    local pendingPartyPrep = false
+    local pendingRetryDepth = 0
+
+    local function GetGrowlSpellName()
+        if C_Spell and type(C_Spell.GetSpellInfo) == "function" then
+            local ok, info = pcall(C_Spell.GetSpellInfo, 2649)
+            if ok and type(info) == "table" and not IsSecret(info.name) and type(info.name) == "string" and info.name ~= "" then
+                return info.name
+            end
+        end
+        if type(GetSpellInfo) == "function" then
+            local ok, nm = pcall(GetSpellInfo, 2649)
+            if ok and not IsSecret(nm) and type(nm) == "string" and nm ~= "" then
+                return nm
+            end
+        end
+        return "Growl"
+    end
+
+    local function GetPvEInstanceState()
+        if type(IsInInstance) ~= "function" then
+            return false, nil, nil
+        end
+        local okInst, inInst, instType = pcall(IsInInstance)
+        if not okInst or not inInst or IsSecret(instType) then
+            return false, nil, nil
+        end
+        if instType ~= "party" and instType ~= "raid" and instType ~= "scenario" then
+            return false, nil, nil
+        end
+        local instName, instMapID = "", 0
+        if type(GetInstanceInfo) == "function" then
+            local okInfo, nm, _, _, _, _, _, _, mapID = pcall(GetInstanceInfo)
+            if okInfo then
+                instName = YRG.SafeString(nm, "") or ""
+                instMapID = YRG.SafeNumber(mapID, 0)
+            end
+        end
+        local key = instName .. ":" .. tostring(instMapID) .. ":" .. tostring(instType)
+        return true, key, (instName ~= "" and instName or nil)
+    end
+
+    local function TryDisableGrowlInPetSpellbook(growlName)
+        local petBook = BOOKTYPE_PET or "pet"
+        local growlLow = growlName:lower()
+
+        local function CheckAndDisableSpellArg(spellArg)
+            if type(GetSpellAutocast) ~= "function" then return false end
+            local okA, autocastable, autostate = pcall(GetSpellAutocast, spellArg, petBook)
+            if okA and autocastable and autostate then
+                if type(DisableSpellAutocast) == "function" then
+                    pcall(DisableSpellAutocast, spellArg, petBook)
+                    return true
+                elseif type(ToggleSpellAutocast) == "function" then
+                    pcall(ToggleSpellAutocast, spellArg, petBook)
+                    return true
+                end
+            end
+            return false
+        end
+
+        if type(GetSpellBookItemName) == "function" and type(HasPetSpells) == "function" then
+            local okNum, numSpells = pcall(HasPetSpells)
+            if okNum and type(numSpells) == "number" and not IsSecret(numSpells) and numSpells > 0 then
+                for i = 1, numSpells do
+                    local okSp, spName, spSub = pcall(GetSpellBookItemName, i, petBook)
+                    if okSp and type(spName) == "string" and not IsSecret(spName) and spName:lower() == growlLow then
+                        local fullArg = (type(spSub) == "string" and not IsSecret(spSub) and spSub ~= "")
+                            and (spName .. "(" .. spSub .. ")") or spName
+                        if CheckAndDisableSpellArg(fullArg) then
+                            return true
+                        end
+                        if fullArg ~= spName and CheckAndDisableSpellArg(spName) then
+                            return true
+                        end
+                        return false
+                    end
+                end
+            end
+        end
+
+        return CheckAndDisableSpellArg(growlName)
+    end
+
+    local function TryApplyBetterPartyMember()
+        if not pendingPartyPrep then return end
+        local modDB = YRG:GetModuleDB("ClassImprovementsModule")
+        if not modDB or not modDB.enabled or modDB.hunterBetterPartyMember == false then
+            pendingPartyPrep = false
+            return
+        end
+        local _, liveClass = UnitClass("player")
+        if IsSecret(liveClass) or liveClass ~= "HUNTER" then
+            pendingPartyPrep = false
+            return
+        end
+        local inPvE, _, instName = GetPvEInstanceState()
+        if not inPvE then
+            pendingPartyPrep = false
+            return
+        end
+        if InCombatLockdown and InCombatLockdown() then
+            return
+        end
+        if not (UnitExists and UnitExists("pet")) or (UnitIsDead and UnitIsDead("pet")) then
+            return
+        end
+
+        local numSlots = NUM_PET_ACTION_SLOTS or 10
+        local growlName = GetGrowlSpellName()
+        local growlLow = growlName:lower()
+        local sawAnySlot = false
+        local passiveSlot, passiveActive = nil, false
+        local growlSlot, growlAllowed, growlEnabled = nil, false, false
+
+        if type(GetPetActionInfo) == "function" then
+            for slot = 1, numSlots do
+                local ok, name, _, isToken, isActive, autoCastAllowed, autoCastEnabled, spellID = pcall(GetPetActionInfo, slot)
+                if ok and name ~= nil then
+                    sawAnySlot = true
+                    if isToken and not IsSecret(name) and name == "PET_MODE_PASSIVE" then
+                        passiveSlot = slot
+                        passiveActive = isActive and true or false
+                    elseif not isToken then
+                        local matchesName = (type(name) == "string" and not IsSecret(name) and name:lower() == growlLow)
+                        local matchesID = (type(spellID) == "number" and not IsSecret(spellID) and GROWL_SPELL_IDS[spellID] == true)
+                        if matchesName or matchesID then
+                            growlSlot = slot
+                            growlAllowed = autoCastAllowed and true or false
+                            growlEnabled = autoCastEnabled and true or false
+                        end
+                    end
+                end
+            end
+        end
+
+        if not sawAnySlot then
+            if pendingRetryDepth < 5 and C_Timer and type(C_Timer.After) == "function" then
+                pendingRetryDepth = pendingRetryDepth + 1
+                C_Timer.After(0.4, TryApplyBetterPartyMember)
+            end
+            return
+        end
+
+        local changedPassive, changedGrowl = false, false
+        if not passiveActive then
+            if type(PetPassiveMode) == "function" then
+                pcall(PetPassiveMode)
+                changedPassive = true
+            elseif passiveSlot and type(CastPetAction) == "function" then
+                pcall(CastPetAction, passiveSlot)
+                changedPassive = true
+            end
+        end
+
+        if growlSlot then
+            if growlAllowed and growlEnabled and type(TogglePetAutocast) == "function" then
+                pcall(TogglePetAutocast, growlSlot)
+                changedGrowl = true
+            end
+        else
+            if TryDisableGrowlInPetSpellbook(growlName) then
+                changedGrowl = true
+            end
+        end
+
+        pendingPartyPrep = false
+        pendingRetryDepth = 0
+
+        if changedPassive or changedGrowl then
+            local locLabel = instName and (" (" .. instName .. ")") or ""
+            local actions = {}
+            if changedPassive then actions[#actions + 1] = "pet set to Passive" end
+            if changedGrowl then actions[#actions + 1] = "Growl auto-cast disabled" end
+            print(string.format("|cffffd100YRG Better Party Member:|r Entered instance%s — %s.",
+                locLabel, table.concat(actions, " and ")))
+        end
+    end
+
+    local function CheckInstanceEntry(isReloadingUi)
+        local inPvE, curKey = GetPvEInstanceState()
+        if not inPvE then
+            wasInPvEInstance = false
+            lastInstanceKey = nil
+            pendingPartyPrep = false
+            pendingRetryDepth = 0
+            return
+        end
+
+        if (not isReloadingUi) and ((not wasInPvEInstance) or (lastInstanceKey ~= curKey)) then
+            pendingPartyPrep = true
+            pendingRetryDepth = 0
+        end
+        wasInPvEInstance = true
+        lastInstanceKey = curKey
+
+        if pendingPartyPrep then
+            TryApplyBetterPartyMember()
+        end
+    end
+
+    function BetterParty.OnEvent(event, arg1, arg2)
+        if event == "PLAYER_ENTERING_WORLD" then
+            local isReloading = (arg2 == true)
+            CheckInstanceEntry(isReloading)
+        elseif event == "ZONE_CHANGED_NEW_AREA" then
+            CheckInstanceEntry(false)
+        elseif event == "UNIT_PET" then
+            if arg1 == "player" and pendingPartyPrep then
+                TryApplyBetterPartyMember()
+            end
+        elseif event == "PET_BAR_UPDATE" or event == "PLAYER_REGEN_ENABLED" then
+            if pendingPartyPrep then
+                TryApplyBetterPartyMember()
+            end
+        end
+    end
+
+    function BetterParty.OnEnable()
+        if type(IsLoggedIn) == "function" and IsLoggedIn() then
+            CheckInstanceEntry(true)
+        end
+    end
+
+    function BetterParty.OnDisable()
+        wasInPvEInstance = false
+        lastInstanceKey = nil
+        pendingPartyPrep = false
+        pendingRetryDepth = 0
+    end
+end
+
 function ClassImprovements:BuildConfigUI(ctx, db)
     local function GetDB()
         return YRG:GetModuleDB("ClassImprovementsModule")
@@ -5392,9 +5662,26 @@ function ClassImprovements:BuildConfigUI(ctx, db)
     end
 
     ctx:AddHeader(
-        "4. Hunter Pet AutoFeeder",
-        "Automatically picks the lowest-quality usable food matching your pet's diet and level. Trigger via the YRGPF macro (/yrg petfeed) on SteamDeck/Controller or by clicking the Pet Happiness face on PC."
+        "4. Hunter Pet Improvements",
+        "AutoFeeder picks the lowest-quality usable food matching your pet's diet and level (/yrg petfeed or click Pet Happiness). Better Party Member prepares your pet automatically on instance entry."
     )
+
+    ctx:AddCheckbox({
+        key = "hunterBetterPartyMember",
+        name = "Better Party Member (Passive + Growl Off in Instances)",
+        tooltip = "Automatically sets your Hunter pet to Passive and disables Growl auto-cast whenever entering a party, raid, or scenario instance (waits cleanly if your pet spawns after loading).",
+        defaultValue = true,
+        get = function()
+            local mdb = GetDB()
+            return mdb == nil or mdb.hunterBetterPartyMember ~= false
+        end,
+        set = function(val)
+            local mdb = GetDB()
+            if mdb then
+                mdb.hunterBetterPartyMember = val and true or false
+            end
+        end,
+    })
 
     ctx:AddCheckbox({
         key = "petFeederEnabled",
