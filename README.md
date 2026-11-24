@@ -2,7 +2,7 @@
 
 Modular UI and Quality-of-Life suite for **World of Warcraft Forever (`1.60.1` / `## Interface: 16001`)**, designed to work cleanly across desktop (Keyboard/Mouse) and Steamdeck / Controller UI mode.
 
-- **Version:** `2.4.5`
+- **Version:** `2.4.6`
 - **Author:** Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP
 - **SavedVariables:** `YRGDB`
 - **Settings Command:** `/yrg`

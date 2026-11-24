@@ -247,7 +247,6 @@ local S = {
     wrappedClickScripts = {},
     wrappedClassClickScripts = {},
     rewrapQueued = false,
-    lastTraceStamp = {},
     centeringFlyoutGuard = false,
     hookedClassClick = {},
 
@@ -665,7 +664,7 @@ end
 
 -- Forward declarations
 local SyncLayout, PlaceSections, ApplyStyle, FitStyle, RefreshEmphasis, SetStyleShown, HandBack, HandBackWhenPossible, SetMoverActive, UpdateMoverBox
-local ApplyClassButtonFrames, ScanFlyoutCandidates, RewrapModifiedActionButtons, FLYOUT_SHOW_SNIP, FLYOUT_HIDE_SNIP
+local ApplyClassButtonFrames, ScanFlyoutCandidates, RewrapModifiedActionButtons, FLYOUT_SHOW_SNIP, FLYOUT_HIDE_SNIP, FLYOUT_CHILD_SHOW_SNIP
 
 local function RunCore(fn)
     if S.stopped then return false end
@@ -761,6 +760,7 @@ local function HasDeniedFlyoutToken(low)
         "actionbutton", "button", "anim", "reticle", "interrupt", "arrow", "autocast",
         "textoverlay", "slot", "staticpopup", "tooltip", "tutorial", "editmode",
         "dropdown", "equipment", "collections", "wardrobe", "heirloom", "store",
+        "segment", "contextaction", "footer", "legend",
     }) do
         if low:find(deny, 1, true) then
             return true
@@ -769,23 +769,42 @@ local function HasDeniedFlyoutToken(low)
     return false
 end
 
-local function RecordFlyoutTrace(tag, detail)
-    local db = GetDB()
-    if not db then return end
-    local now = (type(GetTime) == "function" and GetTime()) or 0
-    if S.lastTraceStamp[tag] and (now - S.lastTraceStamp[tag]) < 0.25 and S.lastTraceDetail == detail then
-        return
+local function DescribeFrameCompact(f)
+    if type(f) ~= "table" or IsForbiddenSafe(f) then return "invalid" end
+    local nm = SafeFrameLabel(f)
+    if nm == "" then
+        if f == S.centerSlot then nm = "centerSlot"
+        elseif f == S.classSlots.Left then nm = "cSlotL"
+        elseif f == S.classSlots.Right then nm = "cSlotR"
+        elseif f == S.secureHolder then nm = "secHolder"
+        else nm = "anon" end
     end
-    S.lastTraceStamp[tag] = now
-    S.lastTraceDetail = detail
-    if type(db._lastFlyoutDebug) ~= "table" then
-        db._lastFlyoutDebug = {}
+    local okSh, sh = pcall(function() return type(f.IsShown) == "function" and f:IsShown() end)
+    local okPr, pr, epr = pcall(function() return type(f.IsProtected) == "function" and f:IsProtected() end)
+    local okPt, pt, rel, _, ox, oy
+    if type(f.GetPoint) == "function" then
+        okPt, pt, rel, _, ox, oy = pcall(f.GetPoint, f, 1)
     end
-    local log = db._lastFlyoutDebug
-    log[#log + 1] = string.format("[%.1f c=%s] %s: %s", now, tostring(InCombatLockdown()), tostring(tag), tostring(detail or ""))
-    while #log > 15 do
-        table.remove(log, 1)
+    local relNm = "nil"
+    if okPt and rel then
+        if rel == S.centerSlot then relNm = "centerSlot"
+        elseif rel == S.classSlots.Left then relNm = "cSlotL"
+        elseif rel == S.classSlots.Right then relNm = "cSlotR"
+        elseif rel == S.secureHolder then relNm = "secHolder"
+        else
+            relNm = SafeFrameLabel(rel)
+            if relNm == "" then relNm = "anon" end
+        end
     end
+    local okC, cx, cy
+    if type(f.GetCenter) == "function" then
+        okC, cx, cy = pcall(f.GetCenter, f)
+    end
+    local posStr = (okC and type(cx) == "number" and type(cy) == "number")
+        and string.format("@%.0f,%.0f", cx, cy) or ""
+    return string.format("%s(sh=%s,pr=%s/%s,pt=%s->%s(%.0f,%.0f)%s)",
+        nm, tostring(okSh and sh), tostring(okPr and pr), tostring(okPr and epr),
+        tostring(okPt and pt), relNm, YRG.SafeNumber(ox, 0), YRG.SafeNumber(oy, 0), posStr)
 end
 
 local function IsFlyoutExcludedFrame(frame)
@@ -882,31 +901,25 @@ local function WrapProtectedFlyoutSlices(frame, depth)
     for _, ch in ipairs(kids) do
         if type(ch) == "table" and not IsForbiddenSafe(ch) then
             if not S.wrappedFlyoutSlices[ch] and IsExplicitlyProtected(ch) then
+                local didWrap = false
+                if FLYOUT_CHILD_SHOW_SNIP then
+                    local okSh = pcall(SecureHandlerWrapScript, ch, "OnShow", S.header, PRE_SHOW, FLYOUT_CHILD_SHOW_SNIP)
+                    didWrap = didWrap or okSh
+                end
                 local okBtn, isBtn = pcall(function()
                     return type(ch.IsObjectType) == "function" and ch:IsObjectType("Button")
                 end)
-                if okBtn and isBtn then
+                if okBtn and isBtn and FLYOUT_HIDE_SNIP then
                     local okWrap = pcall(SecureHandlerWrapScript, ch, "OnClick", S.header, "return nil, true", FLYOUT_HIDE_SNIP)
-                    if okWrap then
-                        S.wrappedFlyoutSlices[ch] = true
-                    end
+                    didWrap = didWrap or okWrap
+                end
+                if didWrap then
+                    S.wrappedFlyoutSlices[ch] = true
                 end
             end
             WrapProtectedFlyoutSlices(ch, depth + 1)
         end
     end
-end
-
-local function DescribeFrameCompact(f)
-    if type(f) ~= "table" or IsForbiddenSafe(f) then return "invalid" end
-    local nm = SafeFrameLabel(f)
-    if nm == "" then nm = "anon" end
-    local okSh, sh = pcall(function() return type(f.IsShown) == "function" and f:IsShown() end)
-    local okPr, pr, epr = pcall(function() return type(f.IsProtected) == "function" and f:IsProtected() end)
-    local okPt, pt, rel = pcall(function() return type(f.GetPoint) == "function" and f:GetPoint(1) end)
-    local relNm = (okPt and rel) and SafeFrameLabel(rel) or "nil"
-    if relNm == "" then relNm = "anon" end
-    return string.format("%s(sh=%s,pr=%s/%s,pt=%s->%s)", nm, tostring(okSh and sh), tostring(okPr and pr), tostring(okPr and epr), tostring(okPt and pt), relNm)
 end
 
 local function RegisterFlyoutCandidate(frame)
@@ -922,7 +935,6 @@ local function RegisterFlyoutCandidate(frame)
     end
     if InCombatLockdown() and isProt then
         S.flyoutScanPending = true
-        RecordFlyoutTrace("ProtFlyoutDeferred", DescribeFrameCompact(frame))
         return
     end
     S.hookedFlyouts[frame] = true
@@ -953,6 +965,9 @@ local function RegisterFlyoutCandidate(frame)
             local showSnip = FLYOUT_SHOW_SNIP:gsub("%$FREF", fRef)
             pcall(SecureHandlerWrapScript, frame, "OnShow", S.header, "return true, true", showSnip)
             pcall(SecureHandlerWrapScript, frame, "OnHide", S.header, "return true, true", FLYOUT_HIDE_SNIP)
+            if FLYOUT_CHILD_SHOW_SNIP then
+                pcall(SecureHandlerWrapScript, frame, "OnAttributeChanged", S.header, PRE_CLICK, FLYOUT_CHILD_SHOW_SNIP)
+            end
         end
         WrapProtectedFlyoutSlices(frame, 0)
     end
@@ -977,6 +992,27 @@ local function RegisterFlyoutCandidate(frame)
     if ok and shown then
         CenterFlyoutFrame(frame)
     end
+end
+
+local function RegisterButtonFlyoutRefs(btn, excludeA, excludeB, excludeC)
+    if type(btn) ~= "table" or IsForbiddenSafe(btn) then return end
+    local okPar, par = pcall(btn.GetParent, btn)
+    if okPar and par and par ~= excludeA and par ~= excludeB and par ~= excludeC
+        and par ~= S.pageUnit and par ~= UIParent and par ~= S.root then
+        RegisterFlyoutCandidate(par)
+    end
+    pcall(function()
+        for k, v in pairs(btn) do
+            if type(k) == "string" and type(v) == "table" then
+                local kl = k:lower()
+                if (kl:find("flyout", 1, true) or kl:find("radial", 1, true)
+                    or kl:find("wheel", 1, true) or kl:find("popup", 1, true))
+                    and not IsFlyoutExcludedFrame(v) then
+                    RegisterFlyoutCandidate(v)
+                end
+            end
+        end
+    end)
 end
 
 local function MatchesFlyoutName(low, allowPopup)
@@ -1046,7 +1082,8 @@ ScanFlyoutCandidates = function()
         end
     end
     for _, gName in ipairs({
-        "GamepadRadial", "SpellFlyout",
+        "GamepadRadial", "SpellFlyout", "GamepadSpellFlyout", "GamepadPetActionFlyout", "GamepadPetSpellFlyout",
+        "GamepadClassSpellFlyout", "ClassSpellFlyout", "ClassActionFlyout",
         "ClassSpellFlyoutFrame", "PetActionFlyoutFrame", "PetSpellFlyoutFrame",
         "GamepadClassActionFlyout", "GamepadFlyoutRadialFrame", "FlyoutRadialFrame",
         "FlyoutRadial", "GamepadActionFlyoutFrame",
@@ -1054,7 +1091,6 @@ ScanFlyoutCandidates = function()
     }) do
         if type(_G[gName]) == "table" then
             RegisterFlyoutCandidate(_G[gName])
-            CheckKids(_G[gName])
         end
     end
     for f in pairs(S.hookedFlyouts) do
@@ -1404,26 +1440,7 @@ local function InstallClassButtonHooks()
     local function InspectButtonFlyoutRefs(tag, side, btn)
         ScheduleClassResnap()
         if tag == "OnFlyoutOpened" or tag == "UpdateFlyoutPopup" or tag == "OnFlyoutClosed" then
-            if type(btn) == "table" and not IsForbiddenSafe(btn) then
-                local okPar, par = pcall(btn.GetParent, btn)
-                if okPar and par and par ~= S.pageUnit and par ~= UIParent and par ~= S.root then
-                    RegisterFlyoutCandidate(par)
-                end
-                pcall(function()
-                    for k, v in pairs(btn) do
-                        if type(k) == "string" and type(v) == "table" then
-                            local kl = k:lower()
-                            if (kl:find("flyout", 1, true) or kl:find("radial", 1, true)
-                                or kl:find("wheel", 1, true) or kl:find("popup", 1, true))
-                                and not IsFlyoutExcludedFrame(v) then
-                                RegisterFlyoutCandidate(v)
-                            end
-                        end
-                    end
-                end)
-                RecordFlyoutTrace(tag .. ":" .. tostring(side),
-                    DescribeFrameCompact(btn) .. " par=" .. DescribeFrameCompact(okPar and par or nil))
-            end
+            RegisterButtonFlyoutRefs(btn)
         end
     end
     local function OnClassInteract()
@@ -1545,6 +1562,22 @@ local FLYOUT_SNAP_BODY = [[
         if cpR and cpsR then cpR:ClearAllPoints(); cpR:SetPoint("CENTER", cpsR, "CENTER", 0, 0) end
     end
 ]]
+local CENTER_SHOWN_FLYS_BODY = [[
+    if owner:GetAttribute("centerWheel") then
+        local cs = owner:GetFrameRef("centerSlot")
+        if cs then
+            local fc = owner:GetAttribute("flyoutCount") or 0
+            for k = 1, fc do
+                local fl = owner:GetFrameRef("flyout" .. k)
+                if fl and fl:IsShown() then
+                    fl:ClearAllPoints()
+                    fl:SetPoint("CENTER", cs, "CENTER", 0, 0)
+                end
+            end
+        end
+    end
+]]
+FLYOUT_CHILD_SHOW_SNIP = "if owner:GetAttribute(\"flat\") then\n" .. CENTER_SHOWN_FLYS_BODY .. "end"
 FLYOUT_SHOW_SNIP = [[
     if owner:GetAttribute("flat") then
         if owner:GetAttribute("centerWheel") then
@@ -1624,19 +1657,7 @@ local POST_CLICK = [[
             local cpR, cpsR = owner:GetFrameRef("classPromptRight"), owner:GetFrameRef("classPSlotRight")
             if cpR and cpsR then cpR:ClearAllPoints(); cpR:SetPoint("CENTER", cpsR, "CENTER", 0, 0) end
         end
-        if owner:GetAttribute("centerWheel") then
-            local cs = owner:GetFrameRef("centerSlot")
-            if cs then
-                local fc = owner:GetAttribute("flyoutCount") or 0
-                for k = 1, fc do
-                    local fl = owner:GetFrameRef("flyout" .. k)
-                    if fl and fl:IsShown() then
-                        fl:ClearAllPoints()
-                        fl:SetPoint("CENTER", cs, "CENTER", 0, 0)
-                    end
-                end
-            end
-        end
+]] .. CENTER_SHOWN_FLYS_BODY .. [[
     end
 ]]
 
@@ -1661,19 +1682,7 @@ local CLASS_POST_CLICK = [[
             local cpR, cpsR = owner:GetFrameRef("classPromptRight"), owner:GetFrameRef("classPSlotRight")
             if cpR and cpsR then cpR:ClearAllPoints(); cpR:SetPoint("CENTER", cpsR, "CENTER", 0, 0) end
         end
-        if owner:GetAttribute("centerWheel") then
-            local cs = owner:GetFrameRef("centerSlot")
-            if cs then
-                local fc = owner:GetAttribute("flyoutCount") or 0
-                for k = 1, fc do
-                    local fl = owner:GetFrameRef("flyout" .. k)
-                    if fl and fl:IsShown() then
-                        fl:ClearAllPoints()
-                        fl:SetPoint("CENTER", cs, "CENTER", 0, 0)
-                    end
-                end
-            end
-        end
+]] .. CENTER_SHOWN_FLYS_BODY .. [[
     end
 ]]
 
@@ -1887,7 +1896,11 @@ local function BuildFlatRows(db)
                     S.classWrapDebug["snip_" .. side] = snip
                 end
                 local okShow = pcall(SecureHandlerWrapScript, cBtn, "OnShow", newHeader, PRE_SHOW, snip)
+                local okDn = pcall(SecureHandlerWrapScript, cBtn, "OnMouseDown", newHeader, PRE_CLICK, snip)
+                local okUp = pcall(SecureHandlerWrapScript, cBtn, "OnMouseUp", newHeader, PRE_CLICK, snip)
+                local okAtr = pcall(SecureHandlerWrapScript, cBtn, "OnAttributeChanged", newHeader, PRE_CLICK, snip)
                 S.classWrapDebug[side] = "prot=true,clk=" .. tostring(okClick) .. ",shw=" .. tostring(okShow)
+                    .. ",dn=" .. tostring(okDn) .. ",up=" .. tostring(okUp) .. ",atr=" .. tostring(okAtr)
             end
         elseif isFrameBtn then
             S.classWrapDebug[side] = "prot=false"
@@ -3017,11 +3030,6 @@ local function InstallBlizzardHooks()
     end
     local function OnBarRestyled(bar)
         if S.applied and restyleJobs[bar] and not IsBlocked() then
-            if InCombatLockdown() then
-                local b1 = bar and bar.Left and bar.Left.ActionButton1
-                local clkOk = b1 and type(b1.GetScript) == "function" and (b1:GetScript("OnClick") == S.wrappedClickScripts[b1])
-                RecordFlyoutTrace("CombatRestyle", tostring(restyleKeys[bar]) .. " b1=" .. DescribeFrameCompact(b1) .. " clk=" .. tostring(clkOk))
-            end
             RunOutOfCombat(restyleKeys[bar], restyleJobs[bar])
         end
     end
@@ -3047,26 +3055,7 @@ local function InstallBlizzardHooks()
             end
             return
         end
-        local okPar, par = pcall(btn.GetParent, btn)
-        if okPar and par and par ~= barInfo.bar and par ~= barInfo.bar.Left and par ~= barInfo.bar.Right
-            and par ~= S.pageUnit and par ~= UIParent and par ~= S.root then
-            RegisterFlyoutCandidate(par)
-        end
-        pcall(function()
-            for k, v in pairs(btn) do
-                if type(k) == "string" and type(v) == "table" then
-                    local kl = k:lower()
-                    if (kl:find("flyout", 1, true) or kl:find("radial", 1, true)
-                        or kl:find("wheel", 1, true) or kl:find("popup", 1, true))
-                        and not IsFlyoutExcludedFrame(v) then
-                        RegisterFlyoutCandidate(v)
-                    end
-                end
-            end
-        end)
-        local okClk = type(btn.GetScript) == "function" and (btn:GetScript("OnClick") == S.wrappedClickScripts[btn])
-        RecordFlyoutTrace("Btn:" .. fnName, tostring(barInfo.key) .. " " .. DescribeFrameCompact(btn)
-            .. " par=" .. DescribeFrameCompact(okPar and par or nil) .. " clk=" .. tostring(okClk))
+        RegisterButtonFlyoutRefs(btn, barInfo.bar, barInfo.bar.Left, barInfo.bar.Right)
         if fnName == "OnFlyoutClosed" then
             ScheduleCoalescedRewrap()
         end
@@ -3221,6 +3210,7 @@ end
 
 function CompactBar:OnInitialize(db)
     -- Migrate/sanitize DB values cleanly
+    db._lastFlyoutDebug = nil
     db.buttonPadding = GetPadding(db)
     if db.arrangement == "XYAB" then
         db.arrangement = "XYAB"
@@ -3440,7 +3430,27 @@ local function CaptureClassAndFlyoutDebug(db)
     end
     local flyList = {}
     for f in pairs(S.hookedFlyouts) do
+        local sc = {}
+        for _, sName in ipairs({ "OnShow", "OnHide", "OnAttributeChanged", "OnUpdate", "OnEvent" }) do
+            local okH, has = pcall(function() return f.HasScript and f:HasScript(sName) and (f:GetScript(sName) ~= nil) end)
+            if okH and has then sc[#sc + 1] = sName end
+        end
+        local chDesc = {}
+        if type(f.GetChildren) == "function" then
+            local okC, chs = pcall(function() return { f:GetChildren() } end)
+            if okC and type(chs) == "table" then
+                for i = 1, math.min(#chs, 8) do
+                    local ch = chs[i]
+                    local okT, ot = pcall(function() return ch.GetObjectType and ch:GetObjectType() end)
+                    local okP, pr = pcall(function() return ch.IsProtected and ch:IsProtected() end)
+                    chDesc[#chDesc + 1] = string.format("%s:%s:pr=%s:w=%s",
+                        SafeFrameLabel(ch) ~= "" and SafeFrameLabel(ch) or "anon",
+                        tostring(okT and ot), tostring(okP and pr), tostring(S.wrappedFlyoutSlices[ch] or false))
+                end
+            end
+        end
         flyList[#flyList + 1] = DescribeFrameCompact(f) .. ",sec=" .. tostring(S.secureFlyouts[f] or 0)
+            .. ",sc=[" .. table.concat(sc, ",") .. "],ch=[" .. table.concat(chDesc, ",") .. "]"
     end
     out[#out + 1] = "HookedFlyouts=[" .. table.concat(flyList, "; ") .. "]"
     local flyBtns = {}
@@ -3682,7 +3692,7 @@ function CompactBar:BuildConfigUI(ctx, db)
     ctx:AddCheckbox({
         key = "centerFlyoutWheel",
         name = "Spawn Selection Wheel in Center of Screen",
-        tooltip = "Automatically centers the LT+LB / RT+RB stance, pet, and spell selection wheel in the middle of the screen instead of anchoring to the bar edge.",
+        tooltip = "Automatically centers stance, pet, and spell selection wheels in the middle of the screen instead of anchoring to the bar edge (out of combat: all flyouts; in combat: action-bar skill flyouts center while Blizzard's LT+LB / RT+RB class-bar trigger locks its protected popup after OnShow).",
         defaultValue = true,
         get = function()
             local mdb = GetDB()

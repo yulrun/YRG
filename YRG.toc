@@ -2,7 +2,7 @@
 ## Title: |cffffd100YRG|r - YulRun Gaming Master Addon
 ## Notes: Modular UI Suite (Steamdeck Improvements, BetterBagsModule, Minimap EXP Tracker, Dynamic Info Placard, QuestTrackerUpdater, ClassImprovementsModule & CompactControllerBar)
 ## Author: Shaemus Shadowstep & Sylas Swiftarrow | NA RP-PVP
-## Version: 2.4.5
+## Version: 2.4.6
 ## IconTexture: Interface\AddOns\YRG\Textures\YRGLogo
 ## OptionalDeps: Blizzard_UIPanels_Game, Blizzard_MainMenuBarBagButtons, Blizzard_ObjectiveTracker, Questie, Blizzard_GamepadActionBars
 ## SavedVariables: YRGDB
